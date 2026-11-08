@@ -1,0 +1,3760 @@
+use serde::{Deserialize, Serialize};
+use tauri::State;
+
+use crate::state::AppState;
+#[cfg(windows)]
+use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use std::fs;
+#[cfg(windows)]
+use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::sync::Mutex;
+#[cfg(windows)]
+use std::time::Duration;
+#[cfg(windows)]
+use tauri::Manager;
+
+#[cfg(windows)]
+static DRIVER_OPERATION_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+/// Create an overlay window on first use.
+///
+/// Both overlay windows used to be declared in `tauri.conf.json`, which means
+/// Tauri built them during startup for everybody. Each one costs its own
+/// WebView2 renderer process — about 60MB apiece, measured — and neither is
+/// visible until something asks for it. The in-game stats bar in particular is
+/// off by default (`overlay.enabled: false`), so the common case was paying
+/// ~120MB for two windows that never appeared.
+///
+/// Creating them on demand instead is why this exists. It is idempotent: the
+/// callers invoke it on every relevant tick and it returns immediately once the
+/// window is there.
+///
+/// The property list below has to stay in step with how these windows used to
+/// be declared. `visible(false)` matters most: the windows manage their own
+/// visibility once they exist, and showing one here would flash it on screen.
+/// **Must stay `async`.** Tauri runs a synchronous command on the main thread,
+/// and building a webview on Windows needs that same thread to pump its event
+/// loop, so a sync version deadlocks the moment the overlay is switched on: the
+/// UI stops repainting, regions never load, and the window cannot even be
+/// closed. That shipped in v3.0.6, where these windows moved out of
+/// `tauri.conf.json` to being created on demand. It survives a restart too,
+/// because the overlay preference is persisted and the driver asks for the
+/// window again on launch.
+///
+/// An async command runs on a worker, which lets the builder hand the work to
+/// the main thread instead of blocking it.
+#[tauri::command]
+pub async fn ensure_overlay_window(app: tauri::AppHandle, label: String) -> Result<(), String> {
+    use tauri::Manager;
+
+    // Whitelisted, because `label` reaches WebviewWindowBuilder and the
+    // frontend should not be able to conjure arbitrary windows.
+    let (title, width, height) = match label.as_str() {
+        "overlay-stats" => ("SwiftTunnel Stats Overlay", 600.0, 200.0),
+        other => return Err(format!("unknown overlay window: {other}")),
+    };
+
+    if app.get_webview_window(&label).is_some() {
+        return Ok(());
+    }
+
+    let window =
+        tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App("index.html".into()))
+            .title(title)
+            .inner_size(width, height)
+            .decorations(false)
+            .transparent(true)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .resizable(false)
+            .focused(false)
+            .shadow(false)
+            .visible(false)
+            .build()
+            .map_err(|e| format!("failed to create {label}: {e}"))?;
+
+    // Same treatment the startup path used to apply: a normal topmost window
+    // activates when clicked, which knocks Roblox out of the foreground and
+    // makes the overlay's foreground-gated visibility flicker off mid-drag.
+    #[cfg(windows)]
+    if let Ok(hwnd) = window.hwnd() {
+        swifttunnel_core::performance_monitor::set_window_no_activate(hwnd.0 as isize);
+    }
+
+    Ok(())
+}
+
+/// Compile-time proof that the overlay command stays off the main thread.
+///
+/// Referencing it as a future is what pins it: if someone drops the `async`,
+/// this stops compiling rather than silently reintroducing the deadlock that
+/// froze the app in v3.0.6.
+#[allow(dead_code)]
+fn ensure_overlay_window_must_stay_async() {
+    fn assert_future<F: std::future::Future>(_: fn(tauri::AppHandle, String) -> F) {}
+    assert_future(ensure_overlay_window);
+}
+
+#[cfg(windows)]
+fn has_reparse_point(path: &Path) -> Result<bool, String> {
+    use std::os::windows::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|e| format!("Failed to inspect {}: {}", path.display(), e))?;
+    Ok((metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+}
+
+#[cfg(windows)]
+fn reject_reparse_point(path: &Path) -> Result<(), String> {
+    if has_reparse_point(path)? {
+        Err(format!(
+            "Refusing to use reparse-point path {}",
+            path.display()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn driver_install_success_exit_code(code: i32) -> bool {
+    // 0 = success
+    // 1638 = another version already installed
+    // 1641/3010 = success, restart required
+    matches!(code, 0 | 1638 | 1641 | 3010)
+}
+
+#[cfg(windows)]
+fn driver_install_failure_message(code: i32) -> String {
+    match code {
+        1223 | 1602 => "Driver installation was canceled at the UAC/installer prompt.".to_string(),
+        1603 => "Windows Installer reported a fatal error (1603). This usually means antivirus \
+                 interference, a pending reboot, or a corrupted prior install. Check the \
+                 installer log for details."
+            .to_string(),
+        1618 => "Another installer is already running. Close it and retry.".to_string(),
+        1625 => "Windows blocked this installer by policy. Contact support.".to_string(),
+        1639 => {
+            "Driver installer received invalid command-line arguments (msiexec 1639).".to_string()
+        }
+        _ => format!("Driver install failed with code {}", code),
+    }
+}
+
+#[cfg(windows)]
+fn is_probable_uac_cancel_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("operation was canceled by the user")
+        || normalized.contains("requested operation requires elevation")
+        || normalized.contains("requires elevation")
+        || normalized.contains("access is denied")
+        || normalized.contains("uac")
+}
+
+/// Decide whether to attempt the INF-based fallback install (pnputil) after an
+/// MSI install failure. The trigger set is intentionally narrow: only 1603
+/// (MSI's generic "fatal error") unless the stderr indicates a UAC cancel.
+///
+/// Other MSI error codes either (a) indicate user intent we must respect
+/// (1223/1602), (b) are policy/platform blocks the fallback cannot bypass
+/// (1625/1633/1643/1644/1654), or (c) indicate MSI package/temp access
+/// problems that would break `msiexec /a` extraction the same way
+/// (1619/1620/1622/1632).
+#[cfg(windows)]
+fn should_try_inf_fallback(exit_code: i32, stderr: &str) -> bool {
+    if is_probable_uac_cancel_message(stderr) {
+        return false;
+    }
+    exit_code == 1603
+}
+
+/// Extract an MSI's payload to a directory via `msiexec /a` (administrative
+/// install). Does not run the normal install sequence, so most MSI custom
+/// actions are skipped — the key property that makes this a viable fallback
+/// when `/i` returns 1603 on custom-action failure. Still not guaranteed to
+/// be custom-action-free (the AdminExecuteSequence can carry actions), so the
+/// caller must validate the extracted payload before using it.
+#[cfg(windows)]
+fn extract_msi_to_dir(msi_path: &Path, extract_dir: &Path, log_path: &Path) -> Result<(), String> {
+    fs::create_dir_all(extract_dir).map_err(|e| {
+        format!(
+            "Failed to create MSI extract dir {}: {}",
+            extract_dir.display(),
+            e
+        )
+    })?;
+    reject_reparse_point(extract_dir)?;
+
+    let target_dir_arg = format!("TARGETDIR={}", extract_dir.display());
+    // Same global installer mutex as the install path, so the same deadline
+    // applies: an administrative extract can queue behind someone else forever.
+    let output = swifttunnel_core::run_hidden_command_with_timeout(
+        "msiexec",
+        &[
+            "/a",
+            &msi_path.to_string_lossy(),
+            &target_dir_arg,
+            "/qn",
+            "/norestart",
+            "/L*V",
+            &log_path.to_string_lossy(),
+        ],
+        Duration::from_secs(600),
+    );
+    if output.timed_out {
+        return Err(format!(
+            "Windows Installer did not respond within 10 minutes while extracting (log: {})",
+            log_path.display()
+        ));
+    }
+
+    let code = output.exit_code.unwrap_or(-1);
+    if code == 0 {
+        return Ok(());
+    }
+
+    let stderr = output.stderr.trim().to_string();
+    if stderr.is_empty() {
+        Err(format!(
+            "msiexec /a failed with code {} (log: {})",
+            code,
+            log_path.display()
+        ))
+    } else {
+        Err(format!(
+            "msiexec /a failed with code {}: {} (log: {})",
+            code,
+            stderr,
+            log_path.display()
+        ))
+    }
+}
+
+/// Recursively search `extract_dir` for `ndisrd_lwf.inf` (case-insensitive).
+/// Returns the parent directory of the matched file (which is the argument
+/// shape expected by `install_driver_from_package_dir`). Bound depth and total
+/// entries, and skip redirected files/folders. WinpkFilter's normal extracted
+/// layout is small and nests to depth ~3.
+#[cfg(windows)]
+fn find_inf_in_extract_dir(extract_dir: &Path) -> Result<PathBuf, String> {
+    find_inf_in_extract_dir_with_limit(extract_dir, 4096)
+}
+
+#[cfg(windows)]
+fn find_inf_in_extract_dir_with_limit(
+    extract_dir: &Path,
+    mut remaining: usize,
+) -> Result<PathBuf, String> {
+    let target = swifttunnel_core::vpn::winpkfilter::DRIVER_INF_NAME;
+    reject_reparse_point(extract_dir)?;
+    let canonical_extract_dir = fs::canonicalize(extract_dir).map_err(|e| {
+        format!(
+            "Failed to canonicalize extract dir {}: {}",
+            extract_dir.display(),
+            e
+        )
+    })?;
+
+    fn walk(
+        dir: &Path,
+        target: &str,
+        depth: u32,
+        remaining: &mut usize,
+    ) -> Result<Option<PathBuf>, String> {
+        if depth > 6 {
+            return Ok(None);
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Ok(None);
+        };
+
+        let mut subdirs = Vec::new();
+        for entry in entries {
+            if *remaining == 0 {
+                return Err("The extracted driver package contains too many files. Retry Repair or use the official installer.".into());
+            }
+            *remaining -= 1;
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if reject_reparse_point(&path).is_err() {
+                continue;
+            }
+            if file_type.is_file() {
+                let matches = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|n| n.eq_ignore_ascii_case(target))
+                    .unwrap_or(false);
+                if matches {
+                    return Ok(path.parent().map(|p| p.to_path_buf()));
+                }
+            } else if file_type.is_dir() && depth < 6 {
+                subdirs.push(path);
+            }
+        }
+        for sub in subdirs {
+            if let Some(found) = walk(&sub, target, depth + 1, remaining)? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    let found = walk(extract_dir, target, 0, &mut remaining)?.ok_or_else(|| {
+        format!(
+            "Could not locate {} under {}",
+            target,
+            extract_dir.display()
+        )
+    })?;
+    reject_reparse_point(&found)?;
+    let canonical_found = fs::canonicalize(&found).map_err(|e| {
+        format!(
+            "Failed to canonicalize extracted driver package {}: {}",
+            found.display(),
+            e
+        )
+    })?;
+    if !canonical_found.starts_with(&canonical_extract_dir) {
+        return Err(format!(
+            "Extracted driver package escaped secure extract dir: {}",
+            canonical_found.display()
+        ));
+    }
+    Ok(canonical_found)
+}
+
+/// Returns `Some(published_name)` if the WinpkFilter driver package is
+/// registered in the driver store but the driver itself is not available
+/// at runtime (service missing, files stale, etc.). This is the "broken
+/// prior install" state that MSI 1603 commonly maps to.
+///
+/// Returns `None` in the healthy cases (not installed at all, or installed
+/// and working), so the caller should only cleanup when this returns `Some`.
+// TODO: handle multi-oem case — `find_installed_driver_published_name` only
+// returns the first match, so if the store has multiple stale ndisrd_lwf.inf
+// entries we'd only detect one. Rare in practice.
+#[cfg(windows)]
+fn detect_broken_install() -> Option<String> {
+    match swifttunnel_core::vpn::winpkfilter::find_installed_driver_published_name() {
+        Ok(Some(name)) if !swifttunnel_core::vpn::SplitTunnelDriver::is_available() => Some(name),
+        _ => None,
+    }
+}
+
+/// Orchestrates the INF fallback install: cleanup stale store entries,
+/// extract the MSI payload via `msiexec /a`, locate the INF, and hand off
+/// to pnputil via the existing `install_driver_from_package_dir`.
+///
+/// The pre-extract cleanup is mandatory: `install_driver_from_package_dir`
+/// short-circuits as success if the INF is already in the driver store,
+/// even when the driver is broken at runtime. Without cleanup, the
+/// fallback would silently claim success on exactly the state it was
+/// trying to fix.
+///
+/// Caller owns `extract_dir` lifecycle — on `Ok`, caller may delete it;
+/// on `Err`, caller should preserve it for support triage.
+#[cfg(windows)]
+fn try_inf_fallback(msi_path: &Path, extract_dir: &Path, extract_log: &Path) -> Result<(), String> {
+    // Step 1: mandatory pre-pnputil cleanup so pnputil doesn't short-circuit
+    // on a stale store entry.
+    swifttunnel_core::vpn::SplitTunnelDriver::cleanup_driver_service_for_uninstall()
+        .map_err(|e| format!("Pre-fallback driver-service cleanup failed: {}", e))?;
+    swifttunnel_core::vpn::winpkfilter::remove_installed_driver_package()
+        .map_err(|e| format!("Pre-fallback driver-store cleanup failed: {}", e))?;
+
+    // Step 2: extract MSI payload (no /i custom actions).
+    extract_msi_to_dir(msi_path, extract_dir, extract_log)?;
+
+    // Step 3: locate the INF.
+    let inf_parent = find_inf_in_extract_dir(extract_dir)?;
+
+    // Step 4: install via pnputil (validates the package internally).
+    swifttunnel_core::vpn::winpkfilter::install_driver_from_package_dir(&inf_parent).map_err(|e| {
+        format!(
+            "pnputil install from {} failed: {}",
+            inf_parent.display(),
+            e
+        )
+    })
+}
+
+#[cfg(windows)]
+fn winpkfilter_msi_candidate_paths(
+    msi_name: &str,
+    resource_dir: Option<&Path>,
+    exe_dir: Option<&Path>,
+    program_files_dir: &Path,
+) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Some(dir) = resource_dir {
+        candidates.push(dir.join("drivers").join(msi_name));
+        candidates.push(dir.join(msi_name));
+    }
+
+    if let Some(dir) = exe_dir {
+        candidates.push(dir.join("drivers").join(msi_name));
+        candidates.push(dir.join("resources").join("drivers").join(msi_name));
+        candidates.push(dir.join("resources").join(msi_name));
+    }
+
+    let install_root = program_files_dir.join("SwiftTunnel");
+    candidates.push(
+        install_root
+            .join("resources")
+            .join("drivers")
+            .join(msi_name),
+    );
+    candidates.push(install_root.join("drivers").join(msi_name));
+
+    candidates
+}
+
+#[cfg(windows)]
+fn find_winpkfilter_msi(
+    msi_name: &str,
+    resource_dir: Option<&Path>,
+    exe_dir: Option<&Path>,
+    program_files_dir: &Path,
+) -> Result<PathBuf, String> {
+    let candidates =
+        winpkfilter_msi_candidate_paths(msi_name, resource_dir, exe_dir, program_files_dir);
+    candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .ok_or_else(|| format!("{} not found in app resources.", msi_name))
+}
+
+#[cfg(windows)]
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(windows)]
+fn validate_payload_sha256(
+    data: &[u8],
+    expected_sha256: &str,
+    min_size_bytes: usize,
+) -> Result<(), String> {
+    if data.len() < min_size_bytes {
+        return Err(format!(
+            "Downloaded WinpkFilter MSI is too small ({} bytes).",
+            data.len()
+        ));
+    }
+
+    let digest = sha256_hex(data);
+    if digest != expected_sha256 {
+        return Err(format!(
+            "Downloaded WinpkFilter MSI failed integrity check (sha256 mismatch: expected {}, got {}).",
+            expected_sha256, digest
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_winpkfilter_payload(
+    data: &[u8],
+    pkg: &swifttunnel_core::vpn::winpkfilter::WinpkFilterMsiPackage,
+) -> Result<(), String> {
+    validate_payload_sha256(data, pkg.sha256, pkg.min_size_bytes)
+}
+
+#[cfg(windows)]
+fn validate_winpkfilter_file(
+    path: &Path,
+    pkg: &swifttunnel_core::vpn::winpkfilter::WinpkFilterMsiPackage,
+) -> Result<(), String> {
+    swifttunnel_core::vpn::winpkfilter::validate_msi_file(path, pkg)
+}
+
+#[cfg(windows)]
+fn read_driver_download(
+    body: impl std::io::Read,
+    content_length: Option<u64>,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    if content_length.is_some_and(|size| size > max_bytes as u64) {
+        return Err("WinpkFilter download exceeds its size limit.".into());
+    }
+    let mut bytes = Vec::new();
+    body.take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Could not finish downloading WinpkFilter: {e}"))?;
+    if bytes.len() > max_bytes {
+        return Err("WinpkFilter download exceeds its size limit.".into());
+    }
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn resolve_winpkfilter_cache_path(
+    app: &tauri::AppHandle,
+    msi_name: &str,
+) -> Result<PathBuf, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to resolve app data directory: {}", e))?;
+    Ok(app_data_dir.join("drivers").join(msi_name))
+}
+
+#[cfg(windows)]
+fn download_winpkfilter_msi(
+    path: &Path,
+    pkg: &swifttunnel_core::vpn::winpkfilter::WinpkFilterMsiPackage,
+) -> Result<(), String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(45))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client for driver download: {}", e))?;
+
+    let response = client
+        .get(pkg.download_url)
+        .header(reqwest::header::USER_AGENT, "SwiftTunnel/driver-installer")
+        .send()
+        .map_err(|e| format!("Failed to download WinpkFilter MSI: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "WinpkFilter download failed with HTTP {}.",
+            response.status()
+        ));
+    }
+
+    let content_length = response.content_length();
+    let data = read_driver_download(
+        response,
+        content_length,
+        swifttunnel_core::vpn::winpkfilter::MAX_DRIVER_MSI_BYTES,
+    )?;
+
+    validate_winpkfilter_payload(&data, pkg)?;
+
+    // The shared cache writer checks for redirection before creating folders.
+    swifttunnel_core::vpn::winpkfilter::save_msi_cache(path, &data, pkg)?;
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn resolve_winpkfilter_msi(
+    app: &tauri::AppHandle,
+    resource_dir: Option<&Path>,
+    exe_dir: Option<&Path>,
+    program_files_dir: &Path,
+) -> Result<PathBuf, String> {
+    let pkg = swifttunnel_core::vpn::winpkfilter::native_msi_package();
+
+    // Validate bundled MSIs the same way we validate cached downloads — a
+    // bundled file can be just as corrupted (partial NSIS extract, disk
+    // bit-rot, tampered install) and handing a bad MSI to msiexec surfaces
+    // as an opaque 1603 with no hint that the file itself is the problem.
+    // Falling through to the download path on integrity failure is
+    // deliberate: the pinned SHA-256 is authoritative, so if the bundled
+    // copy is bad the network copy should be trusted over it.
+    if let Ok(path) = find_winpkfilter_msi(pkg.msi_name, resource_dir, exe_dir, program_files_dir) {
+        match validate_winpkfilter_file(&path, pkg) {
+            Ok(()) => {
+                log::info!(
+                    "Bundled WinpkFilter MSI at {} passed integrity check",
+                    path.display()
+                );
+                return Ok(path);
+            }
+            Err(e) => {
+                log::warn!(
+                    "Bundled WinpkFilter MSI at {} failed integrity check ({}) — falling back to pinned download",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    log::warn!(
+        "Bundled WinpkFilter MSI ({}) unavailable; downloading pinned fallback from {}",
+        pkg.msi_name,
+        pkg.download_url
+    );
+    let cache_path = resolve_winpkfilter_cache_path(app, pkg.msi_name)?;
+
+    if cache_path.exists() {
+        if validate_winpkfilter_file(&cache_path, pkg).is_ok() {
+            log::info!("Using cached WinpkFilter MSI from {}", cache_path.display());
+            return Ok(cache_path);
+        }
+
+        log::warn!(
+            "Cached WinpkFilter MSI failed integrity check, removing {}",
+            cache_path.display()
+        );
+        if let Err(e) = fs::remove_file(&cache_path) {
+            log::warn!(
+                "Failed to remove invalid cached WinpkFilter MSI {}: {}",
+                cache_path.display(),
+                e
+            );
+        }
+    }
+
+    download_winpkfilter_msi(&cache_path, pkg)?;
+    log::info!("Downloaded WinpkFilter MSI to {}", cache_path.display());
+    Ok(cache_path)
+}
+
+#[cfg(windows)]
+struct DriverInstallWorkspace {
+    work: swifttunnel_installer_cache::ProtectedWorkspace,
+    _source: swifttunnel_installer_cache::ProtectedInstaller,
+    msi_path: PathBuf,
+    first_log_path: PathBuf,
+    retry_log_path: PathBuf,
+    extract_dir: PathBuf,
+}
+
+#[cfg(windows)]
+fn stage_winpkfilter_msi(
+    source_path: &Path,
+    pkg: &swifttunnel_core::vpn::winpkfilter::WinpkFilterMsiPackage,
+) -> Result<DriverInstallWorkspace, String> {
+    reject_reparse_point(source_path)?;
+    let data = swifttunnel_core::vpn::winpkfilter::read_validated_msi_file(source_path, pkg)?;
+
+    let cache = swifttunnel_installer_cache::InstallerCache::open()
+        .map_err(|e| format!("Could not prepare protected driver storage. Run SwiftTunnel as administrator and try again. ({e})"))?;
+    let source = cache
+        .stage(pkg.msi_name, &data)
+        .map_err(|e| format!("Could not save the verified driver installer: {e}"))?;
+    let work = cache
+        .workspace("driver")
+        .map_err(|e| format!("Could not prepare a protected driver work directory: {e}"))?;
+    let root = work.path();
+    let msi_path = source.path().to_path_buf();
+    validate_winpkfilter_file(&msi_path, pkg)?;
+
+    Ok(DriverInstallWorkspace {
+        first_log_path: root.join("install.log"),
+        retry_log_path: root.join("install.retry.log"),
+        extract_dir: root.join("extract"),
+        work,
+        _source: source,
+        msi_path,
+    })
+}
+
+#[cfg(windows)]
+/// Build the msiexec command line for a driver install. Passed straight to the
+/// pure-Win32 elevation helper — no PowerShell wrapper, so a repair can never
+/// flash a console window.
+fn build_msiexec_install_args(
+    msi_path: &str,
+    log_path: &str,
+    passive: bool,
+    reinstall: bool,
+) -> String {
+    let ui_flag = if passive { "/passive" } else { "/qn" };
+    let mut args = vec![
+        "/i".to_string(),
+        swifttunnel_core::utils::quote_windows_arg(msi_path),
+        ui_flag.to_string(),
+        "/norestart".to_string(),
+        "/L*V".to_string(),
+        swifttunnel_core::utils::quote_windows_arg(log_path),
+    ];
+    if reinstall {
+        args.push("REINSTALL=ALL".to_string());
+        args.push("REINSTALLMODE=vamus".to_string());
+    }
+    args.join(" ")
+}
+
+#[cfg(windows)]
+const WAIT_RELAUNCH_ARG: &str = "--wait-relaunch";
+
+#[cfg(windows)]
+fn restart_as_admin_args(current_pid: u32) -> String {
+    let args = [WAIT_RELAUNCH_ARG.to_string(), current_pid.to_string()];
+    args.iter()
+        .map(|arg| swifttunnel_core::utils::quote_windows_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(windows)]
+fn launch_elevated_swifttunnel(exe_path: &Path, args: &str) -> Result<(), String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::PCWSTR;
+
+    let verb: Vec<u16> = OsStr::new("runas").encode_wide().chain(Some(0)).collect();
+    let file: Vec<u16> = exe_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let params: Vec<u16> = OsStr::new(args).encode_wide().chain(Some(0)).collect();
+
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            PCWSTR(params.as_ptr()),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+
+    let code = result.0 as isize;
+    if code > 32 {
+        Ok(())
+    } else if code == 5 {
+        Err(
+            "Windows did not allow the restart. Try again, or close and reopen SwiftTunnel."
+                .to_string(),
+        )
+    } else {
+        Err(format!(
+            "Failed to relaunch SwiftTunnel as Administrator (ShellExecute code {}).",
+            code
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn driver_repair_requires_reinstall(force: bool, broken: bool, removed: bool) -> bool {
+    (force || broken) && !removed
+}
+
+#[cfg(windows)]
+fn install_winpkfilter_driver_from_msi(
+    app: &tauri::AppHandle,
+    resource_dir: Option<&Path>,
+    exe_dir: Option<&Path>,
+    program_files_dir: &Path,
+    force: bool,
+) -> Result<(), String> {
+    // `force = true` comes from recovery flows that need to re-run install
+    // even if the NDISRD handle opens. A stale/corrupt driver can pass the
+    // open-handle check but fail the stronger health check.
+    if !force && swifttunnel_core::vpn::SplitTunnelDriver::health_check().ready {
+        return Ok(());
+    }
+
+    let pkg = swifttunnel_core::vpn::winpkfilter::native_msi_package();
+    let resolved_msi_path = resolve_winpkfilter_msi(app, resource_dir, exe_dir, program_files_dir)?;
+    let workspace = stage_winpkfilter_msi(&resolved_msi_path, pkg)?;
+    let msi_string = workspace.msi_path.to_string_lossy().to_string();
+    let first_log_path = workspace.first_log_path.clone();
+    let first_log_string = first_log_path.to_string_lossy().to_string();
+    let retry_log_path = workspace.retry_log_path.clone();
+    let retry_log_string = retry_log_path.to_string_lossy().to_string();
+
+    // ── Phase A: pre-flight (broken-install detection) ──
+    // If the WinpkFilter driver package is registered in the driver store
+    // but the driver isn't available at runtime, the MSI is very likely
+    // to return 1603 trying to "repair" the stale state. Clean it up
+    // first so the MSI install starts from a known-empty state.
+    let mut cleaned_broken_install = false;
+    let broken_install = detect_broken_install();
+    if let Some(published) = &broken_install {
+        log::warn!(
+            "Detected broken WinpkFilter install ({}); cleaning up before retry",
+            published
+        );
+        match swifttunnel_core::vpn::SplitTunnelDriver::remove_driver_for_uninstall() {
+            Ok(removed) => {
+                cleaned_broken_install = removed;
+            }
+            Err(e) => {
+                log::warn!("Pre-install cleanup failed (continuing anyway): {}", e);
+            }
+        }
+    }
+    let use_reinstall_mode =
+        driver_repair_requires_reinstall(force, broken_install.is_some(), cleaned_broken_install)
+            && swifttunnel_core::vpn::winpkfilter::find_installed_driver_published_name()
+                .ok()
+                .flatten()
+                .is_some();
+
+    let run_install = |passive: bool, log_string: &str| -> Result<(i32, String), String> {
+        if swifttunnel_core::is_administrator() {
+            let ui_flag = if passive { "/passive" } else { "/qn" };
+            let mut args = vec!["/i", &msi_string, ui_flag, "/norestart", "/L*V", log_string];
+            if use_reinstall_mode {
+                args.push("REINSTALL=ALL");
+                args.push("REINSTALLMODE=vamus");
+            }
+            // msiexec serialises on a global Windows Installer mutex, so a
+            // stuck install elsewhere on the machine blocks this one forever.
+            // Support tickets on 2026-08-24 described Repair still spinning
+            // after twenty minutes against a usual three to five, which is what
+            // that looks like from the outside. Ten minutes is generous for a
+            // driver install and still finite.
+            let outcome = swifttunnel_core::run_hidden_command_with_timeout(
+                "msiexec",
+                &args,
+                Duration::from_secs(600),
+            );
+            if outcome.timed_out {
+                log::warn!("Driver install: msiexec exceeded its deadline and was stopped");
+                return Err(
+                    "Windows Installer did not respond within 10 minutes. Another install may be                      stuck; restart the PC and run Repair again."
+                        .to_string(),
+                );
+            }
+            Ok((
+                if outcome.success { 0 } else { -1 },
+                outcome.stderr.trim().to_string(),
+            ))
+        } else {
+            let args =
+                build_msiexec_install_args(&msi_string, log_string, passive, use_reinstall_mode);
+
+            // Pure Win32 elevation (UAC prompt for msiexec) — no PowerShell
+            // wrapper process, and the installer window stays hidden.
+            let code = swifttunnel_core::utils::run_elevated_and_wait("msiexec.exe", &args, true)
+                .map_err(|e| format!("Failed to invoke elevated installer: {}", e))?;
+
+            Ok((code, String::new()))
+        }
+    };
+
+    let (mut exit_code, mut output_error) = run_install(false, &first_log_string)?;
+    let mut retry_attempted = false;
+
+    // Prefer fully quiet install so repair does not flash a scary x64 installer
+    // window over SwiftTunnel. If a machine rejects the quiet command line,
+    // retry once with passive UI as a compatibility fallback.
+    if exit_code == 1639 {
+        retry_attempted = true;
+        log::warn!("WinpkFilter install returned 1639 with /qn; retrying with /passive");
+        let (retry_code, retry_error) = run_install(true, &retry_log_string)?;
+        exit_code = retry_code;
+        output_error = retry_error;
+    }
+
+    // ── Phase C: handle MSI result ──
+    if !driver_install_success_exit_code(exit_code) {
+        if should_try_inf_fallback(exit_code, &output_error) {
+            log::warn!(
+                "MSI install returned recoverable code {}; attempting INF fallback via pnputil",
+                exit_code
+            );
+            let extract_dir = workspace.extract_dir.clone();
+            let extract_log = extract_dir.join("extract.log");
+            match try_inf_fallback(&workspace.msi_path, &extract_dir, &extract_log) {
+                Ok(()) => {
+                    log::info!("INF fallback succeeded; proceeding to service repair");
+                    // Fall through to Phase D.
+                }
+                Err(fallback_err) => {
+                    // Preserve extract dir for support triage.
+                    log::error!(
+                        "INF fallback failed; extract dir preserved at {}",
+                        extract_dir.display()
+                    );
+                    let mut message = format!(
+                        "Driver install failed (msiexec code {}). INF fallback also failed: {}. Installer log: {}. Extract dir: {}",
+                        exit_code,
+                        fallback_err,
+                        first_log_string,
+                        extract_dir.display()
+                    );
+                    if retry_attempted {
+                        message.push_str(". Retry log: ");
+                        message.push_str(&retry_log_string);
+                    }
+                    return Err(message);
+                }
+            }
+        } else {
+            let mut message = if is_probable_uac_cancel_message(&output_error) {
+                "Driver installation was canceled at the UAC/installer prompt.".to_string()
+            } else {
+                driver_install_failure_message(exit_code)
+            };
+            if !output_error.is_empty() {
+                message.push_str(": ");
+                message.push_str(&output_error);
+            }
+            message.push_str(". Installer log: ");
+            message.push_str(&first_log_string);
+            if retry_attempted {
+                message.push_str(". Retry log: ");
+                message.push_str(&retry_log_string);
+            }
+            return Err(message);
+        }
+    }
+
+    // ── Phase D: post-install verification + self-test ──
+    // The service-repair step only confirms \\.\NDISRD opens. That's
+    // a weak proxy: leftover WinpkFilter installs from other VPN
+    // products (pre-3.6.2) pass the handle-open check and then
+    // fail the reader bind at runtime. self_test runs the next
+    // IOCTL (adapter enumeration) and checks the version floor so
+    // a bad install surfaces here rather than during the user's
+    // first Connect.
+    //
+    // Error strings intentionally begin with phrases the UI's
+    // `isRebootRequired` / `isDriverMissing` helpers substring-match
+    // so the right CTA renders without needing a structured error
+    // enum passed through Tauri serialization.
+    match swifttunnel_core::vpn::SplitTunnelDriver::repair_and_wait_until_available(
+        Duration::from_secs(20),
+    ) {
+        Ok(()) => {
+            if let Err(self_test_err) = swifttunnel_core::vpn::SplitTunnelDriver::self_test() {
+                log::warn!(
+                    "Driver service came up but post-install self-test failed: {}",
+                    self_test_err
+                );
+                if matches!(exit_code, 1641 | 3010) {
+                    let mut message = format!(
+                        "Reboot required to finish driver installation. Windows signaled exit {} and the post-install self-test failed ({}). Please reboot and try again.",
+                        exit_code, self_test_err
+                    );
+                    message.push_str(". Installer log: ");
+                    message.push_str(&first_log_string);
+                    if retry_attempted {
+                        message.push_str(". Retry log: ");
+                        message.push_str(&retry_log_string);
+                    }
+                    return Err(message);
+                }
+                let mut message = self_test_err;
+                message.push_str(". Installer log: ");
+                message.push_str(&first_log_string);
+                if retry_attempted {
+                    message.push_str(". Retry log: ");
+                    message.push_str(&retry_log_string);
+                }
+                return Err(message);
+            }
+            if let Err(error) = workspace.work.cleanup() {
+                log::debug!("Successful driver repair left diagnostic files: {error}");
+            }
+            Ok(())
+        }
+        Err(e) if matches!(exit_code, 1641 | 3010) => {
+            let mut message = format!(
+                "Reboot required to finish driver installation. Windows signaled exit {} and the driver did not come up within the service-repair window ({}). Please reboot and try again.",
+                exit_code, e
+            );
+            message.push_str(". Installer log: ");
+            message.push_str(&first_log_string);
+            if retry_attempted {
+                message.push_str(". Retry log: ");
+                message.push_str(&retry_log_string);
+            }
+            Err(message)
+        }
+        Err(e) => {
+            let mut message = format!(
+                "Driver installation completed, but the driver is still not available after service repair attempts. {}",
+                e
+            );
+            message.push_str(". Installer log: ");
+            message.push_str(&first_log_string);
+            if retry_attempted {
+                message.push_str(". Retry log: ");
+                message.push_str(&retry_log_string);
+            }
+            Err(message)
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct AdminCheckResponse {
+    pub is_admin: bool,
+}
+
+#[tauri::command]
+pub fn system_is_admin() -> AdminCheckResponse {
+    AdminCheckResponse {
+        is_admin: swifttunnel_core::is_administrator(),
+    }
+}
+
+/// Whether the startup network self-heal has finished. The UI queries this on
+/// mount so it never hangs waiting on a `STARTUP_RECOVERY_COMPLETE` event it may
+/// have missed (the recovery can finish before the webview registers a listener).
+#[tauri::command]
+pub fn system_startup_recovery_done(state: tauri::State<'_, crate::state::AppState>) -> bool {
+    *state.startup_recovery_done.borrow()
+}
+
+#[cfg(windows)]
+enum StartupDriverRepairDecision {
+    Skip,
+    Report(DriverCheckResponse),
+    Repair,
+}
+
+#[cfg(windows)]
+fn startup_driver_repair_decision(
+    binding_preference: Option<swifttunnel_core::vpn::AdapterBindingPreference>,
+) -> Result<StartupDriverRepairDecision, String> {
+    use swifttunnel_core::vpn::DriverRecommendedAction;
+
+    let health = swifttunnel_core::vpn::SplitTunnelDriver::health_check();
+    if health.ready {
+        let preflight = swifttunnel_core::vpn::preflight_binding(binding_preference);
+        return match preflight {
+            Ok(info) if is_winpkfilter_binding_disabled_preflight(&info) => {
+                log::info!(
+                    "Startup driver recovery: selected adapter binding is disabled while disconnected; skipping repair because Connect will enable it"
+                );
+                Ok(StartupDriverRepairDecision::Skip)
+            }
+            Ok(info) if is_winpkfilter_binding_missing_preflight(&info) => {
+                log::info!(
+                    "Startup driver recovery: selected adapter binding is missing; running repair"
+                );
+                Ok(StartupDriverRepairDecision::Repair)
+            }
+            Ok(info) => {
+                log::info!(
+                    "Startup driver recovery: driver ready and binding preflight is {} ({})",
+                    info.status,
+                    info.binding_stage.as_deref().unwrap_or("unknown")
+                );
+                Ok(StartupDriverRepairDecision::Skip)
+            }
+            Err(err) => {
+                if is_winpkfilter_repairable_preflight_error(&err) {
+                    log::warn!(
+                        "Startup driver recovery: binding preflight failed with a repairable WinpkFilter error; running repair: {}",
+                        err
+                    );
+                    Ok(StartupDriverRepairDecision::Repair)
+                } else {
+                    log::warn!(
+                        "Startup driver recovery: binding preflight failed while driver is ready: {}",
+                        err
+                    );
+                    Ok(StartupDriverRepairDecision::Skip)
+                }
+            }
+        };
+    }
+
+    if health.reboot_required || health.recommended_action == DriverRecommendedAction::Reboot {
+        log::warn!(
+            "Startup driver recovery: reboot already required before repair: {}",
+            health.message
+        );
+        return Ok(StartupDriverRepairDecision::Report(
+            DriverCheckResponse::from_health(health),
+        ));
+    }
+
+    // Zero TCP/IP-bound adapters is the normal disconnected state, not a fault.
+    // SwiftTunnel unbinds WinpkFilter from every adapter when it disconnects, so
+    // a launch following a clean exit finds nothing bound and the driver reports
+    // itself unhealthy. Treating that as a real fault made the app delete and
+    // recreate the kernel driver service on 9 of 18 launches on one machine,
+    // with a "SwiftTunnel repaired itself" popup every time, to reach a state
+    // Connect produces on its own: it binds the adapter it needs, and the
+    // connect path has its own repair when that genuinely fails.
+    //
+    // This is the same judgement the binding-disabled branch above already makes
+    // for the ready-driver case; it just never got reached, because an unbound
+    // driver reports not-ready and short-circuits before it.
+    if matches!(
+        health.status,
+        swifttunnel_core::vpn::DriverHealthStatus::NoAdapters
+    ) {
+        log::info!(
+            "Startup driver recovery: no adapters are bound while disconnected; skipping repair because Connect binds the adapter it needs"
+        );
+        return Ok(StartupDriverRepairDecision::Skip);
+    }
+
+    match health.recommended_action {
+        DriverRecommendedAction::Install
+        | DriverRecommendedAction::ResetService
+        | DriverRecommendedAction::Reinstall => {
+            log::info!(
+                "Startup driver recovery: driver not ready ({}); running repair",
+                health.message
+            );
+            Ok(StartupDriverRepairDecision::Repair)
+        }
+        DriverRecommendedAction::None => {
+            log::warn!(
+                "Startup driver recovery: driver not ready but no repair action was recommended: {}",
+                health.message
+            );
+            Ok(StartupDriverRepairDecision::Skip)
+        }
+        DriverRecommendedAction::Reboot => Ok(StartupDriverRepairDecision::Report(
+            DriverCheckResponse::from_health(health),
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn repair_binding_preference_from_settings(
+    settings: &mut swifttunnel_core::settings::AppSettings,
+) -> Option<swifttunnel_core::vpn::AdapterBindingPreference> {
+    match crate::commands::vpn::current_binding_preference(settings) {
+        Ok(preference) => preference,
+        Err(e) => {
+            log::warn!(
+                "Could not resolve adapter binding preference before driver repair; continuing with default binding: {}",
+                e
+            );
+            None
+        }
+    }
+}
+
+pub(crate) async fn system_startup_repair_driver_if_needed(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<DriverCheckResponse>, String> {
+    #[cfg(windows)]
+    {
+        let binding_preference = {
+            let mut settings = state.settings.lock();
+            repair_binding_preference_from_settings(&mut settings)
+        };
+
+        let decision = tauri::async_runtime::spawn_blocking(move || {
+            startup_driver_repair_decision(binding_preference)
+        })
+        .await
+        .map_err(|e| format!("Startup driver recovery task failed: {}", e))??;
+
+        match decision {
+            StartupDriverRepairDecision::Skip => Ok(None),
+            StartupDriverRepairDecision::Report(response) => Ok(Some(response)),
+            StartupDriverRepairDecision::Repair => {
+                log::warn!(
+                    "Startup driver recovery found a repairable driver issue; running automatic repair"
+                );
+                // The loading screen waits on this and says why.
+                let _ = tauri::Emitter::emit(
+                    &app,
+                    crate::events::STARTUP_RECOVERY_STAGE,
+                    "driver_repair",
+                );
+                system_repair_driver(app, state).await.map(Some)
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (app, state);
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WindowsFirewallServiceStatus {
+    pub name: String,
+    pub display_name: String,
+    pub state: String,
+    pub start_attempted: bool,
+    pub start_succeeded: bool,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WindowsFirewallRepairResponse {
+    pub supported: bool,
+    pub is_admin: bool,
+    pub before_available: bool,
+    pub after_available: bool,
+    pub reset_attempted: bool,
+    pub reset_succeeded: bool,
+    pub reboot_recommended: bool,
+    pub backup_path: Option<String>,
+    pub message: String,
+    pub probe_before: String,
+    pub probe_after: String,
+    pub reset_output: Option<String>,
+    pub services: Vec<WindowsFirewallServiceStatus>,
+}
+
+impl WindowsFirewallRepairResponse {
+    #[allow(dead_code)]
+    fn unsupported() -> Self {
+        Self {
+            supported: false,
+            is_admin: false,
+            before_available: false,
+            after_available: false,
+            reset_attempted: false,
+            reset_succeeded: false,
+            reboot_recommended: false,
+            backup_path: None,
+            message: "Windows Firewall repair is only available on Windows.".to_string(),
+            probe_before: "not supported".to_string(),
+            probe_after: "not supported".to_string(),
+            reset_output: None,
+            services: Vec::new(),
+        }
+    }
+}
+
+fn parse_windows_service_state(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if !trimmed.to_ascii_uppercase().starts_with("STATE") {
+            continue;
+        }
+
+        let Some((_, rest)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        let _state_code = fields.next();
+        if let Some(state) = fields.next() {
+            return Some(state.to_ascii_uppercase());
+        }
+    }
+
+    None
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct WindowsRepairCommandOutput {
+    success: bool,
+    timed_out: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+#[cfg(windows)]
+impl WindowsRepairCommandOutput {
+    fn summary(&self, command_label: &str) -> String {
+        if self.timed_out {
+            return format!("{command_label} timed out.");
+        }
+
+        let stdout = self.stdout.trim();
+        let stderr = self.stderr.trim();
+        let text = match (stdout.is_empty(), stderr.is_empty()) {
+            (false, false) => format!("{stdout}\n{stderr}"),
+            (false, true) => stdout.to_string(),
+            (true, false) => stderr.to_string(),
+            (true, true) => self
+                .exit_code
+                .map(|code| format!("{command_label} exited with code {code}."))
+                .unwrap_or_else(|| format!("{command_label} exited without output.")),
+        };
+
+        compact_repair_text(&text, 600)
+    }
+}
+
+#[cfg(windows)]
+fn compact_repair_text(text: &str, max_chars: usize) -> String {
+    let normalized = text.trim().replace("\r\n", "\n");
+    let mut compacted = normalized.chars().take(max_chars).collect::<String>();
+    if normalized.chars().count() > max_chars {
+        compacted.push_str("...");
+    }
+    compacted
+}
+
+#[cfg(windows)]
+fn run_windows_repair_command(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> WindowsRepairCommandOutput {
+    let output = swifttunnel_core::run_hidden_command_with_timeout(program, args, timeout);
+    WindowsRepairCommandOutput {
+        success: output.success,
+        timed_out: output.timed_out,
+        exit_code: output.exit_code,
+        stdout: output.stdout,
+        stderr: output.stderr,
+    }
+}
+
+#[cfg(windows)]
+fn probe_windows_firewall() -> WindowsRepairCommandOutput {
+    run_windows_repair_command(
+        "netsh",
+        &["advfirewall", "show", "allprofiles"],
+        Duration::from_secs(8),
+    )
+}
+
+#[cfg(windows)]
+fn path_is_non_empty_file(path: &Path) -> bool {
+    path.metadata()
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false)
+}
+
+#[cfg(any(test, windows))]
+fn firewall_registry_backup_summary(export_summary: &str, reg_export_summary: &str) -> String {
+    format!("export: {export_summary}\nregistry export fallback: {reg_export_summary}")
+}
+
+#[cfg(any(test, windows))]
+fn firewall_backup_failed_message(export_summary: &str, reg_export_summary: &str) -> String {
+    format!(
+        "Windows Firewall repair aborted because policy backup failed: {export_summary}; registry export fallback: {reg_export_summary}"
+    )
+}
+
+#[cfg(windows)]
+struct FirewallPolicyBackup {
+    path: String,
+    summary: String,
+    _workspace: swifttunnel_installer_cache::ProtectedWorkspace,
+}
+
+#[cfg(windows)]
+fn backup_windows_firewall_policy() -> Result<FirewallPolicyBackup, String> {
+    let cache = swifttunnel_installer_cache::InstallerCache::open()
+        .map_err(|e| format!("Could not prepare protected storage for the firewall backup: {e}"))?;
+    let work = cache
+        .workspace("firewall-backup")
+        .map_err(|e| format!("Could not prepare the firewall backup directory: {e}"))?;
+    let wfw_backup_path = work.path().join("windows-firewall-before-reset.wfw");
+    let wfw_backup_path_string = wfw_backup_path.to_string_lossy().to_string();
+    let export = run_windows_repair_command(
+        "netsh",
+        &["advfirewall", "export", wfw_backup_path_string.as_str()],
+        Duration::from_secs(15),
+    );
+    let export_summary = export.summary("netsh advfirewall export");
+    if export.success && path_is_non_empty_file(&wfw_backup_path) {
+        return Ok(FirewallPolicyBackup {
+            path: wfw_backup_path_string,
+            summary: format!("export: {export_summary}"),
+            _workspace: work,
+        });
+    }
+
+    let reg_backup_path = work.path().join("windows-firewall-before-reset.reg");
+    let reg_backup_path_string = reg_backup_path.to_string_lossy().to_string();
+    let reg_export = run_windows_repair_command(
+        "reg",
+        &[
+            "export",
+            r"HKLM\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy",
+            reg_backup_path_string.as_str(),
+            "/y",
+        ],
+        Duration::from_secs(15),
+    );
+    let reg_export_summary = reg_export.summary("reg export firewall policy");
+    if reg_export.success && path_is_non_empty_file(&reg_backup_path) {
+        return Ok(FirewallPolicyBackup {
+            path: reg_backup_path_string,
+            summary: firewall_registry_backup_summary(&export_summary, &reg_export_summary),
+            _workspace: work,
+        });
+    }
+
+    Err(firewall_backup_failed_message(
+        &export_summary,
+        &reg_export_summary,
+    ))
+}
+
+#[cfg(windows)]
+fn query_firewall_service(name: &str, display_name: &str) -> WindowsFirewallServiceStatus {
+    let query = run_windows_repair_command("sc", &["query", name], Duration::from_secs(5));
+    let state = parse_windows_service_state(&format!("{}\n{}", query.stdout, query.stderr))
+        .unwrap_or_else(|| {
+            if query.success {
+                "unknown".to_string()
+            } else {
+                "query_failed".to_string()
+            }
+        });
+
+    WindowsFirewallServiceStatus {
+        name: name.to_string(),
+        display_name: display_name.to_string(),
+        state,
+        start_attempted: false,
+        start_succeeded: false,
+        message: query.summary("sc query"),
+    }
+}
+
+#[cfg(windows)]
+fn repair_firewall_service(name: &str, display_name: &str) -> WindowsFirewallServiceStatus {
+    let mut status = query_firewall_service(name, display_name);
+    if status.state == "RUNNING" {
+        status.message = "service already running".to_string();
+        return status;
+    }
+
+    status.start_attempted = true;
+    let start = run_windows_repair_command("sc", &["start", name], Duration::from_secs(10));
+    let after = poll_firewall_service_running(name, display_name, Duration::from_secs(10));
+    status.state = after.state;
+    status.start_succeeded = status.state == "RUNNING";
+    status.message = if status.start_succeeded {
+        "service started".to_string()
+    } else {
+        format!(
+            "start failed: {}; after query: {}",
+            start.summary("sc start"),
+            after.message
+        )
+    };
+    status
+}
+
+#[cfg(windows)]
+fn poll_firewall_service_running(
+    name: &str,
+    display_name: &str,
+    timeout: Duration,
+) -> WindowsFirewallServiceStatus {
+    let start = std::time::Instant::now();
+    loop {
+        let status = query_firewall_service(name, display_name);
+        if status.state == "RUNNING" || start.elapsed() >= timeout {
+            return status;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[cfg(windows)]
+fn repair_windows_firewall_sync() -> Result<WindowsFirewallRepairResponse, String> {
+    let is_admin = swifttunnel_core::is_administrator();
+    let before_probe = probe_windows_firewall();
+    let before_available = before_probe.success;
+
+    if before_available {
+        return Ok(WindowsFirewallRepairResponse {
+            supported: true,
+            is_admin,
+            before_available: true,
+            after_available: true,
+            reset_attempted: false,
+            reset_succeeded: false,
+            reboot_recommended: false,
+            backup_path: None,
+            message: "Windows Firewall already accepts advfirewall commands.".to_string(),
+            probe_before: before_probe.summary("netsh advfirewall show"),
+            probe_after: "not needed".to_string(),
+            reset_output: None,
+            services: vec![
+                query_firewall_service("BFE", "Base Filtering Engine"),
+                query_firewall_service("MpsSvc", "Windows Defender Firewall"),
+            ],
+        });
+    }
+
+    if !is_admin {
+        return Ok(WindowsFirewallRepairResponse {
+            supported: true,
+            is_admin: false,
+            before_available: false,
+            after_available: false,
+            reset_attempted: false,
+            reset_succeeded: false,
+            reboot_recommended: false,
+            backup_path: None,
+            message: "Administrator privileges are required to repair Windows Firewall."
+                .to_string(),
+            probe_before: before_probe.summary("netsh advfirewall show"),
+            probe_after: "not attempted".to_string(),
+            reset_output: None,
+            services: vec![
+                query_firewall_service("BFE", "Base Filtering Engine"),
+                query_firewall_service("MpsSvc", "Windows Defender Firewall"),
+            ],
+        });
+    }
+
+    let services = vec![
+        repair_firewall_service("BFE", "Base Filtering Engine"),
+        repair_firewall_service("MpsSvc", "Windows Defender Firewall"),
+    ];
+
+    let service_probe = probe_windows_firewall();
+    if service_probe.success {
+        return Ok(WindowsFirewallRepairResponse {
+            supported: true,
+            is_admin: true,
+            before_available: false,
+            after_available: true,
+            reset_attempted: false,
+            reset_succeeded: false,
+            reboot_recommended: false,
+            backup_path: None,
+            message: "Windows Firewall services repaired.".to_string(),
+            probe_before: before_probe.summary("netsh advfirewall show"),
+            probe_after: service_probe.summary("netsh advfirewall show"),
+            reset_output: None,
+            services,
+        });
+    }
+
+    let mut reset_output_parts = Vec::new();
+    let FirewallPolicyBackup {
+        path: backup_path_string,
+        summary: backup_summary,
+        _workspace: _backup_workspace,
+    } = backup_windows_firewall_policy()?;
+    reset_output_parts.push(backup_summary);
+
+    let reset =
+        run_windows_repair_command("netsh", &["advfirewall", "reset"], Duration::from_secs(15));
+    reset_output_parts.push(format!(
+        "reset: {}",
+        reset.summary("netsh advfirewall reset")
+    ));
+    let after_probe = probe_windows_firewall();
+    let after_available = after_probe.success;
+    let reset_succeeded = reset.success;
+
+    Ok(WindowsFirewallRepairResponse {
+        supported: true,
+        is_admin: true,
+        before_available: false,
+        after_available,
+        reset_attempted: true,
+        reset_succeeded,
+        reboot_recommended: reset_succeeded && !after_available,
+        backup_path: Some(backup_path_string),
+        message: if after_available {
+            "Windows Firewall policy reset repaired advfirewall commands.".to_string()
+        } else if reset_succeeded {
+            "Windows Firewall reset completed, but advfirewall commands still fail.".to_string()
+        } else {
+            "Windows Firewall repair did not restore advfirewall commands.".to_string()
+        },
+        probe_before: before_probe.summary("netsh advfirewall show"),
+        probe_after: after_probe.summary("netsh advfirewall show"),
+        reset_output: Some(reset_output_parts.join("\n")),
+        services,
+    })
+}
+
+#[tauri::command]
+pub async fn system_repair_windows_firewall() -> Result<WindowsFirewallRepairResponse, String> {
+    #[cfg(windows)]
+    {
+        tauri::async_runtime::spawn_blocking(|| {
+            let _guard = DRIVER_OPERATION_LOCK
+                .lock()
+                .map_err(|_| "Driver operation lock is poisoned".to_string())?;
+            repair_windows_firewall_sync()
+        })
+        .await
+        .map_err(|e| format!("Windows Firewall repair task failed: {}", e))?
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(WindowsFirewallRepairResponse::unsupported())
+    }
+}
+
+#[derive(Serialize)]
+pub struct DriverCheckResponse {
+    pub installed: bool,
+    pub version: Option<String>,
+    pub ready: bool,
+    pub status: String,
+    pub message: String,
+    pub reboot_required: bool,
+    pub recommended_action: String,
+}
+
+impl DriverCheckResponse {
+    #[cfg(windows)]
+    fn from_health(health: swifttunnel_core::vpn::SplitTunnelDriverHealth) -> Self {
+        Self {
+            installed: health.installed,
+            version: health.version,
+            ready: health.ready,
+            status: health.status.as_str().to_string(),
+            message: health.message,
+            reboot_required: health.reboot_required,
+            recommended_action: health.recommended_action.as_str().to_string(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn repair_failure(
+        health: swifttunnel_core::vpn::SplitTunnelDriverHealth,
+        error: String,
+    ) -> Self {
+        let reboot_required = health.reboot_required
+            || health.status == swifttunnel_core::vpn::DriverHealthStatus::RebootRequired
+            || health.recommended_action == swifttunnel_core::vpn::DriverRecommendedAction::Reboot
+            || swifttunnel_core::vpn::error_messages::driver_reboot_pending(&error);
+        let status = health.status;
+        let recommended_action = health.recommended_action;
+        let message = health.message;
+        Self {
+            installed: health.installed,
+            version: health.version,
+            ready: false,
+            status: if reboot_required {
+                "reboot_required".to_string()
+            } else {
+                status.as_str().to_string()
+            },
+            message: if message.is_empty() {
+                error
+            } else {
+                format!("{}\n\nRepair failed: {}", message, error)
+            },
+            reboot_required,
+            recommended_action: if reboot_required {
+                "reboot".to_string()
+            } else {
+                recommended_action.as_str().to_string()
+            },
+        }
+    }
+
+    #[cfg(windows)]
+    fn binding_repair_failure(
+        health: swifttunnel_core::vpn::SplitTunnelDriverHealth,
+        reason: String,
+    ) -> Self {
+        Self {
+            installed: health.installed,
+            version: health.version,
+            ready: false,
+            status: "binding_missing".to_string(),
+            message: format!(
+                "SwiftTunnel repaired the split-tunnel driver, but Windows still has not attached the network filter to the active adapter. Restart Windows once, then connect again. If it still fails after restarting, contact support with this result.\n\nDetails: {}",
+                reason
+            ),
+            reboot_required: true,
+            recommended_action: "reboot".to_string(),
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn unsupported() -> Self {
+        Self {
+            installed: false,
+            version: None,
+            ready: false,
+            status: "unsupported".to_string(),
+            message: "Split tunnel driver is only supported on Windows.".to_string(),
+            reboot_required: false,
+            recommended_action: "none".to_string(),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_winpkfilter_binding_missing_preflight(
+    preflight: &swifttunnel_core::vpn::BindingPreflightInfo,
+) -> bool {
+    let haystack = format!(
+        "{}\n{}\n{}",
+        preflight.status,
+        preflight.reason,
+        preflight.binding_stage.as_deref().unwrap_or("")
+    )
+    .to_ascii_lowercase();
+
+    preflight.status.eq_ignore_ascii_case("unrecoverable")
+        && !haystack.contains("winpkfilter_binding_disabled")
+        && (haystack.contains("winpkfilter_binding_missing")
+            || (haystack.contains("nt_ndisrd") && haystack.contains("not bound to adapter")))
+}
+
+#[cfg(windows)]
+fn is_winpkfilter_binding_disabled_preflight(
+    preflight: &swifttunnel_core::vpn::BindingPreflightInfo,
+) -> bool {
+    let haystack = format!(
+        "{}\n{}\n{}",
+        preflight.status,
+        preflight.reason,
+        preflight.binding_stage.as_deref().unwrap_or("")
+    )
+    .to_ascii_lowercase();
+
+    preflight.status.eq_ignore_ascii_case("unrecoverable")
+        && (haystack.contains("winpkfilter_binding_disabled")
+            || (haystack.contains("nt_ndisrd") && haystack.contains("disabled on adapter")))
+}
+
+#[cfg(windows)]
+fn driver_repair_response_after_binding_preflight(
+    health: swifttunnel_core::vpn::SplitTunnelDriverHealth,
+    preflight: Result<swifttunnel_core::vpn::BindingPreflightInfo, swifttunnel_core::vpn::VpnError>,
+) -> DriverCheckResponse {
+    let health_response = DriverCheckResponse::from_health(health.clone());
+    if !health.ready {
+        return health_response;
+    }
+
+    match preflight {
+        Ok(preflight)
+            if is_winpkfilter_binding_missing_preflight(&preflight)
+                || is_winpkfilter_binding_disabled_preflight(&preflight) =>
+        {
+            DriverCheckResponse::binding_repair_failure(health, preflight.reason)
+        }
+        Ok(preflight) => {
+            log::info!(
+                "Post-repair split tunnel binding preflight status: {} ({})",
+                preflight.status,
+                preflight.binding_stage.as_deref().unwrap_or("unknown")
+            );
+            health_response
+        }
+        Err(e) => {
+            log::warn!("Post-repair split tunnel binding preflight failed: {}", e);
+            if is_winpkfilter_repairable_preflight_error(&e) {
+                DriverCheckResponse::binding_repair_failure(health, e.to_string())
+            } else {
+                health_response
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_winpkfilter_repairable_preflight_error(error: &swifttunnel_core::vpn::VpnError) -> bool {
+    let haystack = error.to_string().to_ascii_lowercase();
+    if haystack.contains("administrator privileges required")
+        || haystack.contains("access denied")
+        || haystack.contains("access is denied")
+        || haystack.contains("process is not elevated")
+    {
+        return false;
+    }
+
+    haystack.contains("winpkfilter_binding_missing")
+        || haystack.contains("split tunnel driver binding is missing")
+        || haystack.contains("failed to ensure winpkfilter binding")
+        || haystack.contains("winpkfilter binding validation failed")
+        || (haystack.contains("nt_ndisrd")
+            && (haystack.contains("not bound")
+                || haystack.contains("not installed on adapter")
+                || haystack.contains("binding is missing")))
+        || (haystack.contains("split tunnel driver not available")
+            && haystack.contains("windows packet filter driver"))
+        || (haystack.contains("failed to open") && haystack.contains("ndisrd"))
+        || haystack.contains("no tcp/ip-bound network adapters")
+        || haystack.contains("version query failed")
+        || haystack.contains("installed but ioctl failed")
+        || haystack.contains("get_tcpip_bound_adapters_info")
+        || haystack.contains("windows packet filter driver did not become available")
+        || (haystack.contains("driver service") && haystack.contains("reset"))
+}
+
+#[tauri::command]
+pub async fn system_check_driver() -> Result<DriverCheckResponse, String> {
+    #[cfg(windows)]
+    {
+        tauri::async_runtime::spawn_blocking(|| {
+            DriverCheckResponse::from_health(
+                swifttunnel_core::vpn::SplitTunnelDriver::health_check(),
+            )
+        })
+        .await
+        .map_err(|e| format!("Driver check task failed: {}", e))
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(DriverCheckResponse::unsupported())
+    }
+}
+
+#[tauri::command]
+pub async fn system_install_driver(
+    app: tauri::AppHandle,
+    force: Option<bool>,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let force = force.unwrap_or(false);
+        let resource_dir = app.path().resource_dir().ok();
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let program_files_dir = PathBuf::from(
+            std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string()),
+        );
+        tauri::async_runtime::spawn_blocking(move || {
+            let _guard = DRIVER_OPERATION_LOCK
+                .lock()
+                .map_err(|_| "Driver operation lock is poisoned".to_string())?;
+            install_winpkfilter_driver_from_msi(
+                &app,
+                resource_dir.as_deref(),
+                exe_dir.as_deref(),
+                &program_files_dir,
+                force,
+            )
+        })
+        .await
+        .map_err(|e| format!("Driver install task failed: {}", e))?
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (app, force);
+        Err("Driver installation is only supported on Windows".to_string())
+    }
+}
+
+/// Force a full driver reinstall regardless of what the health check says.
+///
+/// `system_repair_driver` deliberately short-circuits when the driver reports
+/// healthy — right for automated Repair-all, but useless when the driver
+/// *reports* ready yet misbehaves in practice (corrupted files, flaky binding
+/// that passes checks). This is the explicit "reinstall the driver" support
+/// action: bundled package first (no UAC when already elevated), elevated MSI
+/// as fallback, then a fresh health check + binding preflight so the caller
+/// can show exactly where it landed — or exactly why it couldn't.
+#[tauri::command]
+pub async fn system_reinstall_driver(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DriverCheckResponse, String> {
+    #[cfg(windows)]
+    {
+        let resource_dir = app.path().resource_dir().ok();
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let program_files_dir = PathBuf::from(
+            std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string()),
+        );
+        let binding_preference = {
+            let mut settings = state.settings.lock();
+            repair_binding_preference_from_settings(&mut settings)
+        };
+
+        tauri::async_runtime::spawn_blocking(move || {
+            let _guard = DRIVER_OPERATION_LOCK
+                .lock()
+                .map_err(|_| "Driver operation lock is poisoned".to_string())?;
+
+            let is_admin = swifttunnel_core::is_administrator();
+            let mut reinstall_errors: Vec<String> = Vec::new();
+
+            if is_admin {
+                match swifttunnel_core::vpn::SplitTunnelDriver::install_driver_from_bundled_package(
+                    resource_dir.as_deref(),
+                    exe_dir.as_deref(),
+                    &program_files_dir,
+                    true, // force: uninstall + clean install even if present
+                ) {
+                    Ok(()) => {
+                        let health = swifttunnel_core::vpn::SplitTunnelDriver::health_check();
+                        let preflight = swifttunnel_core::vpn::preflight_binding_for_connect(
+                            binding_preference.clone(),
+                        );
+                        return Ok(driver_repair_response_after_binding_preflight(
+                            health, preflight,
+                        ));
+                    }
+                    Err(e) => {
+                        log::warn!("Bundled driver package reinstall failed: {}", e);
+                        if swifttunnel_core::vpn::error_messages::driver_reboot_pending(&e) {
+                            return Ok(DriverCheckResponse::repair_failure(
+                                swifttunnel_core::vpn::SplitTunnelDriver::health_check(),
+                                e,
+                            ));
+                        }
+                        reinstall_errors.push(format!("bundled package reinstall failed: {}", e));
+                    }
+                }
+            } else {
+                reinstall_errors
+                    .push("not elevated; using the elevated installer instead".to_string());
+            }
+
+            match install_winpkfilter_driver_from_msi(
+                &app,
+                resource_dir.as_deref(),
+                exe_dir.as_deref(),
+                &program_files_dir,
+                true,
+            ) {
+                Ok(()) => {
+                    let health = swifttunnel_core::vpn::SplitTunnelDriver::health_check();
+                    let preflight =
+                        swifttunnel_core::vpn::preflight_binding_for_connect(binding_preference);
+                    Ok(driver_repair_response_after_binding_preflight(
+                        health, preflight,
+                    ))
+                }
+                Err(e) => {
+                    log::warn!("MSI driver reinstall failed: {}", e);
+                    reinstall_errors.push(format!("MSI reinstall failed: {}", e));
+                    let health = swifttunnel_core::vpn::SplitTunnelDriver::health_check();
+                    Ok(DriverCheckResponse::repair_failure(
+                        health,
+                        reinstall_errors.join("\n"),
+                    ))
+                }
+            }
+        })
+        .await
+        .map_err(|e| format!("Driver reinstall task failed: {}", e))?
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (app, state);
+        Ok(DriverCheckResponse::unsupported())
+    }
+}
+
+#[tauri::command]
+pub async fn system_repair_driver(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DriverCheckResponse, String> {
+    #[cfg(windows)]
+    {
+        let resource_dir = app.path().resource_dir().ok();
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let program_files_dir = PathBuf::from(
+            std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string()),
+        );
+        let binding_preference = {
+            let mut settings = state.settings.lock();
+            repair_binding_preference_from_settings(&mut settings)
+        };
+
+        tauri::async_runtime::spawn_blocking(move || {
+            use swifttunnel_core::vpn::DriverRecommendedAction;
+
+            let _guard = DRIVER_OPERATION_LOCK
+                .lock()
+                .map_err(|_| "Driver operation lock is poisoned".to_string())?;
+            let post_repair_preflight =
+                || swifttunnel_core::vpn::preflight_binding_for_connect(binding_preference.clone());
+            let initial = swifttunnel_core::vpn::SplitTunnelDriver::health_check();
+            let is_admin = swifttunnel_core::is_administrator();
+            let mut current = initial.clone();
+            let mut last_error: Option<String> = None;
+            let mut binding_reinstall_needed = false;
+
+            if initial.ready {
+                match post_repair_preflight() {
+                    Ok(preflight)
+                        if !is_winpkfilter_binding_missing_preflight(&preflight)
+                            && !is_winpkfilter_binding_disabled_preflight(&preflight) =>
+                    {
+                        log::info!(
+                            "Driver repair: selected adapter binding was repaired or already healthy; skipping full driver reinstall"
+                        );
+                        return Ok(driver_repair_response_after_binding_preflight(
+                            current,
+                            Ok(preflight),
+                        ));
+                    }
+                    Ok(preflight) => {
+                        log::warn!(
+                            "Driver repair: selected adapter binding still unhealthy after targeted repair: {}",
+                            preflight.reason
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!("Driver repair: targeted binding repair failed: {}", e);
+                        last_error = Some(format!("targeted binding repair failed: {}", e));
+                    }
+                }
+            }
+
+            if is_admin
+                && (initial.ready
+                    || current.recommended_action == DriverRecommendedAction::ResetService)
+            {
+                match swifttunnel_core::vpn::SplitTunnelDriver::restart_driver_service()
+                    .and_then(|_| {
+                        swifttunnel_core::vpn::SplitTunnelDriver::repair_and_wait_until_available(
+                            Duration::from_secs(15),
+                        )
+                    })
+                    .and_then(|_| swifttunnel_core::vpn::SplitTunnelDriver::self_test())
+                {
+                    Ok(()) => {
+                        current = swifttunnel_core::vpn::SplitTunnelDriver::health_check();
+                        if initial.ready || current.ready {
+                            let preflight = post_repair_preflight();
+                            let response = driver_repair_response_after_binding_preflight(
+                                current.clone(),
+                                preflight,
+                            );
+                            if response.ready {
+                                return Ok(response);
+                            }
+                            if response.status == "binding_missing" {
+                                log::warn!(
+                                    "Driver service reset passed but adapter binding is still missing; escalating to installer repair"
+                                );
+                                binding_reinstall_needed = true;
+                                last_error = Some(response.message.clone());
+                            } else {
+                                return Ok(response);
+                            }
+                        }
+                        log::warn!(
+                            "Driver service reset passed but driver is still not ready; continuing to installer repair: {}",
+                            current.message
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!("Driver service reset failed during repair: {}", e);
+                        last_error = Some(format!("Driver service reset failed: {}", e));
+                        current = swifttunnel_core::vpn::SplitTunnelDriver::health_check();
+                    }
+                }
+            } else if current.recommended_action == DriverRecommendedAction::ResetService {
+                log::info!(
+                    "Skipping in-process driver service reset because SwiftTunnel is not elevated; falling through to elevated MSI repair"
+                );
+            }
+
+            if initial.ready && !binding_reinstall_needed {
+                let mut response = driver_repair_response_after_binding_preflight(
+                    current,
+                    post_repair_preflight(),
+                );
+                if let Some(error) = last_error {
+                    response.message = format!("{}\n\n{}", response.message, error);
+                    response.reboot_required = true;
+                    response.recommended_action = "reboot".to_string();
+                    response.status = "reboot_required".to_string();
+                }
+                return Ok(response);
+            }
+
+            if !initial.ready && current.ready && last_error.is_none() {
+                let preflight = post_repair_preflight();
+                return Ok(driver_repair_response_after_binding_preflight(
+                    current, preflight,
+                ));
+            }
+
+            if current.reboot_required || current.recommended_action == DriverRecommendedAction::Reboot {
+                let mut response = DriverCheckResponse::from_health(current);
+                if let Some(error) = last_error {
+                    response.message = format!("{}\n\n{}", response.message, error);
+                }
+                response.reboot_required = true;
+                response.recommended_action = "reboot".to_string();
+                response.status = "reboot_required".to_string();
+                return Ok(response);
+            }
+
+            let reset_failed =
+                last_error.is_some() && current.recommended_action == DriverRecommendedAction::ResetService;
+            if binding_reinstall_needed || matches!(
+                current.recommended_action,
+                DriverRecommendedAction::Install | DriverRecommendedAction::Reinstall | DriverRecommendedAction::ResetService
+            ) || matches!(
+                initial.recommended_action,
+                DriverRecommendedAction::Install | DriverRecommendedAction::Reinstall | DriverRecommendedAction::ResetService
+            ) || reset_failed
+            {
+                let force_reinstall = binding_reinstall_needed || matches!(
+                    current.recommended_action,
+                    DriverRecommendedAction::Reinstall | DriverRecommendedAction::ResetService
+                ) || matches!(
+                    initial.recommended_action,
+                    DriverRecommendedAction::Reinstall | DriverRecommendedAction::ResetService
+                ) || reset_failed;
+
+                let mut repair_errors = Vec::new();
+                if let Some(error) = &last_error {
+                    repair_errors.push(error.clone());
+                }
+
+                if is_admin {
+                    match swifttunnel_core::vpn::SplitTunnelDriver::install_driver_from_bundled_package(
+                        resource_dir.as_deref(),
+                        exe_dir.as_deref(),
+                        &program_files_dir,
+                        force_reinstall,
+                    ) {
+                        Ok(()) => {
+                            let health = swifttunnel_core::vpn::SplitTunnelDriver::health_check();
+                            let preflight = post_repair_preflight();
+                            return Ok(driver_repair_response_after_binding_preflight(
+                                health, preflight,
+                            ));
+                        }
+                        Err(e) => {
+                            log::warn!("Bundled driver package repair failed: {}", e);
+                            if swifttunnel_core::vpn::error_messages::driver_reboot_pending(&e) {
+                                return Ok(DriverCheckResponse::repair_failure(
+                                    swifttunnel_core::vpn::SplitTunnelDriver::health_check(),
+                                    e,
+                                ));
+                            }
+                            repair_errors.push(format!("bundled package repair failed: {}", e));
+                        }
+                    }
+                } else {
+                    repair_errors.push(
+                        "service reset requires elevation; trying elevated installer repair"
+                            .to_string(),
+                    );
+                }
+
+                match install_winpkfilter_driver_from_msi(
+                    &app,
+                    resource_dir.as_deref(),
+                    exe_dir.as_deref(),
+                    &program_files_dir,
+                    true,
+                ) {
+                    Ok(()) => {
+                        let health = swifttunnel_core::vpn::SplitTunnelDriver::health_check();
+                        let preflight = post_repair_preflight();
+                        return Ok(driver_repair_response_after_binding_preflight(
+                            health, preflight,
+                        ));
+                    }
+                    Err(e) => {
+                        log::warn!("MSI driver repair failed: {}", e);
+                        repair_errors.push(format!("MSI repair failed: {}", e));
+                        let health = swifttunnel_core::vpn::SplitTunnelDriver::health_check();
+                        return Ok(DriverCheckResponse::repair_failure(
+                            health,
+                            repair_errors.join("\n"),
+                        ));
+                    }
+                }
+            }
+
+            let mut response = DriverCheckResponse::from_health(current);
+            if let Some(error) = last_error {
+                response.message = format!("{}\n\n{}", response.message, error);
+            }
+            Ok(response)
+        })
+        .await
+        .map_err(|e| format!("Driver repair task failed: {}", e))?
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (app, state);
+        Ok(DriverCheckResponse::unsupported())
+    }
+}
+
+#[cfg(test)]
+mod windows_firewall_repair_tests {
+    use super::*;
+
+    #[test]
+    fn parse_windows_service_state_reads_running_state() {
+        let output = r#"
+SERVICE_NAME: MpsSvc
+        TYPE               : 20  WIN32_SHARE_PROCESS
+        STATE              : 4  RUNNING
+"#;
+
+        assert_eq!(
+            parse_windows_service_state(output).as_deref(),
+            Some("RUNNING")
+        );
+    }
+
+    #[test]
+    fn parse_windows_service_state_reads_start_pending_state() {
+        let output = r#"
+SERVICE_NAME: MpsSvc
+        TYPE               : 20  WIN32_SHARE_PROCESS
+        STATE              : 2  START_PENDING
+"#;
+
+        assert_eq!(
+            parse_windows_service_state(output).as_deref(),
+            Some("START_PENDING")
+        );
+    }
+
+    #[test]
+    fn parse_windows_service_state_ignores_unrelated_text() {
+        assert_eq!(
+            parse_windows_service_state(
+                "The following command was not found: advfirewall firewall add rule."
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unsupported_windows_firewall_response_is_not_successful() {
+        let response = WindowsFirewallRepairResponse::unsupported();
+        assert!(!response.supported);
+        assert!(!response.after_available);
+        assert!(!response.reset_attempted);
+    }
+
+    #[test]
+    fn firewall_registry_backup_summary_includes_primary_and_fallback_results() {
+        let summary = firewall_registry_backup_summary(
+            "The following command was not found: advfirewall export.",
+            "The operation completed successfully.",
+        );
+
+        assert!(summary.contains("export: The following command was not found"));
+        assert!(summary.contains("registry export fallback: The operation completed successfully"));
+    }
+
+    #[test]
+    fn firewall_backup_failed_message_reports_both_failed_backup_attempts() {
+        let message = firewall_backup_failed_message(
+            "The following command was not found: advfirewall export.",
+            "ERROR: Access is denied.",
+        );
+
+        assert!(message.contains("policy backup failed"));
+        assert!(message.contains("advfirewall export"));
+        assert!(message.contains("registry export fallback"));
+        assert!(message.contains("Access is denied"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn ready_health() -> swifttunnel_core::vpn::SplitTunnelDriverHealth {
+        swifttunnel_core::vpn::SplitTunnelDriverHealth {
+            installed: true,
+            ready: true,
+            status: swifttunnel_core::vpn::DriverHealthStatus::Ready,
+            message: "Windows Packet Filter driver is ready.".to_string(),
+            version: Some("3.6.2".to_string()),
+            reboot_required: false,
+            recommended_action: swifttunnel_core::vpn::DriverRecommendedAction::None,
+        }
+    }
+
+    #[test]
+    fn driver_repair_failure_preserves_confirmed_reboot_health() {
+        let response = DriverCheckResponse::repair_failure(
+            swifttunnel_core::vpn::SplitTunnelDriverHealth {
+                ready: false,
+                status: swifttunnel_core::vpn::DriverHealthStatus::RebootRequired,
+                reboot_required: true,
+                recommended_action: swifttunnel_core::vpn::DriverRecommendedAction::Reboot,
+                ..ready_health()
+            },
+            "The driver self-test could not finish.".into(),
+        );
+        assert!(response.reboot_required);
+        assert_eq!(response.status, "reboot_required");
+        assert_eq!(response.recommended_action, "reboot");
+        assert!(response.message.contains("self-test"));
+    }
+
+    #[test]
+    fn driver_repair_failure_does_not_treat_reboot_history_as_pending_installation() {
+        let response = DriverCheckResponse::repair_failure(
+            swifttunnel_core::vpn::SplitTunnelDriverHealth {
+                ready: false,
+                status: swifttunnel_core::vpn::DriverHealthStatus::Missing,
+                recommended_action: swifttunnel_core::vpn::DriverRecommendedAction::Install,
+                ..ready_health()
+            },
+            "Driver install failed after reboot. No reboot required by the installer.".into(),
+        );
+        assert!(!response.reboot_required);
+        assert_eq!(response.status, "missing");
+        assert_eq!(response.recommended_action, "install");
+    }
+
+    fn preflight(
+        status: &str,
+        reason: &str,
+        binding_stage: Option<&str>,
+    ) -> swifttunnel_core::vpn::BindingPreflightInfo {
+        swifttunnel_core::vpn::BindingPreflightInfo {
+            status: status.to_string(),
+            reason: reason.to_string(),
+            network_signature: "test-network".to_string(),
+            route_resolution_source: "test".to_string(),
+            route_resolution_target_ip: None,
+            resolved_if_index: Some(12),
+            recommended_guid: None,
+            cached_override_used: false,
+            binding_stage: binding_stage.map(str::to_string),
+            candidates: Vec::new(),
+        }
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("swifttunnel_{label}_{nanos}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn driver_download_limit_is_enforced_with_or_without_a_length_header() {
+        struct MustNotRead;
+        impl std::io::Read for MustNotRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("Oversized declaration must be refused before reading");
+            }
+        }
+        assert!(
+            read_driver_download(MustNotRead, Some(1_000_000_000), 4)
+                .unwrap_err()
+                .contains("size limit")
+        );
+        assert!(
+            read_driver_download(std::io::Cursor::new(b"hello"), None, 4)
+                .unwrap_err()
+                .contains("size limit")
+        );
+        assert_eq!(
+            read_driver_download(std::io::Cursor::new(b"data"), Some(4), 4).unwrap(),
+            b"data"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repair_commands_drain_busy_pipes_and_preserve_deadlines_and_exit_codes() {
+        let script = "for ($i=0; $i -lt 3000; $i++) { [Console]::Out.WriteLine('owned stdout'); [Console]::Error.WriteLine('owned stderr') }";
+        let output = run_windows_repair_command(
+            "powershell",
+            &["-NoProfile", "-NonInteractive", "-Command", script],
+            Duration::from_secs(10),
+        );
+        assert!(output.success, "{}", output.stderr);
+        assert_eq!(output.stdout.lines().count(), 3000);
+        assert_eq!(output.stderr.lines().count(), 3000);
+        let failed = run_windows_repair_command("cmd", &["/C", "exit 42"], Duration::from_secs(2));
+        assert!(!failed.success);
+        assert!(!failed.timed_out);
+        assert_eq!(failed.exit_code, Some(42));
+        let started = std::time::Instant::now();
+        let stalled = run_windows_repair_command(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 8",
+            ],
+            Duration::from_secs(1),
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(stalled.timed_out);
+        assert!(!stalled.success);
+        assert!(stalled.stderr.contains("did not finish within"));
+    }
+
+    fn touch(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent dirs");
+        }
+        fs::write(path, b"").expect("write temp file");
+    }
+
+    fn assert_same_canonical_path(actual: &Path, expected: &Path) {
+        let actual = fs::canonicalize(actual).expect("canonicalize actual path");
+        let expected = fs::canonicalize(expected).expect("canonicalize expected path");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn driver_repair_response_reports_missing_binding_after_ready_health() {
+        let response = driver_repair_response_after_binding_preflight(
+            ready_health(),
+            Ok(preflight(
+                "Unrecoverable",
+                "winpkfilter_binding_missing: nt_ndisrd is not bound to adapter 'Ethernet'.",
+                Some("winpkfilter_binding_missing"),
+            )),
+        );
+
+        assert!(!response.ready);
+        assert_eq!(response.status, "binding_missing");
+        assert_eq!(response.recommended_action, "reboot");
+        assert!(response.reboot_required);
+        assert!(
+            response
+                .message
+                .contains("Windows still has not attached the network filter")
+        );
+        assert!(response.message.contains("Ethernet"));
+    }
+
+    #[test]
+    fn disabled_binding_preflight_is_detected_separately_from_missing() {
+        let info = preflight(
+            "unrecoverable",
+            "winpkfilter_binding_disabled: nt_ndisrd is disabled on adapter 'Wi-Fi'.",
+            Some("winpkfilter_binding_missing"),
+        );
+
+        assert!(is_winpkfilter_binding_disabled_preflight(&info));
+        assert!(!is_winpkfilter_binding_missing_preflight(&info));
+    }
+
+    #[test]
+    fn disconnected_binding_stage_skips_missing_binding_repair_without_error_text() {
+        // The public preflight reason is prose, not the internal VpnError.
+        // Startup must recognize the stage without relying on an error prefix.
+        let info = preflight(
+            "unrecoverable",
+            "SwiftTunnel found the active network adapter, but the WinpkFilter binding is disabled while disconnected. Connect will enable it automatically.",
+            Some("winpkfilter_binding_disabled"),
+        );
+        assert!(is_winpkfilter_binding_disabled_preflight(&info));
+        assert!(!is_winpkfilter_binding_missing_preflight(&info));
+    }
+
+    #[test]
+    fn driver_repair_response_ignores_unrelated_unrecoverable_preflight() {
+        let response = driver_repair_response_after_binding_preflight(
+            ready_health(),
+            Ok(preflight(
+                "unrecoverable",
+                "SwiftTunnel could not detect the active network adapter.",
+                Some("unrecoverable"),
+            )),
+        );
+
+        assert!(response.ready);
+        assert_eq!(response.status, "ready");
+        assert_eq!(response.recommended_action, "none");
+    }
+
+    #[test]
+    fn driver_repair_response_fails_open_when_post_repair_preflight_errors() {
+        let response = driver_repair_response_after_binding_preflight(
+            ready_health(),
+            Err(swifttunnel_core::vpn::VpnError::Network(
+                "preflight command failed".to_string(),
+            )),
+        );
+
+        assert!(response.ready);
+        assert_eq!(response.status, "ready");
+        assert_eq!(response.recommended_action, "none");
+    }
+
+    #[test]
+    fn driver_repair_response_reports_repairable_preflight_errors() {
+        let response = driver_repair_response_after_binding_preflight(
+            ready_health(),
+            Err(swifttunnel_core::vpn::VpnError::SplitTunnel(
+                "Failed to ensure WinpkFilter binding on adapter 'Ethernet': PowerShell failed."
+                    .to_string(),
+            )),
+        );
+
+        assert!(!response.ready);
+        assert_eq!(response.status, "binding_missing");
+        assert_eq!(response.recommended_action, "reboot");
+        assert!(response.reboot_required);
+        assert!(
+            response
+                .message
+                .contains("Windows still has not attached the network filter")
+        );
+        assert!(
+            response
+                .message
+                .contains("Failed to ensure WinpkFilter binding")
+        );
+        assert!(!response.message.contains("reinstall SwiftTunnel"));
+    }
+
+    #[test]
+    fn repairable_preflight_error_classifier_rejects_access_denied() {
+        let error = swifttunnel_core::vpn::VpnError::SplitTunnel(
+            "nt_ndisrd adapter validation error: access denied".to_string(),
+        );
+
+        assert!(!is_winpkfilter_repairable_preflight_error(&error));
+    }
+
+    #[test]
+    fn driver_install_success_exit_code_accepts_expected_codes() {
+        for code in [0, 1638, 1641, 3010] {
+            assert!(driver_install_success_exit_code(code));
+        }
+        assert!(!driver_install_success_exit_code(1));
+    }
+
+    #[test]
+    fn driver_install_failure_message_maps_common_codes() {
+        assert!(driver_install_failure_message(1223).contains("canceled"));
+        assert!(driver_install_failure_message(1602).contains("canceled"));
+        assert!(driver_install_failure_message(1603).contains("fatal error"));
+        assert!(driver_install_failure_message(1603).contains("1603"));
+        assert!(driver_install_failure_message(1618).contains("Another installer"));
+        assert!(driver_install_failure_message(1639).contains("invalid command-line"));
+        assert_eq!(
+            driver_install_failure_message(42),
+            "Driver install failed with code 42"
+        );
+    }
+
+    #[test]
+    fn should_try_inf_fallback_triggers_only_on_1603() {
+        // Success codes: never fall back.
+        assert!(!should_try_inf_fallback(0, ""));
+        assert!(!should_try_inf_fallback(1638, ""));
+        assert!(!should_try_inf_fallback(1641, ""));
+        assert!(!should_try_inf_fallback(3010, ""));
+
+        // 1603 is the single recoverable trigger.
+        assert!(should_try_inf_fallback(1603, ""));
+
+        // Everything else must not fall back.
+        for code in [
+            1, 1223, 1602, 1612, 1618, 1619, 1620, 1622, 1625, 1632, 1633, 1639, 1640, 1643, 1644,
+            1645, 1654,
+        ] {
+            assert!(
+                !should_try_inf_fallback(code, ""),
+                "should not fall back on code {}",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn should_try_inf_fallback_rejects_uac_cancel_stderr_even_on_1603() {
+        assert!(!should_try_inf_fallback(
+            1603,
+            "The operation was canceled by the user."
+        ));
+        assert!(!should_try_inf_fallback(1603, "Access is denied."));
+        assert!(!should_try_inf_fallback(
+            1603,
+            "Start-Process : This command requires elevation."
+        ));
+    }
+
+    #[test]
+    fn find_inf_in_extract_dir_finds_at_top_level() {
+        let base = unique_temp_dir("extract_top");
+        touch(&base.join("ndisrd_lwf.inf"));
+        let result = find_inf_in_extract_dir(&base).expect("should find top-level inf");
+        assert_same_canonical_path(&result, &base);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn find_inf_in_extract_dir_finds_nested() {
+        let base = unique_temp_dir("extract_nested");
+        let nested = base.join("PFiles").join("WinpkFilter").join("driver");
+        fs::create_dir_all(&nested).expect("create nested dir");
+        touch(&nested.join("ndisrd_lwf.inf"));
+        let result = find_inf_in_extract_dir(&base).expect("should find nested inf");
+        assert_same_canonical_path(&result, &nested);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn find_inf_in_extract_dir_case_insensitive() {
+        let base = unique_temp_dir("extract_case");
+        touch(&base.join("NDISRD_LWF.INF"));
+        let result = find_inf_in_extract_dir(&base).expect("should find case-insensitive inf");
+        assert_same_canonical_path(&result, &base);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn find_inf_in_extract_dir_errors_when_missing() {
+        let base = unique_temp_dir("extract_missing");
+        touch(&base.join("some_other.inf"));
+        let err = find_inf_in_extract_dir(&base).expect_err("should not find ndisrd_lwf.inf");
+        assert!(err.contains("ndisrd_lwf.inf"));
+        assert!(err.contains(&base.display().to_string()));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn find_inf_in_extract_dir_respects_depth_cap() {
+        let base = unique_temp_dir("extract_deep");
+        // Plant the INF at depth 8 (deeper than the cap of 6).
+        let mut deep = base.clone();
+        for n in 0..8 {
+            deep = deep.join(format!("d{n}"));
+        }
+        fs::create_dir_all(&deep).expect("create deep dirs");
+        touch(&deep.join("ndisrd_lwf.inf"));
+        let err = find_inf_in_extract_dir(&base).expect_err("should not descend past depth cap");
+        assert!(err.contains("ndisrd_lwf.inf"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn find_inf_in_extract_dir_bounds_breadth_and_shares_one_recursive_budget() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let base = Fixture(unique_temp_dir("extract_budget"));
+        for index in 0..8 {
+            touch(&base.0.join(format!("other-{index}.inf")));
+        }
+        assert!(
+            find_inf_in_extract_dir_with_limit(&base.0, 4)
+                .unwrap_err()
+                .contains("too many files")
+        );
+
+        let nested = Fixture(unique_temp_dir("extract_shared_budget"));
+        for index in 0..3 {
+            touch(&nested.0.join(format!("dir-{index}")).join("other.inf"));
+        }
+        // Each directory is small. Only a single shared budget catches the
+        // cumulative work across root and child directory entries.
+        assert!(
+            find_inf_in_extract_dir_with_limit(&nested.0, 4)
+                .unwrap_err()
+                .contains("too many files")
+        );
+        assert!(
+            find_inf_in_extract_dir_with_limit(&nested.0, 6)
+                .unwrap_err()
+                .contains("Could not locate")
+        );
+    }
+
+    #[test]
+    fn is_probable_uac_cancel_message_detects_known_patterns() {
+        assert!(is_probable_uac_cancel_message(
+            "The operation was canceled by the user."
+        ));
+        assert!(is_probable_uac_cancel_message(
+            "Start-Process : This command requires elevation."
+        ));
+        assert!(is_probable_uac_cancel_message("Access is denied."));
+        assert!(!is_probable_uac_cancel_message("Network timeout"));
+    }
+
+    #[test]
+    fn sha256_hex_returns_expected_lowercase_digest() {
+        assert_eq!(
+            sha256_hex(b"swift"),
+            "a33603bf79f74b056172d43b78358a9d6a51ae59d2720741fbb33ce78e3ad607"
+        );
+    }
+
+    #[test]
+    fn validate_payload_sha256_accepts_matching_hash_and_size() {
+        let payload = b"abcdef";
+        let digest = sha256_hex(payload);
+        assert!(validate_payload_sha256(payload, &digest, payload.len()).is_ok());
+    }
+
+    #[test]
+    fn validate_payload_sha256_rejects_small_payload() {
+        let payload = b"abcdef";
+        let digest = sha256_hex(payload);
+        let err = validate_payload_sha256(payload, &digest, payload.len() + 1)
+            .expect_err("payload should be rejected when too small");
+        assert!(err.contains("too small"));
+    }
+
+    #[test]
+    fn validate_payload_sha256_rejects_hash_mismatch() {
+        let payload = b"abcdef";
+        let err = validate_payload_sha256(payload, "deadbeef", payload.len())
+            .expect_err("payload should be rejected when hash mismatches");
+        assert!(err.contains("sha256 mismatch"));
+    }
+
+    #[test]
+    fn find_winpkfilter_msi_prefers_first_existing_candidate() {
+        let pkg = swifttunnel_core::vpn::winpkfilter::native_msi_package();
+        let base = unique_temp_dir("winpkfilter_candidates");
+        let resource_dir = base.join("resources");
+        let exe_dir = base.join("exe");
+        let program_files_dir = base.join("ProgramFiles");
+
+        let preferred = resource_dir.join("drivers").join(pkg.msi_name);
+        let fallback = exe_dir.join("drivers").join(pkg.msi_name);
+
+        touch(&preferred);
+        touch(&fallback);
+
+        let found = find_winpkfilter_msi(
+            pkg.msi_name,
+            Some(resource_dir.as_path()),
+            Some(exe_dir.as_path()),
+            program_files_dir.as_path(),
+        )
+        .expect("should resolve msi path");
+
+        assert_eq!(found, preferred);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn find_winpkfilter_msi_returns_error_when_missing() {
+        let pkg = swifttunnel_core::vpn::winpkfilter::native_msi_package();
+        let base = unique_temp_dir("winpkfilter_missing");
+        let resource_dir = base.join("resources");
+        let program_files_dir = base.join("ProgramFiles");
+
+        let err = find_winpkfilter_msi(
+            pkg.msi_name,
+            Some(resource_dir.as_path()),
+            None,
+            program_files_dir.as_path(),
+        )
+        .expect_err("should error when no msi exists");
+
+        assert!(err.contains("not found in app resources"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn find_winpkfilter_msi_works_for_both_arch_variants() {
+        for pkg in swifttunnel_core::vpn::winpkfilter::ALL_MSI_PACKAGES {
+            let base = unique_temp_dir(&format!("winpkfilter_{}", pkg.arch));
+            let resource_dir = base.join("resources");
+            let program_files_dir = base.join("ProgramFiles");
+
+            let expected = resource_dir.join("drivers").join(pkg.msi_name);
+            touch(&expected);
+
+            let found = find_winpkfilter_msi(
+                pkg.msi_name,
+                Some(resource_dir.as_path()),
+                None,
+                program_files_dir.as_path(),
+            )
+            .expect("should resolve msi path");
+            assert_eq!(found, expected);
+
+            let _ = fs::remove_dir_all(base);
+        }
+    }
+
+    #[test]
+    fn build_msiexec_install_args_quotes_paths_and_flags() {
+        let args = build_msiexec_install_args(
+            "C:\\path with spaces\\WinpkFilter-x64.msi",
+            "C:\\Temp\\log dir\\winpk.log",
+            true,
+            true,
+        );
+        // Paths with spaces must be quoted for msiexec's command line.
+        assert!(args.contains("\"C:\\path with spaces\\WinpkFilter-x64.msi\""));
+        assert!(args.contains("\"C:\\Temp\\log dir\\winpk.log\""));
+        assert!(args.contains("/passive"));
+        assert!(args.contains("/L*V"));
+        assert!(args.contains("REINSTALL=ALL"));
+        assert!(args.contains("REINSTALLMODE=vamus"));
+        // The args string is handed to ShellExecuteExW directly — it must
+        // never contain a PowerShell wrapper again.
+        assert!(!args.contains("Start-Process"));
+    }
+
+    #[test]
+    fn build_msiexec_install_args_quiet_without_reinstall() {
+        let args = build_msiexec_install_args(
+            "C:\\pkg\\WinpkFilter-x64.msi",
+            "C:\\Temp\\winpk.log",
+            false,
+            false,
+        );
+        assert!(args.contains("/qn"));
+        assert!(!args.contains("/passive"));
+        assert!(!args.contains("REINSTALL=ALL"));
+    }
+
+    #[test]
+    fn a_preserved_shared_driver_still_gets_repair_flags() {
+        // Cleanup may return successfully while preserving a shared package.
+        // A positively broken install needs repair even on the automatic path.
+        for force in [false, true] {
+            let requested = driver_repair_requires_reinstall(force, true, false);
+            let args = build_msiexec_install_args(
+                "C:\\fixture\\driver.msi",
+                "C:\\fixture\\install.log",
+                false,
+                requested,
+            );
+            assert!(args.contains("REINSTALL=ALL"));
+            assert!(args.contains("REINSTALLMODE=vamus"));
+        }
+        assert!(!driver_repair_requires_reinstall(true, true, true));
+        assert!(!driver_repair_requires_reinstall(false, false, false));
+    }
+
+    #[test]
+    fn restart_as_admin_args_waits_for_current_pid_without_powershell() {
+        let args = restart_as_admin_args(4242);
+        assert!(args.contains("--wait-relaunch"));
+        assert!(args.contains("4242"));
+        assert!(!args.to_ascii_lowercase().contains("powershell"));
+    }
+}
+
+#[tauri::command]
+pub async fn system_cleanup() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        swifttunnel_core::network_booster::cleanup_all_system_state().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Cleanup task failed: {}", e))?
+}
+
+/// Cleanup tunnel-specific runtime leftovers without removing install-time
+/// state such as the driver package, startup registration, optimizer settings,
+/// hosts entries, or Roblox settings.
+#[tauri::command]
+pub async fn system_cleanup_tunnel_state() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        log::info!("Running tunnel-state cleanup");
+        swifttunnel_core::vpn::recover_tso_on_startup();
+        swifttunnel_core::vpn::recover_ipv6_on_startup();
+        swifttunnel_core::vpn::wfp_block::cleanup_stale();
+        swifttunnel_core::vpn::wfp_block::cleanup();
+        swifttunnel_core::vpn::SplitTunnelDriver::cleanup_stale_state();
+        #[cfg(windows)]
+        match swifttunnel_core::vpn::SplitTunnelDriver::disable_leftover_winpkfilter_bindings() {
+            Ok(disabled) if !disabled.is_empty() => log::info!(
+                "Tunnel-state cleanup: disabled WinpkFilter binding on adapter(s): {}",
+                disabled.join(", ")
+            ),
+            Ok(_) => {}
+            Err(e) => log::warn!("Tunnel-state cleanup: WinpkFilter binding cleanup failed: {e}"),
+        }
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("Tunnel-state cleanup task failed: {}", e))?
+}
+
+#[derive(Serialize, Clone)]
+pub struct NetworkRepairStep {
+    pub id: String,
+    pub label: String,
+    /// "fixed" | "healthy" | "failed" | "skipped"
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Serialize, Clone)]
+pub struct NetworkRepairResponse {
+    pub supported: bool,
+    pub is_admin: bool,
+    /// "fixed" | "healthy" | "partial" | "failed"
+    pub overall: String,
+    pub steps: Vec<NetworkRepairStep>,
+}
+
+#[cfg(windows)]
+fn network_repair_step(
+    id: &str,
+    label: &str,
+    status: &str,
+    detail: impl Into<String>,
+) -> NetworkRepairStep {
+    NetworkRepairStep {
+        id: id.to_string(),
+        label: label.to_string(),
+        status: status.to_string(),
+        detail: detail.into(),
+    }
+}
+
+/// "My internet is broken after SwiftTunnel" repair.
+///
+/// Targets every piece of system state a dead session can leave behind, in
+/// blast-radius order. Unlike tunnel cleanup, this runs unconditionally —
+/// the stuck-tunnel-mode failure is invisible to VPN state (the app restarts
+/// into a clean `disconnected` state while the kernel filter still
+/// blackholes traffic), so gating on an error state would skip exactly the
+/// case this exists for.
+///
+/// Every step runs even if earlier steps fail; per-step results are
+/// reported so support can see which leftover was the culprit.
+#[tauri::command]
+pub async fn system_repair_network(
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<NetworkRepairResponse, String> {
+    #[cfg(windows)]
+    {
+        // Refuse while a session is active: the repair resets adapter modes
+        // and removes our static filters, which would sever a live tunnel
+        // mid-session and then report success.
+        let _vpn_guard = state.vpn_connection.lock().await;
+        let conn_state = state.vpn_state_handle.borrow().clone();
+        if !matches!(
+            conn_state,
+            swifttunnel_core::vpn::ConnectionState::Disconnected
+                | swifttunnel_core::vpn::ConnectionState::Error(_)
+        ) {
+            return Err("Disconnect SwiftTunnel before running internet recovery.".to_string());
+        }
+
+        tauri::async_runtime::spawn_blocking(run_network_repair_steps)
+            .await
+            .map_err(|e| format!("Network repair task failed: {}", e))
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        Ok(NetworkRepairResponse {
+            supported: false,
+            is_admin: false,
+            overall: "failed".to_string(),
+            steps: Vec::new(),
+        })
+    }
+}
+
+#[cfg(windows)]
+fn run_network_repair_steps() -> NetworkRepairResponse {
+    use swifttunnel_core::vpn::tunnel_mode_recovery;
+    use swifttunnel_core::vpn::{SplitTunnelDriver, ipv6_recovery, tso_recovery};
+
+    let _guard = match DRIVER_OPERATION_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return NetworkRepairResponse {
+                supported: true,
+                is_admin: swifttunnel_core::is_administrator(),
+                overall: "failed".to_string(),
+                steps: vec![network_repair_step(
+                    "lock",
+                    "Driver operation lock",
+                    "failed",
+                    "Another driver operation crashed while holding the lock. Restart SwiftTunnel and run recovery again.",
+                )],
+            };
+        }
+    };
+
+    let is_admin = swifttunnel_core::is_administrator();
+    log::info!("Running network repair (internet recovery)");
+    let mut steps: Vec<NetworkRepairStep> = Vec::new();
+
+    // Step 1: adapter tunnel modes — the total-blackout leftover.
+    let marker = tunnel_mode_recovery::read_tunnel_mode_marker();
+    let driver_installed = SplitTunnelDriver::driver_install_evidence();
+    let report = SplitTunnelDriver::cleanup_stale_state_checked();
+    let adapter_step = if let Some(open_error) = &report.driver_open_error {
+        if driver_installed {
+            network_repair_step(
+                "adapter_modes",
+                "Adapter packet filter modes",
+                "failed",
+                format!(
+                    "The split tunnel driver is installed but could not be opened ({}). Run the split tunnel driver repair, then run this again.",
+                    open_error
+                ),
+            )
+        } else {
+            network_repair_step(
+                "adapter_modes",
+                "Adapter packet filter modes",
+                "healthy",
+                "Split tunnel driver is not loaded, so no adapter can be stuck in tunnel mode.",
+            )
+        }
+    } else if !report.errors.is_empty() {
+        network_repair_step(
+            "adapter_modes",
+            "Adapter packet filter modes",
+            "failed",
+            format!(
+                "{}/{} adapter(s) verified default; failures: {}",
+                report.adapters_reset,
+                report.adapters_total,
+                report.errors.join("; ")
+            ),
+        )
+    } else if report.adapters_were_filtering > 0 {
+        network_repair_step(
+            "adapter_modes",
+            "Adapter packet filter modes",
+            "fixed",
+            format!(
+                "{} adapter(s) were stuck with packet filter flags set (this blocks all traffic) — reset and verified on all {} adapter(s).",
+                report.adapters_were_filtering, report.adapters_total
+            ),
+        )
+    } else {
+        network_repair_step(
+            "adapter_modes",
+            "Adapter packet filter modes",
+            "healthy",
+            format!(
+                "All {} adapter(s) already had default packet filter modes.",
+                report.adapters_total
+            ),
+        )
+    };
+    let adapter_modes_clean =
+        report.fully_clean() || (report.driver_open_error.is_some() && !driver_installed);
+    steps.push(adapter_step);
+
+    // Step 2: crash marker bookkeeping (must follow the verified reset).
+    steps.push(if marker.is_some() {
+        if adapter_modes_clean {
+            tunnel_mode_recovery::delete_tunnel_mode_marker();
+            network_repair_step(
+                "tunnel_marker",
+                "Crash marker",
+                "fixed",
+                "A previous session ended without cleaning up (crash or force-close). Marker cleared after verified reset.",
+            )
+        } else {
+            network_repair_step(
+                "tunnel_marker",
+                "Crash marker",
+                "failed",
+                "Crash marker kept because the adapter reset could not be verified; recovery will retry on next launch.",
+            )
+        }
+    } else {
+        network_repair_step("tunnel_marker", "Crash marker", "healthy", "No crash marker present.")
+    });
+
+    // Step 2b: leftover WinpkFilter (nt_ndisrd) adapter binding. After a crash or
+    // force-close the packet-filter LWF can stay bound to adapters and blackhole
+    // all traffic ("No internet, Secured") until the user reconnects. Unbinding it
+    // here self-heals without a reboot; the next connect re-enables it on the
+    // active adapter. The script is a no-op when nothing is bound, so this is safe
+    // to run every time.
+    steps.push(match SplitTunnelDriver::disable_leftover_winpkfilter_bindings() {
+        Ok(disabled) if disabled.is_empty() => network_repair_step(
+            "winpkfilter_binding",
+            "WinpkFilter adapter binding",
+            "healthy",
+            "No leftover WinpkFilter (nt_ndisrd) adapter bindings were found.",
+        ),
+        Ok(disabled) => network_repair_step(
+            "winpkfilter_binding",
+            "WinpkFilter adapter binding",
+            "fixed",
+            format!(
+                "Disabled a leftover WinpkFilter (nt_ndisrd) binding that blocks all internet after a crash, on adapter(s): {}.",
+                disabled.join(", ")
+            ),
+        ),
+        Err(e) => network_repair_step(
+            "winpkfilter_binding",
+            "WinpkFilter adapter binding",
+            "failed",
+            e,
+        ),
+    });
+
+    // Step 3: IPv6 block leftovers (static filters / legacy binding / firewall rule).
+    steps.push(match ipv6_recovery::restore_ipv6_from_marker() {
+        Some(true) => {
+            ipv6_recovery::delete_ipv6_marker();
+            network_repair_step(
+                "ipv6",
+                "IPv6 connectivity",
+                "fixed",
+                "IPv6 was still blocked from a previous session — restored.",
+            )
+        }
+        Some(false) => network_repair_step(
+            "ipv6",
+            "IPv6 connectivity",
+            "failed",
+            "An IPv6 block from a previous session could not be removed; it will be retried on next launch.",
+        ),
+        None => match ipv6_recovery::remove_winpkfilter_ipv6_block_filters() {
+            Ok(()) => network_repair_step(
+                "ipv6",
+                "IPv6 connectivity",
+                "healthy",
+                "No IPv6 block marker; verified no SwiftTunnel IPv6 filters remain.",
+            ),
+            Err(e) => {
+                if driver_installed {
+                    network_repair_step(
+                        "ipv6",
+                        "IPv6 connectivity",
+                        "failed",
+                        format!("Could not verify the driver filter table: {}", e),
+                    )
+                } else {
+                    network_repair_step(
+                        "ipv6",
+                        "IPv6 connectivity",
+                        "healthy",
+                        "Split tunnel driver is not loaded, so no SwiftTunnel IPv6 filters can be active.",
+                    )
+                }
+            }
+        },
+    });
+
+    // Step 4: TSO/LSO offload leftovers from older builds.
+    steps.push(match tso_recovery::restore_tso_from_marker() {
+        Some(true) => {
+            tso_recovery::delete_tso_marker();
+            network_repair_step(
+                "tso",
+                "Adapter offload settings",
+                "fixed",
+                "Adapter offload settings from a previous session were restored.",
+            )
+        }
+        Some(false) => network_repair_step(
+            "tso",
+            "Adapter offload settings",
+            "failed",
+            "Adapter offload settings could not be restored; recovery will retry on next launch.",
+        ),
+        None => network_repair_step(
+            "tso",
+            "Adapter offload settings",
+            "healthy",
+            "No offload-settings marker present.",
+        ),
+    });
+
+    // Step 5: WFP process-block filters (best-effort, no structured result).
+    swifttunnel_core::vpn::wfp_block::cleanup_stale();
+    swifttunnel_core::vpn::wfp_block::cleanup();
+    steps.push(network_repair_step(
+        "wfp",
+        "Windows Filtering Platform blocks",
+        "healthy",
+        "Stale SwiftTunnel WFP filters cleaned (best-effort).",
+    ));
+
+    // Step 6: hosts file. Clean out anything of ours left behind, then make
+    // sure the file is even there. A missing hosts file is what turned country
+    // ban bypass into "unavailable on this network" with no way for anyone to
+    // work out why, since Windows never complains about its absence.
+    swifttunnel_core::roblox_proxy::hosts::recover_stale();
+    steps.push(match swifttunnel_core::roblox_proxy::hosts::ensure_exists() {
+        Ok(true) => network_repair_step(
+            "hosts",
+            "Hosts file",
+            "fixed",
+            "The Windows hosts file was missing and has been recreated. Something removed it, usually antivirus or a PC cleanup tool.",
+        ),
+        Ok(false) => network_repair_step(
+            "hosts",
+            "Hosts file",
+            "healthy",
+            "Hosts file present; stale SwiftTunnel entries cleaned.",
+        ),
+        Err(e) => network_repair_step(
+            "hosts",
+            "Hosts file",
+            "failed",
+            format!("The Windows hosts file is missing and could not be recreated: {e}"),
+        ),
+    });
+
+    // Step 7: DNS cache, so fixed connectivity takes effect immediately.
+    steps.push(
+        match swifttunnel_core::run_hidden_command_with_timeout(
+            "ipconfig",
+            &["/flushdns"],
+            Duration::from_secs(30),
+        ) {
+            output if output.success => {
+                // Routine maintenance, not evidence of a found problem, must
+                // not flip the overall result to "fixed" on a healthy system.
+                network_repair_step("dns", "DNS cache", "healthy", "DNS cache flushed.")
+            }
+            output if output.timed_out => network_repair_step(
+                "dns",
+                "DNS cache",
+                "failed",
+                "ipconfig /flushdns did not respond and was stopped.".to_string(),
+            ),
+            output => network_repair_step(
+                "dns",
+                "DNS cache",
+                "failed",
+                format!(
+                    "ipconfig /flushdns exited with {}",
+                    output.exit_code.unwrap_or(-1)
+                ),
+            ),
+        },
+    );
+
+    let any_failed = steps.iter().any(|s| s.status == "failed");
+    let any_fixed = steps.iter().any(|s| s.status == "fixed");
+    let overall = match (any_failed, any_fixed) {
+        (false, false) => "healthy",
+        (false, true) => "fixed",
+        (true, true) => "partial",
+        (true, false) => "failed",
+    };
+    log::info!(
+        "Network repair finished: overall={}, steps=[{}]",
+        overall,
+        steps
+            .iter()
+            .map(|s| format!("{}={}", s.id, s.status))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    NetworkRepairResponse {
+        supported: true,
+        is_admin,
+        overall: overall.to_string(),
+        steps,
+    }
+}
+
+/// Stop + start the NDISRD kernel service without reinstalling the driver.
+///
+/// Intended for the "wedged NDIS state" case: driver is installed, service
+/// claims to be running, `\\.\NDISRD` opens fine, but connect fails with
+/// bind-level errors (0x80070057, stale adapter binding). This is the state
+/// that historically required a full OS reboot to clear. A service restart
+/// re-runs NDISRD's `DriverEntry`, rebuilds its adapter attachment list, and
+/// clears any in-kernel filter state the prior session left behind — cheaper
+/// than a reboot and works in ~90% of the stuck cases we've seen.
+///
+/// Falls back to the full `repair_and_wait_until_available` flow after the
+/// restart so a service that refuses to come back up still surfaces a
+/// useful error instead of the UI silently claiming success.
+#[tauri::command]
+pub async fn system_reset_driver(
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let _vpn_guard = state.vpn_connection.lock().await;
+        let conn_state = state.vpn_state_handle.borrow().clone();
+        if !matches!(
+            conn_state,
+            swifttunnel_core::vpn::ConnectionState::Disconnected
+                | swifttunnel_core::vpn::ConnectionState::Error(_)
+        ) {
+            return Err(
+                "Disconnect SwiftTunnel before resetting the split tunnel driver.".to_string(),
+            );
+        }
+
+        tauri::async_runtime::spawn_blocking(|| {
+            let _guard = DRIVER_OPERATION_LOCK
+                .lock()
+                .map_err(|_| "Driver operation lock is poisoned".to_string())?;
+            if !swifttunnel_core::is_administrator() {
+                return Err(
+                    "Administrator privileges required to restart the driver service. Please relaunch SwiftTunnel as Administrator."
+                        .to_string(),
+                );
+            }
+
+            log::info!("system_reset_driver: restarting NDISRD service");
+            swifttunnel_core::vpn::SplitTunnelDriver::restart_driver_service()?;
+
+            // After restart, give the service a moment to finish initializing
+            // before the self-test. `repair_and_wait_until_available` polls so
+            // this is usually fast; it also handles the edge case where the
+            // restart left the service in a transient `MARKED_FOR_DELETE`.
+            swifttunnel_core::vpn::SplitTunnelDriver::repair_and_wait_until_available(
+                Duration::from_secs(15),
+            )?;
+
+            // Self-test with the same stringency as post-install so a reset
+            // that "succeeded" at the SCM level but still doesn't pass the
+            // IOCTL test doesn't fool the UI into thinking the problem is
+            // fixed.
+            swifttunnel_core::vpn::SplitTunnelDriver::self_test()?;
+
+            log::info!("system_reset_driver: NDISRD service reset and self-test passed");
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Driver reset task failed: {}", e))?
+    }
+
+    #[cfg(not(windows))]
+    {
+        Err("Driver reset is only supported on Windows".to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn system_uninstall(
+    state: tauri::State<'_, crate::state::AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // Resolve the product before disconnecting or cleaning up. The native
+        // API includes visible per-user installations and selects Desktop's
+        // upgrade family, not the first display-name match in HKLM.
+        let mut uninstall_command = tauri::async_runtime::spawn_blocking(|| {
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("Failed to locate SwiftTunnel: {e}"))?;
+            let dir = exe.parent().ok_or("Failed to locate the install folder")?;
+            if let Some(code) = swifttunnel_core::msi_uninstall::desktop_product_code(dir)? {
+                let mut command = swifttunnel_core::hidden_command("msiexec.exe");
+                command.args(["/x", &code, "/norestart"]);
+                return Ok::<_, String>(command);
+            }
+            let legacy = dir.join("uninstall.exe");
+            if legacy.is_file() {
+                return Ok(swifttunnel_core::hidden_command(&legacy.to_string_lossy()));
+            }
+            Err("No SwiftTunnel uninstaller was found. Open Windows Settings > Apps, or run the current SwiftTunnel installer to repair the installation first.".to_string())
+        })
+        .await
+        .map_err(|e| format!("Could not check the installation: {e}"))??;
+
+        let conn_state = state.vpn_state_handle.borrow().clone();
+        if !matches!(
+            conn_state,
+            swifttunnel_core::vpn::ConnectionState::Disconnected
+        ) {
+            // Tear down the live session before touching the uninstaller.
+            // Best-effort: swallow any error so a stuck driver never blocks
+            // the uninstall. The shared helper has already cleared the split
+            // tunnel handle, set Discord idle, and persisted
+            // `resume_vpn_on_startup = false` by this point, so continuing
+            // is safe even when the driver-level disconnect errored.
+            if let Err(e) = crate::commands::vpn::disconnect_and_persist(&state).await {
+                log::warn!("Uninstall proceeding despite disconnect error: {}", e);
+            }
+        }
+
+        // Run the same stateless cleanup the MSI/NSIS uninstaller is supposed
+        // to invoke with `--cleanup`, but do it while the elevated app binary
+        // is definitely still present. This protects users who uninstall
+        // specifically because their network is already wedged: if the MSI
+        // custom action is skipped, ignored, or loses elevation, stale
+        // WinpkFilter bindings/hosts/WFP state can otherwise survive uninstall
+        // and make the PC look like it only has internet when SwiftTunnel is
+        // reinstalled.
+        if let Err(e) = tauri::async_runtime::spawn_blocking(|| {
+            swifttunnel_core::network_booster::cleanup_all_system_state().map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("Pre-uninstall cleanup task failed: {e}"))?
+        {
+            log::warn!("Uninstall pre-cleanup failed; continuing to uninstaller: {e}");
+        }
+
+        // Start the native uninstaller before closing so launch failures reach
+        // the user. Full MSI UI keeps missing-source and installer-busy errors
+        // visible after this process exits.
+        uninstall_command
+            .spawn()
+            .map_err(|e| format!("Could not start Windows uninstall: {e}"))?;
+
+        app.exit(0);
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        let _ = app;
+        Err("Uninstall is only supported on Windows".to_string())
+    }
+}
+
+#[tauri::command]
+pub fn system_launched_from_startup(state: tauri::State<'_, crate::state::AppState>) -> bool {
+    state.launched_from_startup
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StartupRegistrationSnapshot {
+    pub exists: bool,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum StartupRegistrationRepairResponse {
+    Completed {
+        snapshot: StartupRegistrationSnapshot,
+    },
+    PreferenceChanged {
+        message: String,
+    },
+}
+
+// The caller holds the startup publication lock through this check and the
+// registration write. The settings lock itself is released before OS calls.
+fn repair_current_startup_preference(
+    requested: bool,
+    current: bool,
+    repair: impl FnOnce() -> Result<StartupRegistrationSnapshot, String>,
+) -> Result<StartupRegistrationRepairResponse, String> {
+    if requested != current {
+        return Ok(StartupRegistrationRepairResponse::PreferenceChanged {
+            message: "Your startup setting changed during Repair. Run Startup login again."
+                .to_string(),
+        });
+    }
+    repair().map(|snapshot| StartupRegistrationRepairResponse::Completed { snapshot })
+}
+
+#[cfg(windows)]
+fn read_startup_registration() -> Result<StartupRegistrationSnapshot, String> {
+    let value = swifttunnel_core::autostart::registered_command(crate::autostart::RUN_VALUE_NAME)?;
+    Ok(StartupRegistrationSnapshot {
+        exists: value.is_some(),
+        value,
+    })
+}
+
+#[tauri::command]
+pub async fn system_get_startup_registration() -> Result<StartupRegistrationSnapshot, String> {
+    #[cfg(windows)]
+    {
+        tauri::async_runtime::spawn_blocking(read_startup_registration)
+            .await
+            .map_err(|e| format!("Startup snapshot task failed: {e}"))?
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(StartupRegistrationSnapshot {
+            exists: false,
+            value: None,
+        })
+    }
+}
+
+#[tauri::command]
+pub async fn system_repair_startup_registration(
+    state: tauri::State<'_, crate::state::AppState>,
+    enabled: bool,
+) -> Result<StartupRegistrationRepairResponse, String> {
+    let settings = state.settings.clone();
+    #[cfg(windows)]
+    {
+        tauri::async_runtime::spawn_blocking(move || {
+            let publication = crate::autostart::begin_startup_publication();
+            let current = settings.lock().run_on_startup;
+            repair_current_startup_preference(enabled, current, || {
+                publication.sync(enabled)?;
+                read_startup_registration()
+            })
+        })
+        .await
+        .map_err(|e| format!("Startup repair task failed: {e}"))?
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _publication = crate::autostart::begin_startup_publication();
+        let current = settings.lock().run_on_startup;
+        repair_current_startup_preference(enabled, current, || {
+            Ok(StartupRegistrationSnapshot {
+                exists: false,
+                value: None,
+            })
+        })
+    }
+}
+
+#[tauri::command]
+pub async fn system_restore_startup_registration(
+    snapshot: StartupRegistrationSnapshot,
+) -> Result<StartupRegistrationSnapshot, String> {
+    #[cfg(windows)]
+    {
+        tauri::async_runtime::spawn_blocking(move || {
+            use crate::autostart::{RUN_KEY_PATH, RUN_VALUE_NAME};
+            use std::io::ErrorKind;
+            use winreg::RegKey;
+            use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
+
+            let _publication = crate::autostart::begin_startup_publication();
+            let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+
+            if snapshot.exists {
+                let (run_key, _) = hkcu
+                    .create_subkey(RUN_KEY_PATH)
+                    .map_err(|e| format!("Failed to open startup registry key: {e}"))?;
+                let value = snapshot.value.clone().unwrap_or_default();
+                run_key
+                    .set_value(RUN_VALUE_NAME, &value)
+                    .map_err(|e| format!("Failed to restore startup registry value: {e}"))?;
+            } else {
+                match hkcu.open_subkey_with_flags(RUN_KEY_PATH, KEY_SET_VALUE) {
+                    Ok(run_key) => {
+                        if let Err(e) = run_key.delete_value(RUN_VALUE_NAME)
+                            && e.kind() != ErrorKind::NotFound
+                        {
+                            return Err(format!("Failed to remove startup registry value: {e}"));
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e) => return Err(format!("Failed to open startup registry key: {e}")),
+                }
+            }
+
+            read_startup_registration()
+        })
+        .await
+        .map_err(|e| format!("Startup restore task failed: {e}"))?
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(snapshot)
+    }
+}
+
+#[cfg(test)]
+mod startup_preference_tests {
+    use super::*;
+
+    #[test]
+    fn stale_startup_repair_never_writes_or_snapshots_registration() {
+        for (requested, current) in [(true, false), (false, true)] {
+            let result = repair_current_startup_preference(requested, current, || {
+                panic!("stale Repair must not touch registration")
+            })
+            .unwrap();
+            assert!(matches!(
+                result,
+                StartupRegistrationRepairResponse::PreferenceChanged { .. }
+            ));
+            let json = serde_json::to_value(result).unwrap();
+            assert_eq!(json["outcome"], "preference_changed");
+        }
+    }
+
+    #[test]
+    fn current_startup_repair_preserves_snapshot_and_native_errors() {
+        let result = repair_current_startup_preference(true, true, || {
+            Ok(StartupRegistrationSnapshot {
+                exists: true,
+                value: Some("owned fixture".into()),
+            })
+        })
+        .unwrap();
+        let json = serde_json::to_value(result).unwrap();
+        assert_eq!(json["outcome"], "completed");
+        assert_eq!(json["snapshot"]["value"], "owned fixture");
+        assert_eq!(
+            repair_current_startup_preference(false, false, || Err("injected failure".into()))
+                .unwrap_err(),
+            "injected failure"
+        );
+    }
+}
+
+#[tauri::command]
+pub fn system_show_notification(title: String, body: String) {
+    swifttunnel_core::notification::show_notification(&title, &body);
+}
+
+#[tauri::command]
+pub async fn system_open_url(url: String) -> Result<(), String> {
+    // Shell/browser startup can wait for Explorer or an antivirus scan.
+    // The UI must stay responsive while Windows handles the request.
+    tauri::async_runtime::spawn_blocking(move || swifttunnel_core::utils::try_open_url(&url))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[cfg(windows)]
+async fn launch_restart_helper(app: &tauri::AppHandle) -> Result<(), String> {
+    let exe =
+        std::env::current_exe().map_err(|e| format!("Failed to resolve executable: {}", e))?;
+    let args = restart_as_admin_args(std::process::id());
+
+    tauri::async_runtime::spawn_blocking(move || launch_elevated_swifttunnel(&exe, &args))
+        .await
+        .map_err(|e| format!("Restart helper task failed: {}", e))??;
+
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn system_restart_as_admin(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // Repair callers need a new process even when this one is elevated.
+        // Returning success without relaunching leaves their restart UI waiting.
+        launch_restart_helper(&app).await
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        Err("Administrator restart is only supported on Windows".to_string())
+    }
+}
+
+#[derive(Serialize)]
+pub struct CopyLogFileResponse {
+    pub file_path: String,
+}
+
+/// Copy the SwiftTunnel log FILE to the clipboard (not its contents).
+///
+/// Pasting in Discord, Outlook, or File Explorer attaches the actual file
+/// rather than the raw text — makes it easy for users to hand a log over
+/// to support staff.
+#[tauri::command]
+pub async fn system_copy_log_to_clipboard() -> Result<CopyLogFileResponse, String> {
+    // Multiple windows/IPC callers must not start parallel clipboard helpers.
+    // The worker owns the permit even if the caller stops waiting.
+    static COPY_LOG: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let _permit = COPY_LOG.try_acquire().map_err(|_| {
+        "A log copy is already running. Wait for it to finish, then retry.".to_string()
+    })?;
+    let path = crate::logging::log_file_path();
+    let path_str = path.to_string_lossy().to_string();
+
+    if !path.exists() {
+        return Err(format!(
+            "Log file not found at {}. Try connecting once so the app can write logs, then retry.",
+            path_str
+        ));
+    }
+
+    #[cfg(windows)]
+    {
+        let escaped = path_str.replace('\'', "''");
+        let script = format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+$files = New-Object System.Collections.Specialized.StringCollection
+[void]$files.Add('{}')
+
+for ($i = 0; $i -lt 5; $i++) {{
+    try {{
+        [System.Windows.Forms.Clipboard]::SetFileDropList($files)
+        exit 0
+    }} catch {{
+        if ($i -eq 4) {{
+            throw
+        }}
+        Start-Sleep -Milliseconds 100
+    }}
+}}
+"#,
+            escaped
+        );
+
+        // Bounded, because this is the button people reach for when the app is
+        // already misbehaving. Two tickets on 2026-08-24 reported Copy log doing
+        // nothing at all: the previous `output()` here had no deadline, so on a
+        // machine where PowerShell will not start it simply never returned and
+        // the button stayed dead with nothing to report. Reinstalling could not
+        // help, because the broken part was Windows rather than the app.
+        const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(15);
+
+        let script_for_thread = script.clone();
+        let outcome = tauri::async_runtime::spawn_blocking(move || {
+            let _permit = _permit;
+            swifttunnel_core::run_hidden_command_with_timeout(
+                "powershell",
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-STA",
+                    "-Command",
+                    &script_for_thread,
+                ],
+                CLIPBOARD_TIMEOUT,
+            )
+        })
+        .await
+        .map_err(|e| format!("Clipboard task failed: {}", e))?;
+
+        if !outcome.success {
+            // Failing is survivable; leaving the user with nothing is not. Hand
+            // back the path so they can attach the file by hand, which is the
+            // only thing they actually needed from this button.
+            let reason = outcome.stderr.trim();
+            log::warn!(
+                "Copy log helper failed (timed_out={}): {}",
+                outcome.timed_out,
+                if reason.is_empty() {
+                    "no output"
+                } else {
+                    reason
+                }
+            );
+
+            return Err(if outcome.timed_out {
+                format!(
+                    "Windows did not respond, so the log could not be copied.                      Open this folder and attach swifttunnel.log by hand: {}",
+                    path.parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or(path_str)
+                )
+            } else {
+                format!(
+                    "Could not copy the log. Open this folder and attach                      swifttunnel.log by hand: {}",
+                    path.parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or(path_str)
+                )
+            });
+        }
+
+        Ok(CopyLogFileResponse {
+            file_path: path_str,
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        Err("Copying the log file to the clipboard is only supported on Windows".to_string())
+    }
+}

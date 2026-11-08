@@ -1,0 +1,2240 @@
+//! Reversible system optimizations for the desktop Optimization tab.
+//!
+//! Each tweak is a list of small, individually-reversible actions (registry
+//! writes, power-plan settings, a service pause, or scheduled-task toggles).
+//! `apply` captures the prior state into a snapshot persisted on disk, then
+//! makes the change; `revert` restores from that snapshot. Snapshot presence is
+//! the source of truth for "is this tweak active", so state survives restarts.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+const SNAPSHOT_FILE: &str = "optimization_snapshots.json";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hive {
+    Hkcu,
+    Hklm,
+}
+
+/// A single reversible change. A tweak is an ordered list of these.
+enum Action {
+    RegDword {
+        hive: Hive,
+        path: &'static str,
+        name: &'static str,
+        value: u32,
+    },
+    RegString {
+        hive: Hive,
+        path: &'static str,
+        name: &'static str,
+        value: &'static str,
+    },
+    RegBinary {
+        hive: Hive,
+        path: &'static str,
+        name: &'static str,
+        value: &'static [u8],
+    },
+    /// Create `default_path` and set its DEFAULT value to `value`, capturing
+    /// whether `owned_path` (the topmost key this tweak introduces) already
+    /// existed. Revert deletes the whole `owned_path` tree when we created it.
+    /// Used for shell-extension keys (e.g. the Win11 classic context menu
+    /// CLSID) whose mere EXISTENCE is the switch.
+    RegOwnedKeyDefault {
+        hive: Hive,
+        owned_path: &'static str,
+        default_path: &'static str,
+        value: &'static str,
+    },
+    /// Active power scheme AC value (via powercfg aliases, e.g. SUB_PROCESSOR).
+    PowerAc {
+        subgroup: &'static str,
+        setting: &'static str,
+        value: u32,
+    },
+    /// Stop the service and set it to Disabled.
+    ServiceDisable { name: &'static str },
+    /// Disable a scheduled task.
+    TaskDisable { path: &'static str },
+}
+
+struct Tweak {
+    id: &'static str,
+    requires_admin: bool,
+    requires_reboot: bool,
+    actions: &'static [Action],
+}
+
+/// The catalog. Ids MUST match the frontend optimization catalog 1:1.
+const TWEAKS: &[Tweak] = &[
+    Tweak {
+        id: "mouse_acceleration_disable",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[
+            Action::RegString {
+                hive: Hive::Hkcu,
+                path: r"Control Panel\Mouse",
+                name: "MouseSpeed",
+                value: "0",
+            },
+            Action::RegString {
+                hive: Hive::Hkcu,
+                path: r"Control Panel\Mouse",
+                name: "MouseThreshold1",
+                value: "0",
+            },
+            Action::RegString {
+                hive: Hive::Hkcu,
+                path: r"Control Panel\Mouse",
+                name: "MouseThreshold2",
+                value: "0",
+            },
+        ],
+    },
+    Tweak {
+        id: "visual_effects_performance",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hkcu,
+            path: r"Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects",
+            name: "VisualFXSetting",
+            value: 2,
+        }],
+    },
+    Tweak {
+        id: "transparency_disable",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hkcu,
+            path: r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            name: "EnableTransparency",
+            value: 0,
+        }],
+    },
+    Tweak {
+        id: "background_apps_disable",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications",
+                name: "GlobalUserDisabled",
+                value: 1,
+            },
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications",
+                name: "BackgroundAppGlobalToggle",
+                value: 0,
+            },
+        ],
+    },
+    Tweak {
+        id: "game_mode_enable",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\GameBar",
+                name: "AutoGameModeEnabled",
+                value: 1,
+            },
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\GameBar",
+                name: "AllowAutoGameMode",
+                value: 1,
+            },
+        ],
+    },
+    Tweak {
+        id: "widgets_disable",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\Windows\CurrentVersion\Dsh",
+                name: "AllowNewsAndInterests",
+                value: 0,
+            },
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
+                name: "TaskbarDa",
+                value: 0,
+            },
+        ],
+    },
+    Tweak {
+        id: "startup_delay_disable",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hkcu,
+            path: r"Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize",
+            name: "StartupDelayInMSec",
+            value: 0,
+        }],
+    },
+    Tweak {
+        id: "action_center_disable",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hkcu,
+            path: r"Software\Policies\Microsoft\Windows\Explorer",
+            name: "DisableNotificationCenter",
+            value: 1,
+        }],
+    },
+    Tweak {
+        id: "live_tiles_disable",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hkcu,
+            path: r"Software\Policies\Microsoft\Windows\CurrentVersion\PushNotifications",
+            name: "NoTileApplicationNotification",
+            value: 1,
+        }],
+    },
+    Tweak {
+        id: "fax_service_disable",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::ServiceDisable { name: "Fax" }],
+    },
+    Tweak {
+        id: "foreground_boost_priority",
+        requires_admin: true,
+        requires_reboot: false,
+        // 0x26 = short, variable quantums with a 3x foreground boost — favors the
+        // game you're focused on. Default is 2.
+        actions: &[Action::RegDword {
+            hive: Hive::Hklm,
+            path: r"SYSTEM\CurrentControlSet\Control\PriorityControl",
+            name: "Win32PrioritySeparation",
+            value: 38,
+        }],
+    },
+    Tweak {
+        id: "windowed_games_optimizations_enable",
+        requires_admin: false,
+        requires_reboot: false,
+        // Windows 11 "Optimizations for windowed games" — lower-latency present
+        // path for borderless/windowed games.
+        actions: &[Action::RegString {
+            hive: Hive::Hkcu,
+            path: r"Software\Microsoft\DirectX\UserGpuPreferences",
+            name: "DirectXUserGlobalSettings",
+            value: "SwapEffectUpgradeEnable=1;",
+        }],
+    },
+    Tweak {
+        id: "windows_ads_suggestions_disable",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager",
+                name: "SystemPaneSuggestionsEnabled",
+                value: 0,
+            },
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager",
+                name: "SubscribedContent-338388Enabled",
+                value: 0,
+            },
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager",
+                name: "SubscribedContent-338389Enabled",
+                value: 0,
+            },
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager",
+                name: "SubscribedContent-310093Enabled",
+                value: 0,
+            },
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager",
+                name: "SilentInstalledAppsEnabled",
+                value: 0,
+            },
+        ],
+    },
+    Tweak {
+        id: "search_web_suggestions_disable",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Policies\Microsoft\Windows\Explorer",
+                name: "DisableSearchBoxSuggestions",
+                value: 1,
+            },
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\Windows\CurrentVersion\SearchSettings",
+                name: "IsDynamicSearchBoxEnabled",
+                value: 0,
+            },
+        ],
+    },
+    Tweak {
+        id: "error_reporting_disable",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::ServiceDisable { name: "WerSvc" }],
+    },
+    Tweak {
+        id: "vbs_disable",
+        requires_admin: true,
+        requires_reboot: true,
+        // VBS + HVCI (Memory Integrity) run the OS under a hypervisor and cost
+        // real FPS in games. Revert restores the prior state (or removes the
+        // values when they did not exist, returning to the platform default).
+        actions: &[
+            Action::RegDword {
+                hive: Hive::Hklm,
+                path: r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity",
+                name: "Enabled",
+                value: 0,
+            },
+            Action::RegDword {
+                hive: Hive::Hklm,
+                path: r"SYSTEM\CurrentControlSet\Control\DeviceGuard",
+                name: "EnableVirtualizationBasedSecurity",
+                value: 0,
+            },
+        ],
+    },
+    Tweak {
+        id: "onedrive_disable",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hklm,
+            path: r"SOFTWARE\Policies\Microsoft\Windows\OneDrive",
+            name: "DisableFileSyncNGSC",
+            value: 1,
+        }],
+    },
+    Tweak {
+        id: "windows_auto_updates_disable",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hklm,
+            path: r"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU",
+            name: "NoAutoUpdate",
+            value: 1,
+        }],
+    },
+    Tweak {
+        id: "browser_hardware_accel_disable",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[
+            Action::RegDword {
+                hive: Hive::Hklm,
+                path: r"SOFTWARE\Policies\Google\Chrome",
+                name: "HardwareAccelerationModeEnabled",
+                value: 0,
+            },
+            Action::RegDword {
+                hive: Hive::Hklm,
+                path: r"SOFTWARE\Policies\Microsoft\Edge",
+                name: "HardwareAccelerationModeEnabled",
+                value: 0,
+            },
+        ],
+    },
+    Tweak {
+        id: "cpu_mitigations_disable",
+        requires_admin: true,
+        requires_reboot: true,
+        // Disables Spectre/Meltdown & related CPU mitigations (real CPU cost).
+        // Big security trade-off; revert restores prior state / removes values.
+        actions: &[
+            Action::RegDword {
+                hive: Hive::Hklm,
+                path: r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management",
+                name: "FeatureSettingsOverride",
+                value: 1,
+            },
+            Action::RegDword {
+                hive: Hive::Hklm,
+                path: r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management",
+                name: "FeatureSettingsOverrideMask",
+                value: 3,
+            },
+        ],
+    },
+    Tweak {
+        id: "smartscreen_disable",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hklm,
+            path: r"SOFTWARE\Policies\Microsoft\Windows\System",
+            name: "EnableSmartScreen",
+            value: 0,
+        }],
+    },
+    Tweak {
+        id: "driver_updates_disable",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[
+            Action::RegDword {
+                hive: Hive::Hklm,
+                path: r"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate",
+                name: "ExcludeWUDriversInQualityUpdate",
+                value: 1,
+            },
+            Action::RegDword {
+                hive: Hive::Hklm,
+                path: r"SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching",
+                name: "SearchOrderConfig",
+                value: 0,
+            },
+        ],
+    },
+    Tweak {
+        id: "game_bar_dvr_disable",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\Windows\CurrentVersion\GameDVR",
+                name: "AppCaptureEnabled",
+                value: 0,
+            },
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\Windows\CurrentVersion\GameDVR",
+                name: "AudioCaptureEnabled",
+                value: 0,
+            },
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\GameBar",
+                name: "ShowStartupPanel",
+                value: 0,
+            },
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"System\GameConfigStore",
+                name: "GameDVR_Enabled",
+                value: 0,
+            },
+        ],
+    },
+    Tweak {
+        id: "power_throttling_disable",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hklm,
+            path: r"SYSTEM\CurrentControlSet\Control\Power\PowerThrottling",
+            name: "PowerThrottlingOff",
+            value: 1,
+        }],
+    },
+    Tweak {
+        id: "core_parking_disable",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::PowerAc {
+            subgroup: "SUB_PROCESSOR",
+            setting: "CPMINCORES",
+            value: 100,
+        }],
+    },
+    Tweak {
+        id: "sysmain_pause",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::ServiceDisable { name: "SysMain" }],
+    },
+    Tweak {
+        id: "hags_enable",
+        requires_admin: true,
+        requires_reboot: true,
+        actions: &[Action::RegDword {
+            hive: Hive::Hklm,
+            path: r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",
+            name: "HwSchMode",
+            value: 2,
+        }],
+    },
+    Tweak {
+        // The CEIP scheduled tasks are protected and refuse `schtasks /Change`
+        // even when elevated ("Access is denied"). Use the admin-writable
+        // telemetry policy instead, which actually reduces data collection.
+        id: "telemetry_tasks_disable",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hklm,
+            path: r"SOFTWARE\Policies\Microsoft\Windows\DataCollection",
+            name: "AllowTelemetry",
+            value: 0,
+        }],
+    },
+    Tweak {
+        // Connected User Experiences and Telemetry service. Stopping it cuts
+        // background telemetry CPU/network. Reversible: revert restores the
+        // prior start type.
+        id: "diagtrack_disable",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::ServiceDisable { name: "DiagTrack" }],
+    },
+    Tweak {
+        // Submenu open delay. Default is 400ms; 0 makes menus feel instant.
+        // Per-user, no admin. Reversible: revert restores the prior string.
+        id: "menu_show_delay_fast",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[Action::RegString {
+            hive: Hive::Hkcu,
+            path: r"Control Panel\Desktop",
+            name: "MenuShowDelay",
+            value: "0",
+        }],
+    },
+    Tweak {
+        // Xbox background services. Frees the four Xbox/Game-Bar services for
+        // users who don't use Game Pass or the Xbox app. Reversible: revert
+        // restores each service's prior start type.
+        id: "xbox_services_disable",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[
+            Action::ServiceDisable {
+                name: "XblAuthManager",
+            },
+            Action::ServiceDisable {
+                name: "XblGameSave",
+            },
+            Action::ServiceDisable { name: "XboxGipSvc" },
+            Action::ServiceDisable {
+                name: "XboxNetApiSvc",
+            },
+        ],
+    },
+    Tweak {
+        // Stop Explorer appending "- Shortcut" to new shortcuts. The `link`
+        // value is REG_BINARY; 00 00 00 00 disables the suffix. Takes effect
+        // after the next sign-in (Explorer reads it at session start).
+        id: "shortcut_suffix_disable",
+        requires_admin: false,
+        requires_reboot: true,
+        actions: &[Action::RegBinary {
+            hive: Hive::Hkcu,
+            path: r"Software\Microsoft\Windows\CurrentVersion\Explorer",
+            name: "link",
+            value: &[0, 0, 0, 0],
+        }],
+    },
+    Tweak {
+        // File Explorer compact mode (Windows 11): tighter row spacing, more
+        // items on screen. Per-user, instant for new windows.
+        id: "explorer_compact_mode",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hkcu,
+            path: r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
+            name: "UseCompactMode",
+            value: 1,
+        }],
+    },
+    Tweak {
+        // Disable the accessibility shortcut popups that interrupt games:
+        // Sticky Keys (Shift x5), Toggle Keys (NumLock hold), Filter Keys
+        // (right Shift hold). Flags are the documented "off + no hotkey +
+        // no popup" values; revert restores the previous flags.
+        id: "sticky_keys_disable",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[
+            Action::RegString {
+                hive: Hive::Hkcu,
+                path: r"Control Panel\Accessibility\StickyKeys",
+                name: "Flags",
+                value: "506",
+            },
+            Action::RegString {
+                hive: Hive::Hkcu,
+                path: r"Control Panel\Accessibility\ToggleKeys",
+                name: "Flags",
+                value: "58",
+            },
+            Action::RegString {
+                hive: Hive::Hkcu,
+                path: r"Control Panel\Accessibility\Keyboard Response",
+                name: "Flags",
+                value: "122",
+            },
+        ],
+    },
+    Tweak {
+        // Windows 11 classic (full) right-click menu. The empty InprocServer32
+        // default for this CLSID makes Explorer fall back to the Windows 10
+        // menu. Applies after sign-out/restart; revert deletes the key we
+        // created.
+        id: "classic_context_menu_enable",
+        requires_admin: false,
+        requires_reboot: true,
+        actions: &[Action::RegOwnedKeyDefault {
+            hive: Hive::Hkcu,
+            owned_path: r"Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}",
+            default_path: r"Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32",
+            value: "",
+        }],
+    },
+    Tweak {
+        // Storage Sense's automatic background cleanup. Disabling avoids
+        // surprise disk activity mid-game; cleanup can still be run manually
+        // from Windows Settings.
+        id: "storage_sense_disable",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hkcu,
+            path: r"Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy",
+            name: "01",
+            value: 0,
+        }],
+    },
+    Tweak {
+        // Toast notifications system-wide for the current user. Real focus
+        // gain while gaming; popups (and their sounds/animations) stop until
+        // reverted.
+        id: "notifications_disable",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hkcu,
+            path: r"Software\Microsoft\Windows\CurrentVersion\PushNotifications",
+            name: "ToastEnabled",
+            value: 0,
+        }],
+    },
+    Tweak {
+        // Skip the lock screen entirely - boot/wake lands on the sign-in
+        // prompt. Machine-wide policy, hence admin.
+        id: "lock_screen_disable",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hklm,
+            path: r"SOFTWARE\Policies\Microsoft\Windows\Personalization",
+            name: "NoLockScreen",
+            value: 1,
+        }],
+    },
+    Tweak {
+        // Remove the acrylic blur on the sign-in background - measurably
+        // lighter composition on weak GPUs at logon. Machine-wide policy.
+        id: "lock_screen_blur_disable",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hklm,
+            path: r"SOFTWARE\Policies\Microsoft\Windows\System",
+            name: "DisableAcrylicBackgroundOnLogon",
+            value: 1,
+        }],
+    },
+    // ── Game Booster specials ────────────────────────────────────────────────
+    Tweak {
+        // Turn off Cortana via Windows Search policy — no background assistant.
+        id: "cortana_disable",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hklm,
+            path: r"SOFTWARE\Policies\Microsoft\Windows\Windows Search",
+            name: "AllowCortana",
+            value: 0,
+        }],
+    },
+    Tweak {
+        // Disable the Windows key via a keyboard Scancode Map so it can't yank
+        // you out of a fullscreen game. Machine-wide; applies after a reboot.
+        id: "windows_key_disable",
+        requires_admin: true,
+        requires_reboot: true,
+        actions: &[Action::RegBinary {
+            hive: Hive::Hklm,
+            path: r"SYSTEM\CurrentControlSet\Control\Keyboard Layout",
+            name: "Scancode Map",
+            value: &[
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x5B, 0xE0, 0x00, 0x00, 0x5C, 0xE0, 0x00, 0x00, 0x00, 0x00,
+            ],
+        }],
+    },
+    // ── Speed Up ─────────────────────────────────────────────────────────────
+    Tweak {
+        id: "su_app_timeouts",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[
+            Action::RegString {
+                hive: Hive::Hkcu,
+                path: r"Control Panel\Desktop",
+                name: "HungAppTimeout",
+                value: "1000",
+            },
+            Action::RegString {
+                hive: Hive::Hkcu,
+                path: r"Control Panel\Desktop",
+                name: "WaitToKillAppTimeout",
+                value: "2000",
+            },
+            Action::RegString {
+                hive: Hive::Hkcu,
+                path: r"Control Panel\Desktop",
+                name: "LowLevelHooksTimeout",
+                value: "1000",
+            },
+        ],
+    },
+    Tweak {
+        id: "su_auto_end_tasks",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[Action::RegString {
+            hive: Hive::Hkcu,
+            path: r"Control Panel\Desktop",
+            name: "AutoEndTasks",
+            value: "1",
+        }],
+    },
+    Tweak {
+        id: "su_foreground_lock",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hkcu,
+            path: r"Control Panel\Desktop",
+            name: "ForegroundLockTimeout",
+            value: 0,
+        }],
+    },
+    Tweak {
+        id: "su_system_responsiveness",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hklm,
+            path: r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile",
+            name: "SystemResponsiveness",
+            value: 10,
+        }],
+    },
+    Tweak {
+        id: "su_ntfs_bookkeeping",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[
+            Action::RegDword {
+                hive: Hive::Hklm,
+                path: r"SYSTEM\CurrentControlSet\Control\FileSystem",
+                name: "NtfsDisableLastAccessUpdate",
+                value: 1,
+            },
+            Action::RegDword {
+                hive: Hive::Hklm,
+                path: r"SYSTEM\CurrentControlSet\Control\FileSystem",
+                name: "NtfsDisable8dot3NameCreation",
+                value: 1,
+            },
+        ],
+    },
+    Tweak {
+        id: "su_ntfs_memory",
+        requires_admin: true,
+        requires_reboot: true,
+        actions: &[Action::RegDword {
+            hive: Hive::Hklm,
+            path: r"SYSTEM\CurrentControlSet\Control\FileSystem",
+            name: "NtfsMemoryUsage",
+            value: 2,
+        }],
+    },
+    Tweak {
+        id: "su_disable_paging_exec",
+        requires_admin: true,
+        requires_reboot: true,
+        actions: &[Action::RegDword {
+            hive: Hive::Hklm,
+            path: r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management",
+            name: "DisablePagingExecutive",
+            value: 1,
+        }],
+    },
+    Tweak {
+        id: "su_wait_kill_service",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::RegString {
+            hive: Hive::Hklm,
+            path: r"SYSTEM\CurrentControlSet\Control",
+            name: "WaitToKillServiceTimeout",
+            value: "2000",
+        }],
+    },
+    Tweak {
+        id: "su_disable_auto_defrag",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::TaskDisable {
+            path: r"\Microsoft\Windows\Defrag\ScheduledDefrag",
+        }],
+    },
+    Tweak {
+        id: "su_disable_settings_suggestions",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager",
+                name: "SubscribedContent-338393Enabled",
+                value: 0,
+            },
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager",
+                name: "SubscribedContent-353694Enabled",
+                value: 0,
+            },
+            Action::RegDword {
+                hive: Hive::Hkcu,
+                path: r"Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager",
+                name: "SubscribedContent-353696Enabled",
+                value: 0,
+            },
+        ],
+    },
+    Tweak {
+        id: "su_keyboard_response",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[
+            Action::RegString {
+                hive: Hive::Hkcu,
+                path: r"Control Panel\Keyboard",
+                name: "KeyboardDelay",
+                value: "0",
+            },
+            Action::RegString {
+                hive: Hive::Hkcu,
+                path: r"Control Panel\Keyboard",
+                name: "KeyboardSpeed",
+                value: "31",
+            },
+        ],
+    },
+    Tweak {
+        id: "su_disable_autoplay",
+        requires_admin: false,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hkcu,
+            path: r"Software\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers",
+            name: "DisableAutoplay",
+            value: 1,
+        }],
+    },
+    Tweak {
+        id: "su_tcp_ttl",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hklm,
+            path: r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
+            name: "DefaultTTL",
+            value: 64,
+        }],
+    },
+    Tweak {
+        id: "su_tcp_pmtu",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[
+            Action::RegDword {
+                hive: Hive::Hklm,
+                path: r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
+                name: "EnablePMTUDiscovery",
+                value: 1,
+            },
+            Action::RegDword {
+                hive: Hive::Hklm,
+                path: r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
+                name: "EnablePMTUBHDetect",
+                value: 1,
+            },
+        ],
+    },
+    Tweak {
+        id: "su_tcp_window_scaling",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hklm,
+            path: r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
+            name: "Tcp1323Opts",
+            value: 1,
+        }],
+    },
+    Tweak {
+        id: "su_dns_cache",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[
+            Action::RegDword {
+                hive: Hive::Hklm,
+                path: r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters",
+                name: "CacheHashTableBucketSize",
+                value: 1,
+            },
+            Action::RegDword {
+                hive: Hive::Hklm,
+                path: r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters",
+                name: "CacheHashTableSize",
+                value: 384,
+            },
+            Action::RegDword {
+                hive: Hive::Hklm,
+                path: r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters",
+                name: "MaxCacheEntryTtlLimit",
+                value: 64000,
+            },
+            Action::RegDword {
+                hive: Hive::Hklm,
+                path: r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters",
+                name: "MaxSOACacheEntryTtlLimit",
+                value: 301,
+            },
+        ],
+    },
+    Tweak {
+        id: "su_qos_bandwidth",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hklm,
+            path: r"SOFTWARE\Policies\Microsoft\Windows\Psched",
+            name: "NonBestEffortLimit",
+            value: 0,
+        }],
+    },
+    Tweak {
+        id: "su_edge_personalization",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::RegDword {
+            hive: Hive::Hklm,
+            path: r"SOFTWARE\Policies\Microsoft\Edge",
+            name: "PersonalizationReportingEnabled",
+            value: 0,
+        }],
+    },
+    Tweak {
+        id: "su_svc_remote_registry",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::ServiceDisable {
+            name: "RemoteRegistry",
+        }],
+    },
+    Tweak {
+        id: "su_svc_peer_networking",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[
+            Action::ServiceDisable { name: "PNRPsvc" },
+            Action::ServiceDisable { name: "p2psvc" },
+            Action::ServiceDisable { name: "p2pimsvc" },
+        ],
+    },
+    Tweak {
+        id: "su_svc_webclient",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::ServiceDisable { name: "WebClient" }],
+    },
+    Tweak {
+        id: "su_svc_winrm",
+        requires_admin: true,
+        requires_reboot: false,
+        actions: &[Action::ServiceDisable { name: "WinRM" }],
+    },
+];
+
+fn find_tweak(id: &str) -> Option<&'static Tweak> {
+    TWEAKS.iter().find(|t| t.id == id)
+}
+
+// ── Snapshot model ──────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+enum ActionSnapshot {
+    RegDword {
+        value: Option<u32>,
+    },
+    RegString {
+        value: Option<String>,
+    },
+    RegBinary {
+        value: Option<Vec<u8>>,
+    },
+    /// Whether the owned key already existed before apply.
+    OwnedKey {
+        existed: bool,
+        #[serde(default)]
+        default_captured: bool,
+        #[serde(default)]
+        default_value: Option<String>,
+    },
+    Power {
+        value: Option<u32>,
+        #[serde(default)]
+        scheme: Option<String>,
+    },
+    Service {
+        start_type: Option<u32>,
+        #[serde(default)]
+        was_running: Option<bool>,
+    },
+    Task {
+        was_enabled: bool,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum TweakSnapshot {
+    // Existing releases saved only the action list, after a successful apply.
+    Legacy(Vec<ActionSnapshot>),
+    Journal {
+        captured: Vec<ActionSnapshot>,
+        applied: bool,
+    },
+}
+
+impl TweakSnapshot {
+    fn captured(&self) -> &[ActionSnapshot] {
+        match self {
+            Self::Legacy(captured) | Self::Journal { captured, .. } => captured,
+        }
+    }
+
+    fn applied(&self) -> bool {
+        matches!(self, Self::Legacy(_) | Self::Journal { applied: true, .. })
+    }
+}
+
+type Snapshots = BTreeMap<String, TweakSnapshot>;
+
+static OPTIMIZATION_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn lock_optimization_state() -> Result<MutexGuard<'static, ()>, String> {
+    OPTIMIZATION_STATE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| {
+            "Optimization state lock poisoned; restart SwiftTunnel and try again.".to_string()
+        })
+}
+
+fn snapshot_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| p.join("SwiftTunnel").join(SNAPSHOT_FILE))
+}
+
+fn load_all() -> Result<Snapshots, String> {
+    let path = snapshot_path().ok_or("No config dir for optimization snapshots")?;
+    read_snapshots(&path)
+}
+
+fn read_snapshots(path: &Path) -> Result<Snapshots, String> {
+    match crate::utils::read_text_file_bounded(path, 4 * 1024 * 1024, "Rollback records") {
+        Ok(content) => serde_json::from_str(&content).map_err(|e| {
+            format!(
+                "Cannot read rollback records: {e}. Keep the snapshot file and contact support."
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Snapshots::new()),
+        Err(e) => Err(format!(
+            "Cannot read rollback records: {e}. Check access to your SwiftTunnel settings folder."
+        )),
+    }
+}
+
+fn save_all(map: &Snapshots) -> Result<(), String> {
+    let path = snapshot_path().ok_or("No config dir for optimization snapshots")?;
+    write_snapshots(&path, map).map_err(|e| {
+        format!("Cannot save rollback records: {e}. Check free disk space and folder access.")
+    })
+}
+
+fn write_snapshots(path: &Path, map: &Snapshots) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("No snapshot directory"))?;
+    std::fs::create_dir_all(parent)?;
+    let json = serde_json::to_vec_pretty(map).map_err(std::io::Error::other)?;
+    let staged = parent.join(format!(".optimization-{:032x}.tmp", rand::random::<u128>()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)?;
+    let result = (|| {
+        file.write_all(&json)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows::Win32::Storage::FileSystem::{
+                MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+            };
+            let from: Vec<u16> = staged.as_os_str().encode_wide().chain(Some(0)).collect();
+            let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            unsafe {
+                MoveFileExW(
+                    windows::core::PCWSTR(from.as_ptr()),
+                    windows::core::PCWSTR(to.as_ptr()),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            }
+            .map_err(std::io::Error::from)?;
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::rename(&staged, path)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    result
+}
+
+// ── Public API ──────────────────────────────────────────────────────────────
+
+/// Tweaks with rollback records, including interrupted changes needing revert.
+pub fn active_ids() -> Result<Vec<String>, String> {
+    let _guard = lock_optimization_state()?;
+    Ok(load_all()?.keys().cloned().collect())
+}
+
+/// Apply a tweak. Returns whether a restart is required to finish.
+/// No-op (returns Ok) if the tweak is already applied.
+pub fn apply(id: &str) -> Result<bool, String> {
+    let _guard = lock_optimization_state()?;
+    let tweak = find_tweak(id).ok_or_else(|| format!("Unknown optimization: {id}"))?;
+
+    let mut snapshots = load_all()?;
+    if let Some(snapshot) = snapshots.get(id) {
+        if !snapshot.applied() {
+            return Err("A previous change did not finish. Revert this optimization before applying it again.".into());
+        }
+        return Ok(tweak.requires_reboot); // already applied
+    }
+
+    if tweak.requires_admin && !crate::utils::is_administrator() {
+        return Err(
+            "Administrator required. Restart SwiftTunnel as administrator to apply this optimization."
+                .to_string(),
+        );
+    }
+
+    // Capture the prior state of every action BEFORE changing anything.
+    let mut captured: Vec<ActionSnapshot> = Vec::with_capacity(tweak.actions.len());
+    for action in tweak.actions {
+        captured.push(capture_action(action)?);
+    }
+
+    let apply_context = captured.clone();
+    apply_captured(
+        id,
+        &mut snapshots,
+        captured,
+        |index| apply_action(&tweak.actions[index], &apply_context[index]),
+        |index, snap| restore_action(&tweak.actions[index], snap),
+        save_all,
+    )?;
+    Ok(tweak.requires_reboot)
+}
+
+fn apply_captured(
+    id: &str,
+    snapshots: &mut Snapshots,
+    captured: Vec<ActionSnapshot>,
+    mut apply: impl FnMut(usize) -> Result<(), String>,
+    mut restore: impl FnMut(usize, &ActionSnapshot) -> Result<(), String>,
+    mut persist: impl FnMut(&Snapshots) -> Result<(), String>,
+) -> Result<(), String> {
+    snapshots.insert(
+        id.to_string(),
+        TweakSnapshot::Journal {
+            captured: captured.clone(),
+            applied: false,
+        },
+    );
+    persist(snapshots)?;
+    for index in 0..captured.len() {
+        if let Err(e) = apply(index) {
+            // The failing action may have changed part of its state too.
+            let mut rollback_error = None;
+            for done_index in (0..=index).rev() {
+                if let Err(error) = restore(done_index, &captured[done_index]) {
+                    rollback_error.get_or_insert(error);
+                }
+            }
+            if let Some(error) = rollback_error {
+                return Err(format!(
+                    "Failed to apply {id}: {e}. Rollback also failed: {error}. The rollback record is kept; revert this optimization to retry recovery."
+                ));
+            }
+            snapshots.remove(id);
+            persist(snapshots).map_err(|save_error| format!("Failed to apply {id}: {e}. Settings were restored, but the rollback record could not be cleared: {save_error}"))?;
+            return Err(format!(
+                "Failed to apply {id}: {e}. Prior settings were restored."
+            ));
+        }
+    }
+
+    snapshots.insert(
+        id.to_string(),
+        TweakSnapshot::Journal {
+            captured,
+            applied: true,
+        },
+    );
+    persist(snapshots).map_err(|e| format!("Settings changed but completion could not be saved: {e}. The rollback record is kept; revert before applying again."))
+}
+
+/// Revert a tweak from its snapshot. Returns whether a restart is required.
+/// No-op (returns Ok) if the tweak is not currently applied.
+pub fn revert(id: &str) -> Result<bool, String> {
+    let _guard = lock_optimization_state()?;
+    let tweak = find_tweak(id).ok_or_else(|| format!("Unknown optimization: {id}"))?;
+
+    let mut snapshots = load_all()?;
+    let Some(snapshot) = snapshots.get(id).cloned() else {
+        return Ok(tweak.requires_reboot); // already inactive
+    };
+    let captured = snapshot.captured();
+    if captured.len() != tweak.actions.len() {
+        return Err("Rollback record does not match this optimization. Keep the snapshot file and contact support.".into());
+    }
+
+    if tweak.requires_admin && !crate::utils::is_administrator() {
+        return Err(
+            "Administrator required. Restart SwiftTunnel as administrator to revert this optimization."
+                .to_string(),
+        );
+    }
+
+    let mut first_error: Option<String> = None;
+    for (action, snap) in tweak.actions.iter().zip(captured.iter()).rev() {
+        if let Err(e) = restore_action(action, snap)
+            && first_error.is_none()
+        {
+            first_error = Some(e);
+        }
+    }
+
+    match first_error {
+        Some(e) => Err(format!(
+            "Reverted {id} with errors: {e}. Rollback snapshot was kept so you can retry."
+        )),
+        None => {
+            snapshots.remove(id);
+            save_all(&snapshots)?;
+            Ok(tweak.requires_reboot)
+        }
+    }
+}
+
+// ── Action execution (Windows) ──────────────────────────────────────────────
+
+#[cfg(windows)]
+fn capture_action(action: &Action) -> Result<ActionSnapshot, String> {
+    Ok(match action {
+        Action::RegDword {
+            hive, path, name, ..
+        } => ActionSnapshot::RegDword {
+            value: read_reg_dword(*hive, path, name)?,
+        },
+        Action::RegString {
+            hive, path, name, ..
+        } => ActionSnapshot::RegString {
+            value: read_reg_string(*hive, path, name)?,
+        },
+        Action::RegBinary {
+            hive, path, name, ..
+        } => ActionSnapshot::RegBinary {
+            value: read_reg_binary(*hive, path, name)?,
+        },
+        Action::RegOwnedKeyDefault {
+            hive,
+            owned_path,
+            default_path,
+            ..
+        } => {
+            let existed = reg_key_exists(*hive, owned_path)?;
+            ActionSnapshot::OwnedKey {
+                existed,
+                default_captured: true,
+                default_value: if existed {
+                    read_reg_string(*hive, default_path, "")?
+                } else {
+                    None
+                },
+            }
+        }
+        Action::PowerAc {
+            subgroup, setting, ..
+        } => {
+            let scheme = crate::system_optimizer::SystemOptimizer::active_power_plan_guid()
+                .ok_or("Couldn't read your current power plan. Nothing was changed.")?;
+            ActionSnapshot::Power {
+                value: Some(
+                    read_power_ac(&scheme, subgroup, setting)
+                        .ok_or("Couldn't read the original power setting. Nothing was changed.")?,
+                ),
+                scheme: Some(scheme),
+            }
+        }
+        Action::ServiceDisable { name } => {
+            let start_type = read_service_start_type(name)?;
+            service_start_keyword(start_type)?;
+            let was_running = read_service_running(name)
+                .ok_or("Couldn't read the original service state. Nothing was changed.")?;
+            if start_type == Some(4) && was_running {
+                return Err("This disabled service is still running. It was left unchanged because that state cannot be restored safely.".into());
+            }
+            ActionSnapshot::Service {
+                start_type,
+                was_running: Some(was_running),
+            }
+        }
+        Action::TaskDisable { path } => ActionSnapshot::Task {
+            was_enabled: read_task_enabled(path)
+                .ok_or("Couldn't read the original scheduled-task state. Nothing was changed.")?,
+        },
+    })
+}
+
+#[cfg(windows)]
+fn apply_action(action: &Action, snapshot: &ActionSnapshot) -> Result<(), String> {
+    match action {
+        Action::RegDword {
+            hive,
+            path,
+            name,
+            value,
+        } => write_reg_dword(*hive, path, name, *value),
+        Action::RegString {
+            hive,
+            path,
+            name,
+            value,
+        } => write_reg_string(*hive, path, name, value),
+        Action::RegBinary {
+            hive,
+            path,
+            name,
+            value,
+        } => write_reg_binary(*hive, path, name, value),
+        Action::RegOwnedKeyDefault {
+            hive,
+            default_path,
+            value,
+            ..
+        } => {
+            // The DEFAULT value is set on the key itself (empty value name).
+            write_reg_string(*hive, default_path, "", value)
+        }
+        Action::PowerAc {
+            subgroup,
+            setting,
+            value,
+        } => {
+            let ActionSnapshot::Power {
+                scheme: Some(scheme),
+                ..
+            } = snapshot
+            else {
+                return Err(
+                    "Couldn't identify the original power plan. Nothing was changed.".into(),
+                );
+            };
+            set_power_ac(scheme, subgroup, setting, *value)
+        }
+        Action::ServiceDisable { name } => {
+            // Stop is best-effort (service may already be stopped).
+            let _ = run("sc", &["stop", name]);
+            run("sc", &["config", name, "start=", "disabled"]).map(|_| ())
+        }
+        Action::TaskDisable { path } => {
+            run("schtasks", &["/Change", "/TN", path, "/DISABLE"]).map(|_| ())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn restore_action(action: &Action, snap: &ActionSnapshot) -> Result<(), String> {
+    match (action, snap) {
+        (
+            Action::RegDword {
+                hive, path, name, ..
+            },
+            ActionSnapshot::RegDword { value },
+        ) => match value {
+            Some(v) => write_reg_dword(*hive, path, name, *v),
+            None => delete_reg_value(*hive, path, name),
+        },
+        (
+            Action::RegString {
+                hive, path, name, ..
+            },
+            ActionSnapshot::RegString { value },
+        ) => match value {
+            Some(v) => write_reg_string(*hive, path, name, v),
+            None => delete_reg_value(*hive, path, name),
+        },
+        (
+            Action::RegBinary {
+                hive, path, name, ..
+            },
+            ActionSnapshot::RegBinary { value },
+        ) => match value {
+            Some(v) => write_reg_binary(*hive, path, name, v),
+            None => delete_reg_value(*hive, path, name),
+        },
+        (
+            Action::RegOwnedKeyDefault {
+                hive,
+                owned_path,
+                default_path,
+                ..
+            },
+            ActionSnapshot::OwnedKey { existed, default_captured, default_value },
+        ) => {
+            if *existed {
+                if !default_captured {
+                    return Err("This older undo record is missing the original Windows setting. Contact support and include your log.".into());
+                }
+                match default_value {
+                    Some(value) => write_reg_string(*hive, default_path, "", value),
+                    None => delete_reg_value(*hive, default_path, ""),
+                }
+            } else {
+                delete_reg_key_tree(*hive, owned_path)
+            }
+        }
+        (
+            Action::PowerAc {
+                subgroup, setting, ..
+            },
+            ActionSnapshot::Power { value, scheme },
+        ) => match (value, scheme) {
+            (Some(value), Some(scheme)) => set_power_ac(scheme, subgroup, setting, *value),
+            _ => Err("The original power plan or setting is missing from this older undo record. Contact support and include your log.".into()),
+        },
+        (
+            Action::ServiceDisable { name },
+            ActionSnapshot::Service {
+                start_type,
+                was_running,
+            },
+        ) => {
+            let keyword = service_start_keyword(*start_type)?;
+            if was_running.is_none() {
+                return Err("This older undo record is missing the original service state. Contact support and include your log.".into());
+            }
+            run("sc", &["config", name, "start=", keyword])?;
+            if let Some(running) = was_running
+                && read_service_running(name) != Some(*running)
+            {
+                run("sc", &[if *running { "start" } else { "stop" }, name])?;
+            }
+            Ok(())
+        }
+        (Action::TaskDisable { path }, ActionSnapshot::Task { was_enabled }) => {
+            if *was_enabled {
+                run("schtasks", &["/Change", "/TN", path, "/ENABLE"]).map(|_| ())
+            } else {
+                Ok(())
+            }
+        }
+        _ => Err("snapshot/action mismatch".to_string()),
+    }
+}
+
+// ── Registry helpers (Windows) ──────────────────────────────────────────────
+
+#[cfg(windows)]
+fn reg_root(hive: Hive) -> winreg::RegKey {
+    use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    RegKey::predef(match hive {
+        Hive::Hkcu => HKEY_CURRENT_USER,
+        Hive::Hklm => HKEY_LOCAL_MACHINE,
+    })
+}
+
+#[cfg(windows)]
+fn read_reg_dword(hive: Hive, path: &str, name: &str) -> Result<Option<u32>, String> {
+    use winreg::types::FromRegValue;
+    read_typed_registry(hive, path, name, winreg::enums::RegType::REG_DWORD)?
+        .as_ref()
+        .map(u32::from_reg_value)
+        .transpose()
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(windows)]
+fn read_reg_string(hive: Hive, path: &str, name: &str) -> Result<Option<String>, String> {
+    use winreg::types::FromRegValue;
+    read_typed_registry(hive, path, name, winreg::enums::RegType::REG_SZ)?
+        .as_ref()
+        .map(String::from_reg_value)
+        .transpose()
+        .map_err(|e| e.to_string())
+}
+
+// Missing is a valid original value. Denied access, corrupt data or a different
+// registry type is not missing and must never become a destructive undo record.
+#[cfg(windows)]
+fn optional_registry<T>(result: std::io::Result<T>) -> Result<Option<T>, String> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "Couldn't read the original Windows setting. Nothing was changed: {error}"
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn read_typed_registry(
+    hive: Hive,
+    path: &str,
+    name: &str,
+    expected: winreg::enums::RegType,
+) -> Result<Option<winreg::RegValue>, String> {
+    let Some(key) = optional_registry(reg_root(hive).open_subkey(path))? else {
+        return Ok(None);
+    };
+    let value = crate::registry_value::read_raw(&key, name).map_err(|error| {
+        format!("Couldn't read the original Windows setting. Nothing was changed: {error}")
+    })?;
+    if value.as_ref().is_some_and(|value| value.vtype != expected) {
+        return Err("This Windows setting has an unexpected type. It was left unchanged.".into());
+    }
+    Ok(value)
+}
+
+#[cfg(windows)]
+fn write_reg_dword(hive: Hive, path: &str, name: &str, value: u32) -> Result<(), String> {
+    let (key, _) = reg_root(hive)
+        .create_subkey(path)
+        .map_err(|e| format!("open {path}: {e}"))?;
+    key.set_value(name, &value)
+        .map_err(|e| format!("set {name}: {e}"))
+}
+
+#[cfg(windows)]
+fn write_reg_string(hive: Hive, path: &str, name: &str, value: &str) -> Result<(), String> {
+    let (key, _) = reg_root(hive)
+        .create_subkey(path)
+        .map_err(|e| format!("open {path}: {e}"))?;
+    key.set_value(name, &value.to_string())
+        .map_err(|e| format!("set {name}: {e}"))
+}
+
+#[cfg(windows)]
+fn read_reg_binary(hive: Hive, path: &str, name: &str) -> Result<Option<Vec<u8>>, String> {
+    Ok(
+        read_typed_registry(hive, path, name, winreg::enums::RegType::REG_BINARY)?
+            .map(|value| value.bytes),
+    )
+}
+
+#[cfg(windows)]
+fn write_reg_binary(hive: Hive, path: &str, name: &str, value: &[u8]) -> Result<(), String> {
+    let (key, _) = reg_root(hive)
+        .create_subkey(path)
+        .map_err(|e| format!("open {path}: {e}"))?;
+    let raw = winreg::RegValue {
+        vtype: winreg::enums::RegType::REG_BINARY,
+        bytes: value.to_vec(),
+    };
+    key.set_raw_value(name, &raw)
+        .map_err(|e| format!("set {name}: {e}"))
+}
+
+#[cfg(windows)]
+fn reg_key_exists(hive: Hive, path: &str) -> Result<bool, String> {
+    Ok(optional_registry(reg_root(hive).open_subkey(path))?.is_some())
+}
+
+#[cfg(windows)]
+fn delete_reg_key_tree(hive: Hive, path: &str) -> Result<(), String> {
+    match reg_root(hive).delete_subkey_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("delete key {path}: {e}")),
+    }
+}
+
+#[cfg(windows)]
+fn delete_reg_value(hive: Hive, path: &str, name: &str) -> Result<(), String> {
+    let key = match reg_root(hive).open_subkey_with_flags(path, winreg::enums::KEY_ALL_ACCESS) {
+        Ok(k) => k,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("open {path}: {e}")),
+    };
+    match key.delete_value(name) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("delete {name}: {e}")),
+    }
+}
+
+#[cfg(windows)]
+fn read_service_start_type(name: &str) -> Result<Option<u32>, String> {
+    read_reg_dword(
+        Hive::Hklm,
+        &format!(r"SYSTEM\CurrentControlSet\Services\{name}"),
+        "Start",
+    )
+}
+
+fn service_start_keyword(start_type: Option<u32>) -> Result<&'static str, String> {
+    match start_type {
+        Some(2) => Ok("auto"), Some(3) => Ok("demand"), Some(4) => Ok("disabled"),
+        _ => Err("The original service startup setting is unavailable or unsupported. It was left unchanged.".into()),
+    }
+}
+
+fn parse_service_running(text: &str) -> Option<bool> {
+    let state = text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("STATE")
+            .and_then(|rest| rest.trim().strip_prefix(':'))
+    })?;
+    match state.split_whitespace().next()? {
+        "1" => Some(false),
+        "4" => Some(true),
+        _ => None, // Starting, stopping or paused is not a stable original state.
+    }
+}
+
+#[cfg(windows)]
+fn read_service_running(name: &str) -> Option<bool> {
+    // `sc query` blocks on the service control manager, which a hung service
+    // can hold. Reporting "unknown" beats stalling the caller.
+    let out = crate::run_hidden_command_with_timeout(
+        "sc",
+        &["query", name],
+        std::time::Duration::from_secs(20),
+    );
+    if !out.success {
+        return None;
+    }
+    parse_service_running(&out.stdout)
+}
+
+// ── powercfg helpers (Windows) ──────────────────────────────────────────────
+
+fn valid_scheme_guid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+#[cfg(windows)]
+fn read_power_ac(scheme: &str, subgroup: &str, setting: &str) -> Option<u32> {
+    let out = crate::run_hidden_command_with_timeout(
+        "powercfg",
+        &["/query", scheme, subgroup, setting],
+        std::time::Duration::from_secs(20),
+    );
+    if !out.success {
+        return None;
+    }
+    let text = out.stdout;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Current AC Power Setting Index:") {
+            let token = rest.trim();
+            let parsed = if let Some(hex) = token.strip_prefix("0x") {
+                u32::from_str_radix(hex, 16).ok()
+            } else {
+                token.parse::<u32>().ok()
+            };
+            return parsed;
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn set_power_ac(scheme: &str, subgroup: &str, setting: &str, value: u32) -> Result<(), String> {
+    if !valid_scheme_guid(scheme) {
+        return Err("The saved power plan could not be identified. It was left unchanged.".into());
+    }
+    run(
+        "powercfg",
+        &[
+            "/setacvalueindex",
+            scheme,
+            subgroup,
+            setting,
+            &value.to_string(),
+        ],
+    )?;
+    run("powercfg", &["/setactive", "SCHEME_CURRENT"]).map(|_| ())
+}
+
+// ── scheduled tasks (Windows) ───────────────────────────────────────────────
+
+#[cfg(windows)]
+fn read_task_enabled(path: &str) -> Option<bool> {
+    let (folder, name) = path.rsplit_once('\\')?;
+    let folder = format!("{folder}\\").replace('\'', "''");
+    let name = name.replace('\'', "''");
+    // Structured booleans are independent of Windows display language. The
+    // old human-readable Status line also describes readiness, not Enabled.
+    let script = format!(
+        "$ErrorActionPreference='Stop'; (Get-ScheduledTask -TaskPath '{folder}' -TaskName '{name}').Settings.Enabled | ConvertTo-Json -Compress"
+    );
+    let out = crate::run_hidden_command_with_timeout(
+        "powershell",
+        &["-NoProfile", "-NonInteractive", "-Command", &script],
+        std::time::Duration::from_secs(20),
+    );
+    if !out.success {
+        return None; // task does not exist
+    }
+    serde_json::from_str::<bool>(out.stdout.trim().trim_start_matches('\u{feff}')).ok()
+}
+
+// ── command runner (Windows) ────────────────────────────────────────────────
+
+#[cfg(windows)]
+fn run(program: &str, args: &[&str]) -> Result<String, String> {
+    let out =
+        crate::run_hidden_command_with_timeout(program, args, std::time::Duration::from_secs(20));
+    if out.success {
+        Ok(out.stdout)
+    } else {
+        let stderr = out.stderr.trim().to_string();
+        let stdout = out.stdout.trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        Err(format!("{program} failed: {detail}"))
+    }
+}
+
+// ── Non-Windows stubs ───────────────────────────────────────────────────────
+
+#[cfg(not(windows))]
+fn capture_action(_action: &Action) -> Result<ActionSnapshot, String> {
+    Err("Optimizations are only supported on Windows".to_string())
+}
+
+#[cfg(not(windows))]
+fn apply_action(_action: &Action, _snapshot: &ActionSnapshot) -> Result<(), String> {
+    Err("Optimizations are only supported on Windows".to_string())
+}
+
+#[cfg(not(windows))]
+fn restore_action(_action: &Action, _snap: &ActionSnapshot) -> Result<(), String> {
+    Err("Optimizations are only supported on Windows".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn registry_snapshot_distinguishes_missing_denied_wrong_type_and_oversized_values() {
+        use winreg::{
+            RegKey, RegValue,
+            enums::{HKEY_CURRENT_USER, RegType},
+        };
+        struct Fixture(&'static str);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(self.0);
+            }
+        }
+        let path: &'static str = Box::leak(
+            format!(
+                r"Software\SwiftTunnel\AuditFixtures\{:016x}",
+                rand::random::<u64>()
+            )
+            .into_boxed_str(),
+        );
+        let fixture = Fixture(path);
+        let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
+            .create_subkey(path)
+            .unwrap();
+        assert_eq!(read_reg_dword(Hive::Hkcu, path, "missing").unwrap(), None);
+        assert!(
+            optional_registry::<()>(Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            )))
+            .is_err()
+        );
+        key.set_value("wrong", &"keep this string").unwrap();
+        assert!(
+            capture_action(&Action::RegDword {
+                hive: Hive::Hkcu,
+                path,
+                name: "wrong",
+                value: 1
+            })
+            .is_err()
+        );
+        assert_eq!(
+            key.get_value::<String, _>("wrong").unwrap(),
+            "keep this string"
+        );
+        key.set_value("number", &17u32).unwrap();
+        assert_eq!(
+            read_reg_dword(Hive::Hkcu, path, "number").unwrap(),
+            Some(17)
+        );
+        assert!(read_reg_binary(Hive::Hkcu, path, "number").is_err());
+        key.set_raw_value(
+            "large",
+            &RegValue {
+                vtype: RegType::REG_BINARY,
+                bytes: vec![0; 65538],
+            },
+        )
+        .unwrap();
+        assert!(read_reg_binary(Hive::Hkcu, path, "large").is_err());
+        drop(key);
+        drop(fixture);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owned_key_undo_restores_its_existing_default_instead_of_deleting_it() {
+        use winreg::{RegKey, enums::HKEY_CURRENT_USER};
+        struct Fixture(&'static str);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(self.0);
+            }
+        }
+        let path: &'static str = Box::leak(
+            format!(
+                r"Software\SwiftTunnel\AuditFixtures\{:016x}",
+                rand::random::<u64>()
+            )
+            .into_boxed_str(),
+        );
+        let fixture = Fixture(path);
+        let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
+            .create_subkey(path)
+            .unwrap();
+        key.set_value("", &"original default").unwrap();
+        let action = Action::RegOwnedKeyDefault {
+            hive: Hive::Hkcu,
+            owned_path: path,
+            default_path: path,
+            value: "applied default",
+        };
+        let snapshot = capture_action(&action).unwrap();
+        let snapshot: ActionSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        apply_action(&action, &snapshot).unwrap();
+        assert_eq!(key.get_value::<String, _>("").unwrap(), "applied default");
+        restore_action(&action, &snapshot).unwrap();
+        assert_eq!(key.get_value::<String, _>("").unwrap(), "original default");
+        let old: ActionSnapshot =
+            serde_json::from_str(r#"{"kind":"OwnedKey","existed":true}"#).unwrap();
+        assert!(restore_action(&action, &old).is_err());
+        assert_eq!(key.get_value::<String, _>("").unwrap(), "original default");
+        drop(key);
+        drop(fixture);
+    }
+
+    #[test]
+    fn service_snapshots_reject_unstable_states_and_never_invent_a_start_type() {
+        assert_eq!(parse_service_running("STATE : 4 RUNNING"), Some(true));
+        assert_eq!(parse_service_running("STATE : 1 STOPPED"), Some(false));
+        assert_eq!(parse_service_running("STATE : 2 START_PENDING"), None);
+        assert_eq!(parse_service_running("STATE : 3 STOP_PENDING"), None);
+        assert_eq!(parse_service_running("STATE : 7 PAUSED"), None);
+        assert_eq!(parse_service_running("Access denied"), None);
+        assert!(service_start_keyword(None).is_err());
+        assert!(service_start_keyword(Some(1)).is_err());
+        assert_eq!(service_start_keyword(Some(2)).unwrap(), "auto");
+        assert_eq!(service_start_keyword(Some(3)).unwrap(), "demand");
+        assert_eq!(service_start_keyword(Some(4)).unwrap(), "disabled");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn incomplete_legacy_power_and_service_undo_records_do_not_run_system_changes() {
+        let power = Action::PowerAc {
+            subgroup: "not-a-setting",
+            setting: "not-a-setting",
+            value: 100,
+        };
+        assert!(
+            restore_action(
+                &power,
+                &ActionSnapshot::Power {
+                    value: Some(10),
+                    scheme: None
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            restore_action(
+                &power,
+                &ActionSnapshot::Power {
+                    value: None,
+                    scheme: Some("not-a-guid".into())
+                }
+            )
+            .is_err()
+        );
+        assert!(set_power_ac("SCHEME_CURRENT", "invalid", "invalid", 0).is_err());
+        let service = Action::ServiceDisable {
+            name: "not-a-service",
+        };
+        assert!(
+            restore_action(
+                &service,
+                &ActionSnapshot::Service {
+                    start_type: None,
+                    was_running: Some(true)
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            restore_action(
+                &service,
+                &ActionSnapshot::Service {
+                    start_type: Some(3),
+                    was_running: None
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn power_snapshot_keeps_the_original_scheme_and_rejects_aliases_and_corrupt_guids() {
+        let scheme = "381b4222-f694-41f0-9685-ff5bb260df2e";
+        assert!(valid_scheme_guid(scheme));
+        for invalid in [
+            "SCHEME_CURRENT",
+            "../plan",
+            "--------------------1234567890123456",
+            "381b4222-f694-41f0-9685-ff5bb260df2g",
+        ] {
+            assert!(!valid_scheme_guid(invalid));
+        }
+        let snapshot = ActionSnapshot::Power {
+            value: Some(0),
+            scheme: Some(scheme.into()),
+        };
+        let roundtrip: ActionSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        assert!(
+            matches!(roundtrip, ActionSnapshot::Power { value: Some(0), scheme: Some(original) } if original == scheme)
+        );
+    }
+
+    #[test]
+    fn snapshot_save_failure_prevents_system_changes() {
+        let changed = std::cell::Cell::new(0);
+        let result = apply_captured(
+            "test",
+            &mut Snapshots::new(),
+            vec![ActionSnapshot::RegDword { value: Some(1) }],
+            |_| {
+                changed.set(changed.get() + 1);
+                Ok(())
+            },
+            |_, _| Ok(()),
+            |_| Err("disk full".into()),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            changed.get(),
+            0,
+            "changed the system without a durable snapshot"
+        );
+    }
+
+    #[test]
+    fn incomplete_apply_restores_the_failing_action_and_keeps_failed_rollback() {
+        let restored = std::cell::RefCell::new(Vec::new());
+        let disk = std::cell::RefCell::new(Snapshots::new());
+        let captured = vec![ActionSnapshot::RegDword { value: Some(1) }; 3];
+        let result = apply_captured(
+            "test",
+            &mut Snapshots::new(),
+            captured,
+            |index| {
+                assert!(!disk.borrow()["test"].applied());
+                if index == 1 {
+                    Err("partially changed".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |index, _| {
+                restored.borrow_mut().push(index);
+                Err("restore failed".into())
+            },
+            |map| {
+                *disk.borrow_mut() = map.clone();
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(*restored.borrow(), [1, 0]);
+        assert!(!disk.borrow()["test"].applied());
+    }
+
+    #[test]
+    fn completion_save_failure_keeps_pending_rollback_record() {
+        let disk = std::cell::RefCell::new(Snapshots::new());
+        let mut writes = 0;
+        let result = apply_captured(
+            "test",
+            &mut Snapshots::new(),
+            vec![ActionSnapshot::Task { was_enabled: true }],
+            |_| Ok(()),
+            |_, _| Ok(()),
+            |map| {
+                writes += 1;
+                if writes == 2 {
+                    return Err("disk full".into());
+                }
+                *disk.borrow_mut() = map.clone();
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!disk.borrow()["test"].applied());
+        assert_eq!(disk.borrow()["test"].captured().len(), 1);
+    }
+
+    #[test]
+    fn successful_rollback_clears_only_its_own_record() {
+        let mut snapshots = Snapshots::new();
+        snapshots.insert("other".into(), TweakSnapshot::Legacy(vec![]));
+        let mut disk = snapshots.clone();
+        let mut restored = Vec::new();
+        let result = apply_captured(
+            "test",
+            &mut snapshots,
+            vec![ActionSnapshot::Task { was_enabled: true }; 2],
+            |index| {
+                if index == 1 {
+                    Err("apply failed".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |index, _| {
+                restored.push(index);
+                Ok(())
+            },
+            |map| {
+                disk = map.clone();
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(restored, [1, 0]);
+        assert!(disk.contains_key("other"));
+        assert!(!disk.contains_key("test"));
+    }
+
+    #[test]
+    fn snapshot_file_rejects_corruption_and_preserves_old_data_on_failed_replace() {
+        let dir =
+            std::env::temp_dir().join(format!("swift-opt-test-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join(SNAPSHOT_FILE);
+        assert!(read_snapshots(&path).unwrap().is_empty());
+        std::fs::write(&path, "broken json").unwrap();
+        assert!(read_snapshots(&path).is_err());
+        std::fs::write(&path, r#"{"old":[{"kind":"Task","was_enabled":true}]}"#).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert!(read_snapshots(&path).unwrap()["old"].applied());
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // A real sharing violation at replacement time, after staging.
+            let _guard = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&path)
+                .unwrap();
+            assert!(write_snapshots(&path, &Snapshots::new()).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        }
+        write_snapshots(&path, &Snapshots::new()).unwrap();
+        assert!(read_snapshots(&path).unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn catalog_ids_are_unique() {
+        let mut ids: Vec<&str> = TWEAKS.iter().map(|t| t.id).collect();
+        ids.sort_unstable();
+        let len = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), len, "duplicate tweak id in catalog");
+    }
+
+    #[test]
+    fn catalog_matches_frontend_ids() {
+        // Keep this list in lockstep with src/components/optimization/optimizationCatalog.ts
+        let expected = [
+            "mouse_acceleration_disable",
+            "visual_effects_performance",
+            "transparency_disable",
+            "background_apps_disable",
+            "game_mode_enable",
+            "widgets_disable",
+            "startup_delay_disable",
+            "action_center_disable",
+            "live_tiles_disable",
+            "fax_service_disable",
+            "foreground_boost_priority",
+            "windowed_games_optimizations_enable",
+            "windows_ads_suggestions_disable",
+            "search_web_suggestions_disable",
+            "error_reporting_disable",
+            "vbs_disable",
+            "onedrive_disable",
+            "windows_auto_updates_disable",
+            "browser_hardware_accel_disable",
+            "cpu_mitigations_disable",
+            "smartscreen_disable",
+            "driver_updates_disable",
+            "game_bar_dvr_disable",
+            "power_throttling_disable",
+            "core_parking_disable",
+            "sysmain_pause",
+            "hags_enable",
+            "telemetry_tasks_disable",
+            "diagtrack_disable",
+            "menu_show_delay_fast",
+            "xbox_services_disable",
+            "shortcut_suffix_disable",
+            "explorer_compact_mode",
+            "sticky_keys_disable",
+            "classic_context_menu_enable",
+            "storage_sense_disable",
+            "notifications_disable",
+            "lock_screen_disable",
+            "lock_screen_blur_disable",
+            "cortana_disable",
+            "windows_key_disable",
+            "su_app_timeouts",
+            "su_auto_end_tasks",
+            "su_foreground_lock",
+            "su_system_responsiveness",
+            "su_ntfs_bookkeeping",
+            "su_ntfs_memory",
+            "su_disable_paging_exec",
+            "su_wait_kill_service",
+            "su_disable_auto_defrag",
+            "su_disable_settings_suggestions",
+            "su_keyboard_response",
+            "su_disable_autoplay",
+            "su_tcp_ttl",
+            "su_tcp_pmtu",
+            "su_tcp_window_scaling",
+            "su_dns_cache",
+            "su_qos_bandwidth",
+            "su_edge_personalization",
+            "su_svc_remote_registry",
+            "su_svc_peer_networking",
+            "su_svc_webclient",
+            "su_svc_winrm",
+        ];
+        for id in expected {
+            assert!(find_tweak(id).is_some(), "missing tweak: {id}");
+        }
+        assert_eq!(TWEAKS.len(), expected.len());
+    }
+
+    #[test]
+    fn unknown_tweak_errors() {
+        assert!(apply("does_not_exist").is_err());
+        assert!(revert("does_not_exist").is_err());
+    }
+
+    #[test]
+    fn legacy_service_snapshot_deserializes_without_runtime_state() {
+        let snapshot: ActionSnapshot =
+            serde_json::from_str(r#"{"kind":"Service","start_type":3}"#).unwrap();
+
+        match snapshot {
+            ActionSnapshot::Service {
+                start_type,
+                was_running,
+            } => {
+                assert_eq!(start_type, Some(3));
+                assert_eq!(was_running, None);
+            }
+            _ => panic!("expected service snapshot"),
+        }
+    }
+}

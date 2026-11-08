@@ -1,0 +1,83 @@
+import { useEffect, useLayoutEffect, useRef, type ReactNode } from "react";
+import * as motion from "framer-motion/m";
+import { useSettingsStore } from "../../stores/settingsStore";
+import { Sidebar } from "./Sidebar";
+import { TopBar } from "./TopBar";
+import { BindingChooserDialog } from "./BindingChooserDialog";
+import { CommandPalette } from "./CommandPalette";
+import { ToastContainer } from "../common/Toast";
+import { handleTabShortcut } from "../../lib/tabShortcuts";
+import { applyCachedTranslations, initI18n } from "../../lib/i18n";
+
+interface AppShellProps {
+  children: (activeTab: string) => ReactNode;
+}
+
+export function AppShell({ children }: AppShellProps) {
+  const activeTab = useSettingsStore((s) => s.activeTab);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo(0, 0);
+  }, [activeTab]);
+
+  // One owner for the sidebar shortcuts, including persisted tab selection.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => handleTabShortcut(event, tab => {
+      const store = useSettingsStore.getState();
+      if (store.activeTab === tab) return;
+      store.setTab(tab);
+      void store.save();
+    });
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // The active tab remounts in English on every switch; re-apply the saved
+  // language from cache before paint so it doesn't flash English or re-fetch.
+  useLayoutEffect(() => {
+    applyCachedTranslations();
+  }, [activeTab]);
+
+  // Re-apply a saved language before the browser paints, so cached translations
+  // show immediately with no English flash.
+  useLayoutEffect(() => {
+    initI18n();
+  }, []);
+
+  return (
+    <>
+      <div
+        className="flex h-screen w-screen overflow-hidden rounded-[18px]"
+        style={{ backgroundColor: "var(--color-bg-sidebar)" }}
+      >
+        <Sidebar />
+        <div className="flex min-w-0 flex-1 flex-col pt-px pl-px">
+          <TopBar />
+          <div
+            ref={scrollRef}
+            className="app-atmosphere flex-1 overflow-y-auto rounded-tl-[20px] border-l border-t [scrollbar-gutter:stable_both-edges]"
+            style={{
+              backgroundColor: "var(--color-bg-base)",
+              borderColor: "var(--color-border-subtle)",
+            }}
+          >
+            <div className="w-full min-w-0 px-6 pb-8 pt-5">
+              <motion.div
+                key={activeTab}
+                initial={{ opacity: 0, y: 6 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
+              >
+                {children(activeTab)}
+              </motion.div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <ToastContainer />
+      <BindingChooserDialog />
+      <CommandPalette />
+    </>
+  );
+}

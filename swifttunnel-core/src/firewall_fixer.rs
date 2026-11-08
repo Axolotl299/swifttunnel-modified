@@ -1,0 +1,380 @@
+use crate::structs::*;
+use log::{info, warn};
+use std::path::PathBuf;
+
+// UWP Roblox runs under Windows10Universal.exe, a generic Store host shared by
+// unrelated Microsoft Store apps. Adding firewall rules keyed to that name
+// would scope to Mail, Weather, etc. Per CLAUDE.md, UWP Roblox is intentionally
+// not tunnel-eligible, so we omit it here.
+const ROBLOX_EXECUTABLES: [&str; 3] = [
+    "RobloxPlayerBeta.exe",
+    "RobloxStudioBeta.exe",
+    "RobloxCrashHandler.exe",
+];
+
+// Executable names written by earlier SwiftTunnel versions that we now reject.
+// On upgrade these rules are still in the Windows firewall and would keep
+// allowing the named (generic) host process through. The pre-apply cleanup
+// pass explicitly deletes them so the over-scoping bug is closed for users
+// migrating from older builds.
+const LEGACY_FIREWALL_EXECUTABLES: &[&str] = &["Windows10Universal.exe"];
+
+const FIREWALL_RULE_PREFIX: &str = "SwiftTunnel - Roblox";
+
+pub struct FirewallFixer {
+    rules_applied: bool,
+}
+
+impl FirewallFixer {
+    pub fn new() -> Self {
+        Self {
+            rules_applied: false,
+        }
+    }
+
+    fn remove_swifttunnel_rules_by_prefix() {
+        // Delete all known rule names individually via netsh instead of
+        // PowerShell Get-NetFirewallRule piping, which triggers AV heuristics.
+        //
+        // Iterate the current executable list AND the legacy list so older
+        // installs that wrote rules for Windows10Universal.exe (the shared
+        // Microsoft Store host) have those rules removed on upgrade.
+        let cleanup_targets = ROBLOX_EXECUTABLES
+            .iter()
+            .copied()
+            .chain(LEGACY_FIREWALL_EXECUTABLES.iter().copied());
+        for exe_name in cleanup_targets {
+            for (suffix, dir) in [("Out", "out"), ("In", "in")] {
+                let rule_name = format!("{} {} {}", FIREWALL_RULE_PREFIX, exe_name, suffix);
+                let _ = crate::utils::run_hidden_command_output_with_timeout(
+                    "netsh",
+                    &[
+                        "advfirewall",
+                        "firewall",
+                        "delete",
+                        "rule",
+                        &format!("name={}", rule_name),
+                        &format!("dir={}", dir),
+                    ],
+                    std::time::Duration::from_secs(15),
+                );
+            }
+        }
+    }
+
+    /// Apply firewall fixes: add allow rules for Roblox, flush DNS, reset Winsock, clear ARP.
+    pub fn apply(&mut self) -> Result<()> {
+        if self.rules_applied {
+            info!("Firewall fix already applied, skipping");
+            return Ok(());
+        }
+
+        info!("Applying Roblox firewall fix");
+
+        // Remove any stale SwiftTunnel rules first so a Roblox reinstall (which
+        // changes the executable path under Versions\version-*) doesn't leave
+        // orphaned `program=` filters pointing at vanished paths. Rules are
+        // matched by exact `SwiftTunnel - Roblox <exe> {In,Out}` name so we
+        // never touch unrelated firewall rules.
+        Self::remove_swifttunnel_rules_by_prefix();
+
+        // 1. Find all Roblox executables and add firewall allow rules
+        let executables = find_roblox_executables();
+
+        if executables.is_empty() {
+            warn!("No Roblox Player or Studio installation was found");
+        }
+
+        let mut rules_added = 0usize;
+        let mut rule_failures = 0usize;
+
+        for (exe_name, full_path) in &executables {
+            let path_str = full_path.to_string_lossy();
+
+            // Outbound allow rule
+            let rule_name_out = format!("{} {} Out", FIREWALL_RULE_PREFIX, exe_name);
+            let output = crate::utils::run_hidden_command_output_with_timeout(
+                "netsh",
+                &[
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
+                    &format!("name={}", rule_name_out),
+                    "dir=out",
+                    "action=allow",
+                    &format!("program={}", path_str),
+                    "enable=yes",
+                ],
+                std::time::Duration::from_secs(15),
+            );
+
+            match output {
+                Ok(result) if result.status.success() => {
+                    info!("Added outbound firewall rule for {}", exe_name);
+                    rules_added += 1;
+                }
+                Ok(result) => {
+                    rule_failures += 1;
+                    let stderr = String::from_utf8_lossy(&result.stderr);
+                    warn!(
+                        "Failed to add outbound firewall rule for {}: {}",
+                        exe_name, stderr
+                    );
+                }
+                Err(e) => {
+                    rule_failures += 1;
+                    warn!(
+                        "Failed to add outbound firewall rule for {}: {}",
+                        exe_name, e
+                    );
+                }
+            }
+
+            // Inbound allow rule
+            let rule_name_in = format!("{} {} In", FIREWALL_RULE_PREFIX, exe_name);
+            let output = crate::utils::run_hidden_command_output_with_timeout(
+                "netsh",
+                &[
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
+                    &format!("name={}", rule_name_in),
+                    "dir=in",
+                    "action=allow",
+                    &format!("program={}", path_str),
+                    "enable=yes",
+                ],
+                std::time::Duration::from_secs(15),
+            );
+
+            match output {
+                Ok(result) if result.status.success() => {
+                    info!("Added inbound firewall rule for {}", exe_name);
+                    rules_added += 1;
+                }
+                Ok(result) => {
+                    rule_failures += 1;
+                    let stderr = String::from_utf8_lossy(&result.stderr);
+                    warn!(
+                        "Failed to add inbound firewall rule for {}: {}",
+                        exe_name, stderr
+                    );
+                }
+                Err(e) => {
+                    rule_failures += 1;
+                    warn!(
+                        "Failed to add inbound firewall rule for {}: {}",
+                        exe_name, e
+                    );
+                }
+            }
+        }
+
+        // 2. Flush DNS cache
+        // A wedged DNS Client service hangs flushdns, and this runs inside
+        // Repair, so an unbounded call here is one of the ways Repair can spin
+        // forever without reporting anything.
+        let output = crate::run_hidden_command_with_timeout(
+            "ipconfig",
+            &["/flushdns"],
+            std::time::Duration::from_secs(30),
+        );
+        if output.success {
+            info!("DNS cache flushed");
+        } else {
+            warn!("Failed to flush DNS cache: {}", output.stderr.trim());
+        }
+
+        // 3. Flush ARP cache
+        let output = crate::run_hidden_command_with_timeout(
+            "netsh",
+            &["interface", "ip", "delete", "arpcache"],
+            std::time::Duration::from_secs(30),
+        );
+        if output.success {
+            info!("ARP cache flushed");
+        } else {
+            warn!("Failed to flush ARP cache: {}", output.stderr.trim());
+        }
+
+        if executables.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Roblox firewall fix could not add rules: no Roblox executables found"
+            ));
+        }
+        if rule_failures > 0 {
+            if rules_added > 0 {
+                Self::remove_swifttunnel_rules_by_prefix();
+            }
+            return Err(anyhow::anyhow!(
+                "Roblox firewall fix failed to add {} firewall rule(s)",
+                rule_failures
+            ));
+        }
+        if rules_added == 0 {
+            return Err(anyhow::anyhow!(
+                "Roblox firewall fix did not add any firewall rules"
+            ));
+        }
+
+        self.rules_applied = true;
+        info!(
+            "Roblox firewall fix applied successfully ({} rule(s))",
+            rules_added
+        );
+        Ok(())
+    }
+
+    /// Restore: remove all SwiftTunnel Roblox firewall rules.
+    pub fn restore(&mut self) -> Result<()> {
+        if !self.rules_applied {
+            info!("Firewall fixer had no in-memory state; removing any stale SwiftTunnel rules");
+        }
+
+        info!("Removing SwiftTunnel Roblox firewall rules");
+
+        // Rule names are shared across install paths and versions. The exact
+        // known-name pass also handles removed installs and legacy rules.
+        Self::remove_swifttunnel_rules_by_prefix();
+
+        self.rules_applied = false;
+        info!("SwiftTunnel Roblox firewall rules removed");
+        Ok(())
+    }
+}
+
+impl Default for FirewallFixer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Scan the global and VNG clients for known Roblox executables.
+///
+/// Returns `Vec<(exe_name, full_path)>` for each executable found.
+fn find_roblox_executables() -> Vec<(String, PathBuf)> {
+    match std::env::var_os("LOCALAPPDATA") {
+        Some(root) => find_roblox_executables_in(&PathBuf::from(root)),
+        None => Vec::new(),
+    }
+}
+
+fn find_roblox_executables_in(local: &std::path::Path) -> Vec<(String, PathBuf)> {
+    let mut found = Vec::new();
+    for client in ["Roblox", "RobloxPCVNG"] {
+        let versions = local.join(client).join("Versions");
+        let Ok(entries) = std::fs::read_dir(&versions) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            for name in ROBLOX_EXECUTABLES {
+                let executable = path.join(name);
+                if executable.is_file() {
+                    found.push((name.into(), executable));
+                }
+            }
+        }
+    }
+    found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_supports_vng_alone_and_both_clients_without_store_hosts() {
+        let root = std::env::temp_dir().join(format!(
+            "swift-firewall-audit-{:032x}",
+            rand::random::<u128>()
+        ));
+        let vng = root
+            .join("RobloxPCVNG")
+            .join("Versions")
+            .join("version-test");
+        std::fs::create_dir_all(&vng).unwrap();
+        std::fs::write(vng.join("RobloxPlayerBeta.exe"), "fixture").unwrap();
+        std::fs::write(vng.join("Windows10Universal.exe"), "fixture").unwrap();
+        assert_eq!(find_roblox_executables_in(&root).len(), 1);
+        let main = root.join("Roblox").join("Versions").join("version-test");
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::write(main.join("RobloxPlayerBeta.exe"), "fixture").unwrap();
+        assert_eq!(find_roblox_executables_in(&root).len(), 2);
+        assert!(root.starts_with(std::env::temp_dir()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn firewall_fixer_default_not_applied() {
+        let fixer = FirewallFixer::new();
+        assert!(!fixer.rules_applied);
+    }
+
+    #[test]
+    fn find_roblox_executables_does_not_panic() {
+        // Should not panic even if Roblox is not installed
+        let exes = find_roblox_executables();
+        // On non-Windows or without Roblox, this will be empty
+        assert!(
+            exes.iter()
+                .all(|(name, path)| ROBLOX_EXECUTABLES.contains(&name.as_str()) && path.is_file())
+        );
+    }
+
+    #[test]
+    #[ignore = "Mutates Windows firewall rules; requires an isolated testbench"]
+    fn restore_removes_real_rules_on_an_isolated_machine() {
+        let mut fixer = FirewallFixer::new();
+        let result = fixer.restore();
+        assert!(result.is_ok());
+    }
+
+    /// Negative test (per global CLAUDE.md failure-mode rules): the generic
+    /// UWP Store host `Windows10Universal.exe` must not be in our firewall
+    /// rule list. It is shared across unrelated Microsoft Store apps and
+    /// CLAUDE.md explicitly marks UWP Roblox as not tunnel-eligible.
+    #[test]
+    fn windows10universal_is_not_a_roblox_executable_target() {
+        assert!(
+            !ROBLOX_EXECUTABLES.contains(&"Windows10Universal.exe"),
+            "Windows10Universal.exe is a generic Store host shared with other Store apps; \
+             firewall rules keyed to it would scope to Mail, Weather, etc."
+        );
+    }
+
+    #[test]
+    fn roblox_executables_list_only_targets_real_player_binaries() {
+        for exe in &ROBLOX_EXECUTABLES {
+            assert!(
+                exe.starts_with("Roblox"),
+                "unexpected firewall target {exe}: must be a Roblox-prefixed exe"
+            );
+        }
+    }
+
+    #[test]
+    fn rule_name_prefix_is_stable() {
+        // Restore depends on this prefix matching what we wrote previously.
+        // Changing the prefix would orphan rules from older app versions.
+        assert_eq!(FIREWALL_RULE_PREFIX, "SwiftTunnel - Roblox");
+    }
+
+    #[test]
+    fn legacy_firewall_executables_targets_windows10universal() {
+        // Older SwiftTunnel builds wrote firewall rules for
+        // Windows10Universal.exe. Removing it from ROBLOX_EXECUTABLES is not
+        // enough — the rules on the user's box must also be deleted on
+        // upgrade. This test pins the cleanup list so a regression
+        // (dropping the entry, renaming the constant) breaks the build.
+        assert!(
+            LEGACY_FIREWALL_EXECUTABLES.contains(&"Windows10Universal.exe"),
+            "legacy firewall cleanup must keep Windows10Universal.exe so upgrade installs strip it"
+        );
+    }
+}

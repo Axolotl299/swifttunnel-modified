@@ -1,0 +1,241 @@
+import type {
+  Config,
+  OptimizationProfile,
+  PowerPlan,
+  StandbyPurgeResult,
+} from "../../lib/types";
+import { normalizeNetworkBoostConfig } from "../../lib/settings";
+
+export const SWIFTTUNNEL_POWER_PLAN_FALLBACK: PowerPlan = "HighPerformance";
+
+export const PROFILES: {
+  id: OptimizationProfile;
+  name: string;
+  desc: string;
+  icon: string;
+}[] = [
+  {
+    id: "LowEnd",
+    name: "Performance",
+    desc: "Max FPS, lowest quality",
+    icon: "\u26A1",
+  },
+  {
+    id: "Balanced",
+    name: "Balanced",
+    desc: "Good FPS, decent visuals",
+    icon: "\u2696\uFE0F",
+  },
+  {
+    id: "HighEnd",
+    name: "Quality",
+    desc: "Best visuals, stable perf",
+    icon: "\u2728",
+  },
+];
+
+export function getPresetConfig(
+  profile: OptimizationProfile,
+  current: Config,
+): Config {
+  const base: Config = {
+    ...current,
+    profile,
+  };
+  switch (profile) {
+    case "LowEnd":
+      return {
+        ...base,
+        system_optimization: {
+          ...current.system_optimization,
+          set_high_priority: true,
+          timer_resolution_1ms: true,
+          mmcss_gaming_profile: true,
+          game_mode_enabled: true,
+          disable_game_bar: true,
+          disable_fullscreen_optimization: true,
+          power_plan: "SwiftTunnel",
+          previous_power_plan: rememberedPowerPlanForSwiftTunnel(
+            current.system_optimization.power_plan,
+            current.system_optimization.previous_power_plan,
+          ),
+        },
+        roblox_settings: {
+          ...current.roblox_settings,
+          graphics_quality: "Level1",
+          unlock_fps: true,
+          // The max-FPS preset must never be the thing that lowers someone's
+          // cap. See Balanced for why a preset writing a fixed number became
+          // dangerous once the writer stopped refusing to lower it.
+          target_fps: Math.max(current.roblox_settings.target_fps, 360),
+          ultraboost: true,
+          // Ultraboost and a custom FFlag import are mutually exclusive, and
+          // the toggle in the UI already clears one when you pick the other.
+          // Without this the preset produces a config the validator rejects,
+          // which used to be invisible because selecting a profile never
+          // applied anything.
+          custom_fflags_enabled: false,
+        },
+        network_settings: normalizeNetworkBoostConfig({
+          ...current.network_settings,
+          disable_nagle: true,
+          disable_network_throttling: true,
+        }),
+      };
+    case "Balanced":
+      return {
+        ...base,
+        system_optimization: {
+          ...current.system_optimization,
+          set_high_priority: true,
+          timer_resolution_1ms: true,
+          mmcss_gaming_profile: true,
+          game_mode_enabled: true,
+          disable_game_bar: true,
+          disable_fullscreen_optimization: true,
+          power_plan: "HighPerformance",
+          previous_power_plan: "HighPerformance",
+        },
+        roblox_settings: {
+          ...current.roblox_settings,
+          graphics_quality: "Manual",
+          unlock_fps: true,
+          // Presets differ on how Roblox looks, not on how many frames it is
+          // allowed to draw. These used to set 144 here and 60 under Quality,
+          // which was harmless while the writer refused to lower an existing
+          // cap and stopped being harmless the moment it wrote the configured
+          // value in both directions: picking Quality would have taken a player
+          // at 300 down to 60. The default is 300 and a preset has no business
+          // undoing it.
+          target_fps: Math.max(current.roblox_settings.target_fps, 300),
+          ultraboost: false,
+        },
+        network_settings: normalizeNetworkBoostConfig({
+          ...current.network_settings,
+          disable_nagle: true,
+          disable_network_throttling: true,
+        }),
+      };
+    case "HighEnd":
+      return {
+        ...base,
+        system_optimization: {
+          ...current.system_optimization,
+          set_high_priority: true,
+          timer_resolution_1ms: true,
+          mmcss_gaming_profile: true,
+          game_mode_enabled: true,
+          disable_game_bar: false,
+          disable_fullscreen_optimization: true,
+          power_plan: "HighPerformance",
+          previous_power_plan: "HighPerformance",
+        },
+        roblox_settings: {
+          ...current.roblox_settings,
+          graphics_quality: "Level8",
+          unlock_fps: true,
+          // See Balanced: best visuals is not a reason to cap frames at 60.
+          target_fps: Math.max(current.roblox_settings.target_fps, 300),
+          ultraboost: false,
+        },
+        network_settings: normalizeNetworkBoostConfig({
+          ...current.network_settings,
+          disable_nagle: true,
+          disable_network_throttling: true,
+        }),
+      };
+    default:
+      return base;
+  }
+}
+
+export function configsEqual(a: Config, b: Config): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+export { mergeConfigChanges } from "../../lib/configMerge";
+
+export function robloxSettingsChanged(a: Config, b: Config): boolean {
+  return (
+    JSON.stringify(a.roblox_settings) !== JSON.stringify(b.roblox_settings)
+  );
+}
+
+export function validateWindowDimension(
+  label: "Width" | "Height",
+  value: number,
+  min: number,
+  max: number,
+): string | null {
+  if (!Number.isFinite(value) || !Number.isInteger(value)) {
+    return `${label} must be a whole number.`;
+  }
+  if (value < min || value > max) {
+    return `${label} must be between ${min} and ${max}.`;
+  }
+  if (value % 2 !== 0) {
+    return `${label} must be an even number.`;
+  }
+  return null;
+}
+
+export function parseWindowDimensionInput(
+  value: string,
+  fallback: number,
+): number {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+export function previousNonSwiftTunnelPowerPlan(
+  plan: PowerPlan | null | undefined,
+  fallback: PowerPlan = SWIFTTUNNEL_POWER_PLAN_FALLBACK,
+): PowerPlan {
+  return plan && plan !== "SwiftTunnel" ? plan : fallback;
+}
+
+export function rememberedPowerPlanForSwiftTunnel(
+  currentPowerPlan: PowerPlan,
+  previousPowerPlan: PowerPlan | null | undefined,
+): PowerPlan {
+  return currentPowerPlan === "SwiftTunnel"
+    ? previousNonSwiftTunnelPowerPlan(previousPowerPlan)
+    : currentPowerPlan;
+}
+
+export function nextPowerPlanForSwiftTunnelToggle(
+  enabled: boolean,
+  previousPowerPlan: PowerPlan,
+): PowerPlan {
+  return enabled
+    ? "SwiftTunnel"
+    : previousNonSwiftTunnelPowerPlan(previousPowerPlan);
+}
+
+export function countActive(...flags: boolean[]): number {
+  return flags.filter(Boolean).length;
+}
+
+export function formatGbFromMb(mb: number): string {
+  if (!Number.isFinite(mb) || mb <= 0) return "0.0";
+  return (mb / 1024).toFixed(1);
+}
+
+export function formatDeltaMb(delta: number): string {
+  if (!Number.isFinite(delta)) return "0 MB";
+  const sign = delta >= 0 ? "+" : "-";
+  return `${sign}${Math.abs(Math.round(delta))} MB`;
+}
+
+export function deepCleanLabel(standby: StandbyPurgeResult): string {
+  if (standby.success) return "Success";
+  const reason = standby.skipped_reason ? ` (${standby.skipped_reason})` : "";
+  if (!standby.attempted) return `Skipped${reason}`;
+  return `Failed${reason}`;
+}
+
+export function memColor(percent: number): string {
+  if (percent > 85) return "#f05a5a";
+  if (percent > 65) return "#f5b428";
+  return "#28d296";
+}

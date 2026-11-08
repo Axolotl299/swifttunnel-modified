@@ -1,0 +1,85 @@
+# Rust build artifacts
+target/
+**/target/
+
+# Release/output artifacts
+releases/
+*.msi
+
+# IDE
+.idea/
+.vscode/*
+!.vscode/settings.json
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.backup
+roblox_settings_backup.xml
+.claude/
+
+# Binaries
+*.exe
+
+# Tauri build artifacts
+swifttunnel-desktop/src-tauri/target/
+swifttunnel-desktop/node_modules/
+swifttunnel-desktop/dist/
+swifttunnel-desktop/src-tauri/resources/drivers/WinpkFilter-x64.msi
+
+# Preview build artifacts (if generated locally)
+.next/
+ui-preview/
+
+# Documentation (private, local-only; may contain secrets)
+AGENTS.md
+CLAUDE.md
+PC-BOOSTS.md
+
+# Allow Windows-testbench scripts and docs, but never its build output.
+#
+# This used to force-include *.exe and *.dll, so three compiled binaries were
+# committed to a public repo. Nothing used them: every wrapper script builds
+# from source and runs out of target/release, and the README already said the
+# committed copies were stale. Unverifiable executables in the repo of an app
+# that installs a network driver are exactly what makes people distrust it.
+!Windows-testbench/
+!Windows-testbench/*.ps1
+!Windows-testbench/*.md
+cargo-core.log
+
+
+# Fetched by the release workflow (SHA-256 verified there), never committed.
+# Local build copies would go stale and ship unverifiable binaries.
+swifttunnel-desktop/src-tauri/resources/drivers/winpkfilter/
+swifttunnel-desktop/src-tauri/resources/tools/goodbyedpi/
+
+swifttunnel-lite/target-msi/
+
+# Credentials.
+#
+# Nothing secret has ever reached this repository, and it has been public since
+# January, so the cost of the first mistake is permanent: a key pushed here is
+# public the moment it lands and stays in the history and in every fork after.
+# The one credential that is committed on purpose is the Supabase anon key in
+# swifttunnel-core, which is designed to ship to clients and is guarded by RLS.
+.env
+.env.*
+!.env.lite
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+*_rsa
+*_ed25519
+secrets.json
+credentials.json
+
+# Local build output path, see .cargo/config.toml
+.cargo/config.toml

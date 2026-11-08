@@ -1,0 +1,2419 @@
+//! Split Tunnel - ndisapi-based Implementation
+//!
+//! Uses Windows Packet Filter (ndisapi) for packet-level split tunneling.
+//! This replaces the Mullvad WFP-based driver with a simpler approach:
+//!
+//! Architecture (v2 - Parallel):
+//! - Per-CPU packet workers with affinity (WireGuard-like)
+//! - Lock-free process cache (RCU pattern for <0.1ms lookups)
+//! - Batch packet reading to amortize syscall overhead
+//! - 30ms cache refresh for instant game detection
+//!
+//! Benefits:
+//! - <0.1ms added latency for routing decisions
+//! - Scales linearly with CPU cores
+//! - No lock contention between packet workers
+//! - No WFP complexity (callouts, filters, sublayers, providers)
+
+use super::parallel_interceptor::{
+    AdapterBindingPreference, ParallelInterceptor, QueueOverflowMode, SplitTunnelDiagnostics,
+    ThroughputStats,
+};
+use super::{VpnError, VpnResult};
+use crate::process_names::ROBLOX_PROCESS_NAMES;
+use crate::utils::normalize_guid_ascii_lowercase;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::time::{Duration, Instant};
+
+const DRIVER_READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const DRIVER_SERVICE_START_TIMEOUT: Duration = Duration::from_secs(30);
+const DRIVER_READY_TIMEOUT: Duration = Duration::from_secs(20);
+const WINPKFILTER_BINDING_CLEANUP_TIMEOUT: Duration = Duration::from_secs(12);
+const DRIVER_MSI_TIMEOUT: Duration = Duration::from_secs(600);
+const SERVICE_NAME: &str = "NDISRD";
+const SERVICE_DISPLAY_NAME: &str = "Windows Packet Filter";
+
+fn driver_service_open_failure(error: windows::core::Error) -> Result<(), String> {
+    use windows::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE,
+    };
+    use windows::core::HRESULT;
+    if error.code() == HRESULT::from_win32(ERROR_SERVICE_DOES_NOT_EXIST.0) {
+        log::debug!("NDISRD service is already absent");
+        Ok(())
+    } else if error.code() == HRESULT::from_win32(ERROR_SERVICE_MARKED_FOR_DELETE.0) {
+        Err(format!(
+            "The NDISRD driver service is still marked for deletion. Restart Windows before reinstalling. ({error})"
+        ))
+    } else if error.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0) {
+        Err(format!(
+            "Access denied while opening the NDISRD driver service for cleanup: {error}"
+        ))
+    } else {
+        Err(format!(
+            "Could not open the NDISRD driver service for cleanup: {error}"
+        ))
+    }
+}
+
+fn prepare_driver_reinstall(
+    remove_component: impl FnOnce() -> Result<(), String>,
+    remove_service: impl FnOnce() -> Result<(), String>,
+    remove_package: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if let Err(error) = remove_component() {
+        if super::error_messages::driver_reboot_pending(&error) {
+            // Windows has scheduled the old filter's removal. Removing its
+            // service/package and installing over it cannot complete that
+            // pending operation before restart.
+            return Err(error);
+        }
+        log::warn!("Failed to remove existing WinpkFilter network component: {error}");
+    }
+    remove_service().map_err(|error| {
+        format!("Failed to remove existing NDISRD service before reinstall: {error}")
+    })?;
+    remove_package().map_err(|error| {
+        format!("Failed to remove existing WinpkFilter package before reinstall: {error}")
+    })
+}
+
+fn run_driver_msi(action: &str, msi_path: &Path) -> std::io::Result<std::process::Output> {
+    use std::ffi::OsStr;
+    let installer = swifttunnel_installer_cache::windows_installer_path()?;
+    // Match Desktop's MSI deadline. The old fallback paths waited forever,
+    // including when Windows Installer was stuck behind another installation.
+    crate::utils::run_hidden_command_output_with_timeout(
+        &installer.to_string_lossy(),
+        &[
+            OsStr::new(action),
+            msi_path.as_os_str(),
+            OsStr::new("/qn"),
+            OsStr::new("/norestart"),
+        ],
+        DRIVER_MSI_TIMEOUT,
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  GAME PRESETS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GamePreset {
+    Roblox,
+}
+
+impl GamePreset {
+    pub fn all() -> &'static [GamePreset] {
+        &[GamePreset::Roblox]
+    }
+
+    /// Process names that should use VPN
+    pub fn process_names(&self) -> &'static [&'static str] {
+        match self {
+            GamePreset::Roblox => ROBLOX_PROCESS_NAMES,
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            GamePreset::Roblox => "Roblox",
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            GamePreset::Roblox => "🎮",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            GamePreset::Roblox => "Roblox Player & Studio",
+        }
+    }
+}
+
+/// Get all process names that should use VPN for given presets
+pub fn get_tunnel_apps_for_presets(presets: &HashSet<GamePreset>) -> HashSet<String> {
+    presets
+        .iter()
+        .flat_map(|p| p.process_names())
+        .map(|s| s.to_lowercase())
+        .collect()
+}
+
+/// Legacy compatibility
+pub fn get_apps_for_presets(presets: &[GamePreset]) -> Vec<String> {
+    presets
+        .iter()
+        .flat_map(|p| p.process_names())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+pub fn get_apps_for_preset_set(presets: &HashSet<GamePreset>) -> Vec<String> {
+    presets
+        .iter()
+        .flat_map(|p| p.process_names())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SPLIT TUNNEL CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct SplitTunnelConfig {
+    /// Apps that SHOULD use VPN
+    pub tunnel_apps: HashSet<String>,
+    /// VPN interface LUID (for adapter identification)
+    pub tunnel_interface_luid: u64,
+    /// Explicit adapter binding preference for manual mode or remembered Smart Auto choices.
+    pub binding_preference: Option<AdapterBindingPreference>,
+}
+
+impl SplitTunnelConfig {
+    pub fn new(
+        tunnel_apps: Vec<String>,
+        tunnel_interface_luid: u64,
+        binding_preference: Option<AdapterBindingPreference>,
+    ) -> Self {
+        Self {
+            tunnel_apps: tunnel_apps.into_iter().map(|s| s.to_lowercase()).collect(),
+            tunnel_interface_luid,
+            binding_preference: binding_preference.map(|mut preference| {
+                preference.guid = normalize_guid_ascii_lowercase(&preference.guid)
+                    .unwrap_or(preference.guid)
+                    .to_string();
+                preference
+            }),
+        }
+    }
+
+    /// For backwards compatibility
+    pub fn include_apps(&self) -> Vec<String> {
+        self.tunnel_apps.iter().cloned().collect()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DRIVER STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriverState {
+    NotAvailable,
+    NotConfigured,
+    Initialized,
+    Active,
+    Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverHealthStatus {
+    Ready,
+    Missing,
+    ServiceUnavailable,
+    IoctlFailed,
+    VersionTooOld,
+    NoAdapters,
+    RebootRequired,
+}
+
+impl DriverHealthStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DriverHealthStatus::Ready => "ready",
+            DriverHealthStatus::Missing => "missing",
+            DriverHealthStatus::ServiceUnavailable => "service_unavailable",
+            DriverHealthStatus::IoctlFailed => "ioctl_failed",
+            DriverHealthStatus::VersionTooOld => "version_too_old",
+            DriverHealthStatus::NoAdapters => "no_adapters",
+            DriverHealthStatus::RebootRequired => "reboot_required",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverRecommendedAction {
+    None,
+    Install,
+    ResetService,
+    Reinstall,
+    Reboot,
+}
+
+impl DriverRecommendedAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DriverRecommendedAction::None => "none",
+            DriverRecommendedAction::Install => "install",
+            DriverRecommendedAction::ResetService => "reset_service",
+            DriverRecommendedAction::Reinstall => "reinstall",
+            DriverRecommendedAction::Reboot => "reboot",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitTunnelDriverHealth {
+    pub installed: bool,
+    pub ready: bool,
+    pub status: DriverHealthStatus,
+    pub message: String,
+    pub version: Option<String>,
+    pub reboot_required: bool,
+    pub recommended_action: DriverRecommendedAction,
+}
+
+impl SplitTunnelDriverHealth {
+    fn ready(version: Option<String>, adapter_count: usize) -> Self {
+        Self {
+            installed: true,
+            ready: true,
+            status: DriverHealthStatus::Ready,
+            message: format!(
+                "Windows Packet Filter driver is ready ({} TCP/IP-bound adapter(s)).",
+                adapter_count
+            ),
+            version,
+            reboot_required: false,
+            recommended_action: DriverRecommendedAction::None,
+        }
+    }
+
+    fn not_ready(
+        installed: bool,
+        status: DriverHealthStatus,
+        message: impl Into<String>,
+        version: Option<String>,
+        reboot_required: bool,
+        recommended_action: DriverRecommendedAction,
+    ) -> Self {
+        Self {
+            installed,
+            ready: false,
+            status,
+            message: message.into(),
+            version,
+            reboot_required,
+            recommended_action,
+        }
+    }
+}
+
+/// Result of a stale tunnel-mode cleanup pass (see
+/// [`SplitTunnelDriver::cleanup_stale_state_checked`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StaleCleanupReport {
+    /// Set when `\\.\NDISRD` could not be opened. Distinct from `errors`
+    /// because "driver not loaded" can be benign (nothing can be stuck in
+    /// tunnel mode without the kernel filter) — the caller disambiguates via
+    /// [`SplitTunnelDriver::driver_install_evidence`].
+    pub driver_open_error: Option<String>,
+    /// TCP/IP-bound adapters enumerated.
+    pub adapters_total: usize,
+    /// Adapters whose mode flags were non-default before the reset (the
+    /// "stuck in tunnel mode" evidence).
+    pub adapters_were_filtering: usize,
+    /// Adapters whose mode was verified back to default by read-back.
+    pub adapters_reset: usize,
+    /// Per-adapter reset/verification failures and enumeration errors.
+    pub errors: Vec<String>,
+}
+
+impl StaleCleanupReport {
+    /// True only when the driver opened and every adapter mode was verified
+    /// back to default. A driver that failed to open is NOT fully clean —
+    /// callers must combine this with install evidence to decide whether
+    /// that's benign.
+    pub fn fully_clean(&self) -> bool {
+        self.driver_open_error.is_none() && self.errors.is_empty()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SPLIT TUNNEL DRIVER (ndisapi-based)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Split tunnel driver using Windows Packet Filter (ndisapi)
+///
+/// Uses ParallelInterceptor for per-CPU packet processing with <0.1ms latency.
+pub struct SplitTunnelDriver {
+    /// Parallel packet interceptor (per-CPU workers)
+    parallel_interceptor: Option<ParallelInterceptor>,
+    /// Current configuration
+    pub config: Option<SplitTunnelConfig>,
+    /// Current state
+    state: DriverState,
+    /// Stop flag for background tasks
+    stop_flag: Arc<AtomicBool>,
+}
+
+unsafe impl Send for SplitTunnelDriver {}
+unsafe impl Sync for SplitTunnelDriver {}
+
+impl SplitTunnelDriver {
+    pub fn new() -> Self {
+        log::info!("Split tunnel: Using parallel mode (per-CPU workers, <0.1ms latency)");
+
+        Self {
+            parallel_interceptor: None,
+            config: None,
+            state: DriverState::NotAvailable,
+            stop_flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Set the auto-router for automatic relay switching based on game server region
+    pub fn set_auto_router(&mut self, router: std::sync::Arc<super::auto_routing::AutoRouter>) {
+        if let Some(ref mut interceptor) = self.parallel_interceptor {
+            interceptor.set_auto_router(router);
+        } else {
+            log::warn!("Cannot set auto router: parallel interceptor not created yet");
+        }
+    }
+
+    /// Set the V3 UDP relay context for unencrypted game traffic relay
+    ///
+    /// This enables lowest-latency mode: workers forward packets directly to relay
+    /// server without encryption.
+    pub fn set_relay_context(&mut self, relay: std::sync::Arc<super::udp_relay::UdpRelay>) {
+        if let Some(ref mut interceptor) = self.parallel_interceptor {
+            interceptor.set_relay_context(relay);
+            log::info!("V3 relay context set for unencrypted UDP forwarding");
+        } else {
+            log::warn!("Cannot set relay context: parallel interceptor not created yet");
+        }
+    }
+
+    /// Returns a handle to the interceptor's `workers_panic_cause` flag so
+    /// long-lived async monitors can observe reader/inbound-receiver failures
+    /// (and their specific cause) without holding a reference to the driver.
+    /// Decode the loaded `u8` with `WorkerPanicCause::from_u8`.
+    pub fn workers_panic_cause_arc(&self) -> Option<Arc<AtomicU8>> {
+        self.parallel_interceptor
+            .as_ref()
+            .map(|i| i.workers_panic_cause_arc())
+    }
+
+    pub fn set_queue_overflow_mode(&mut self, mode: QueueOverflowMode) {
+        if let Some(ref mut interceptor) = self.parallel_interceptor {
+            interceptor.set_queue_overflow_mode(mode);
+        } else {
+            log::warn!(
+                "Cannot set queue overflow mode ({:?}): parallel interceptor not created yet",
+                mode
+            );
+        }
+    }
+
+    /// Get the V3 UDP relay context if set
+    pub fn get_relay_context(&self) -> Option<std::sync::Arc<super::udp_relay::UdpRelay>> {
+        self.parallel_interceptor
+            .as_ref()
+            .and_then(|p| p.get_relay_context())
+    }
+
+    /// Check if driver is available (can open device)
+    pub fn is_available() -> bool {
+        ParallelInterceptor::check_driver_available()
+    }
+
+    fn driver_service_exists() -> bool {
+        use windows::Win32::System::Services::*;
+        use windows::core::PCWSTR;
+
+        unsafe {
+            let Ok(scm) = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) else {
+                return false;
+            };
+
+            let service_name_wide: Vec<u16> = SERVICE_NAME
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let service = OpenServiceW(
+                scm,
+                PCWSTR(service_name_wide.as_ptr()),
+                SERVICE_QUERY_STATUS,
+            );
+            let exists = service.is_ok();
+            if let Ok(service) = service {
+                let _ = CloseServiceHandle(service);
+            }
+            let _ = CloseServiceHandle(scm);
+            exists
+        }
+    }
+
+    pub fn driver_install_evidence() -> bool {
+        if Self::get_driver_path().is_some() || Self::driver_service_exists() {
+            return true;
+        }
+
+        matches!(
+            super::winpkfilter::find_installed_driver_published_name(),
+            Ok(Some(_))
+        )
+    }
+
+    /// Strong health check for the split tunnel driver.
+    ///
+    /// This is intentionally stricter than `ParallelInterceptor::check_driver_available()`:
+    /// opening `\\.\NDISRD` only proves that a device handle exists. A driver is
+    /// considered ready only when it opens, reports a compatible version, accepts
+    /// the adapter-enumeration IOCTL, and enumerates at least one TCP/IP-bound
+    /// adapter.
+    pub fn health_check() -> SplitTunnelDriverHealth {
+        use super::winpkfilter::{MIN_DRIVER_VERSION, format_version};
+
+        let driver = match ndisapi::Ndisapi::new("NDISRD") {
+            Ok(driver) => driver,
+            Err(e) => {
+                // An open device is already stronger evidence than a file,
+                // service or driver-store listing. Only a failed open needs
+                // that extra discovery to choose installation versus repair.
+                let installed = Self::driver_install_evidence();
+                let status = if installed {
+                    DriverHealthStatus::ServiceUnavailable
+                } else {
+                    DriverHealthStatus::Missing
+                };
+                let action = if installed {
+                    DriverRecommendedAction::ResetService
+                } else {
+                    DriverRecommendedAction::Install
+                };
+                return SplitTunnelDriverHealth::not_ready(
+                    installed,
+                    status,
+                    format!(
+                        "Split tunnel driver not available (Windows Packet Filter driver): failed to open \\\\.\\NDISRD: {}",
+                        e
+                    ),
+                    None,
+                    false,
+                    action,
+                );
+            }
+        };
+
+        let version = match driver.get_version() {
+            Ok(version) => {
+                let installed = (version.major, version.minor, version.revision);
+                let version_string = format_version(installed);
+                if installed < MIN_DRIVER_VERSION {
+                    return SplitTunnelDriverHealth::not_ready(
+                        true,
+                        DriverHealthStatus::VersionTooOld,
+                        format!(
+                            "Split tunnel driver is older than SwiftTunnel requires \
+                             (installed {}, required >= {}). An older Windows Packet \
+                             Filter driver is preventing SwiftTunnel's bundled driver \
+                             from taking effect. Reinstall SwiftTunnel's driver.",
+                            version_string,
+                            format_version(MIN_DRIVER_VERSION)
+                        ),
+                        Some(version_string),
+                        false,
+                        DriverRecommendedAction::Reinstall,
+                    );
+                }
+                Some(version_string)
+            }
+            Err(e) => {
+                return SplitTunnelDriverHealth::not_ready(
+                    true,
+                    DriverHealthStatus::IoctlFailed,
+                    format!(
+                        "Split tunnel driver not available (Windows Packet Filter driver): version query failed ({}). Reset the driver service, then try again.",
+                        e
+                    ),
+                    None,
+                    false,
+                    DriverRecommendedAction::ResetService,
+                );
+            }
+        };
+
+        let adapters = match driver.get_tcpip_bound_adapters_info() {
+            Ok(adapters) => adapters,
+            Err(e) => {
+                return SplitTunnelDriverHealth::not_ready(
+                    true,
+                    DriverHealthStatus::IoctlFailed,
+                    format!(
+                        "Split tunnel driver not available (Windows Packet Filter driver): installed but IOCTL failed (get_tcpip_bound_adapters_info: {}). Reset the driver service, then try again.",
+                        e
+                    ),
+                    version,
+                    false,
+                    DriverRecommendedAction::ResetService,
+                );
+            }
+        };
+
+        if adapters.is_empty() {
+            return SplitTunnelDriverHealth::not_ready(
+                true,
+                DriverHealthStatus::NoAdapters,
+                "Split tunnel driver not available (Windows Packet Filter driver): no TCP/IP-bound network adapters were enumerated. Reset the driver service, then try again.",
+                version,
+                false,
+                DriverRecommendedAction::ResetService,
+            );
+        }
+
+        log::info!(
+            "Driver health check passed: version={}, adapters={}",
+            version.as_deref().unwrap_or("unknown"),
+            adapters.len()
+        );
+        SplitTunnelDriverHealth::ready(version, adapters.len())
+    }
+
+    /// Check if the split tunnel driver is available
+    /// Will attempt to repair/load the driver if not ready.
+    pub fn check_driver_available() -> bool {
+        let initial_health = Self::health_check();
+        if initial_health.ready {
+            log::info!("Windows Packet Filter driver is ready");
+            return true;
+        }
+
+        // Starting/creating services and installing drivers requires elevation.
+        // If we're not elevated, fail fast so the UI can guide the user through
+        // an explicit UAC install flow.
+        if !crate::utils::is_administrator() {
+            log::warn!(
+                "Windows Packet Filter driver not available and process is not elevated; skipping service start / MSI install"
+            );
+            return false;
+        }
+
+        match Self::repair_and_wait_until_available(DRIVER_SERVICE_START_TIMEOUT) {
+            Ok(()) => {
+                let health = Self::health_check();
+                if health.ready {
+                    log::info!("Windows Packet Filter driver ready after service repair/start");
+                    return true;
+                }
+                log::warn!(
+                    "Driver service repair completed but health check still failed: {}",
+                    health.message
+                );
+            }
+            Err(e) => {
+                log::error!("Failed to repair driver service before MSI install: {}", e);
+            }
+        }
+
+        if matches!(
+            initial_health.recommended_action,
+            DriverRecommendedAction::Install | DriverRecommendedAction::Reinstall
+        ) {
+            if initial_health.recommended_action == DriverRecommendedAction::Reinstall {
+                if let Err(e) = super::winpkfilter::remove_installed_network_component() {
+                    log::warn!(
+                        "Failed to remove stale WinpkFilter network component: {}",
+                        e
+                    );
+                }
+                if let Err(e) = super::winpkfilter::remove_installed_driver_package() {
+                    log::warn!("Failed to remove stale WinpkFilter driver package: {}", e);
+                }
+                if let Err(e) = Self::cleanup_driver_service_for_uninstall() {
+                    log::warn!("Failed to remove stale NDISRD service: {}", e);
+                }
+            }
+
+            // Try to install from the bundled MSI.
+            log::info!("Attempting to install WinpkFilter from bundled MSI...");
+            if let Err(e) = Self::install_driver_from_msi() {
+                log::warn!("Failed to install from bundled MSI: {}", e);
+            } else {
+                match Self::repair_and_wait_until_available(DRIVER_READY_TIMEOUT) {
+                    Ok(()) => {
+                        let health = Self::health_check();
+                        if health.ready {
+                            log::info!("Windows Packet Filter driver ready after MSI install");
+                            return true;
+                        }
+                        log::warn!(
+                            "Driver install succeeded, but health check still failed: {}",
+                            health.message
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Driver install succeeded, but readiness repair failed: {}",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        log::error!("Windows Packet Filter driver not available");
+        false
+    }
+
+    /// End-to-end self-test for a freshly installed (or repaired) driver.
+    ///
+    /// `check_driver_available` only verifies that `\\.\NDISRD` opens — a weak
+    /// proxy for "the driver works". Machines can pass that check with a
+    /// pre-3.6.2 WinpkFilter install left over from another product
+    /// (ExpressVPN, NordLynx, Wiresock's stand-alone tools) and then fail the
+    /// reader bind at runtime with `ERROR_INVALID_PARAMETER`. This runs the
+    /// next-most-expensive IOCTL (`get_tcpip_bound_adapters_info`) and the
+    /// version check, so the install flow can catch both failure modes up
+    /// front rather than having the user see a "driver not available" error
+    /// on their first Connect.
+    ///
+    /// Returns:
+    /// - `Ok(())` — driver opened, enumerated adapters, and version is new
+    ///   enough (>= 3.6.2).
+    /// - `Err("reboot required…")` / `Err("driver version too old…")` / etc.
+    ///   The error string is shaped so the UI's `isRebootRequired` and
+    ///   `isDriverMissing` helpers can substring-match without parsing.
+    pub fn self_test() -> Result<(), String> {
+        let health = Self::health_check();
+        if health.ready {
+            return Ok(());
+        }
+        Err(health.message)
+    }
+
+    /// Try to install the driver from the bundled MSI.
+    ///
+    /// Validates the MSI's pinned SHA-256 before handing it to msiexec — a
+    /// corrupted bundle (partial copy, disk bit-rot, tampered installer)
+    /// would otherwise surface as an opaque msiexec 1603 with no hint that
+    /// the file itself is wrong. Keeping the check at the bundled path (not
+    /// just the runtime download fallback in the Tauri `system_install_driver`
+    /// command) closes the hole for auto-install during first connect, which
+    /// is the overwhelmingly common path.
+    fn install_driver_from_msi() -> Result<(), String> {
+        let msi_path = Self::find_driver_msi().ok_or_else(Self::driver_msi_not_found_message)?;
+        let pkg = super::winpkfilter::native_msi_package();
+
+        super::winpkfilter::validate_msi_file(&msi_path, pkg).map_err(|e| {
+            log::error!("Bundled WinpkFilter MSI failed integrity check: {}", e);
+            e
+        })?;
+
+        log::info!(
+            "Installing WinpkFilter from: {} (sha256 verified)",
+            msi_path.display()
+        );
+
+        let output = run_driver_msi("/i", &msi_path)
+            .map_err(|e| format!("Could not finish the driver installation: {e}"))?;
+
+        let code = output.status.code().unwrap_or(-1);
+        if matches!(code, 0 | 1638 | 1641 | 3010) {
+            if code == 1638 {
+                log::info!("WinpkFilter already installed (different version)");
+            } else {
+                log::info!("WinpkFilter MSI installation completed with code {}", code);
+            }
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("msiexec failed with code {}: {}", code, stderr))
+    }
+
+    /// Install the WinpkFilter driver from the bundled INF/SYS/CAT package.
+    ///
+    /// This is the path used by the SwiftTunnel MSI custom action. It avoids
+    /// launching a nested MSI from inside Windows Installer and instead uses
+    /// `pnputil` directly on the extracted driver package.
+    pub fn install_driver_from_bundled_package(
+        resource_dir: Option<&Path>,
+        exe_dir: Option<&Path>,
+        program_files_dir: &Path,
+        force_reinstall: bool,
+    ) -> Result<(), String> {
+        let package = super::winpkfilter::find_bundled_driver_package(
+            resource_dir,
+            exe_dir,
+            program_files_dir,
+        )?;
+
+        if force_reinstall {
+            prepare_driver_reinstall(
+                super::winpkfilter::remove_installed_network_component,
+                Self::cleanup_driver_service_for_uninstall,
+                super::winpkfilter::remove_installed_driver_package,
+            )?;
+        }
+
+        log::info!(
+            "Installing WinpkFilter from bundled driver package: {}",
+            package.root_dir.display()
+        );
+        super::winpkfilter::install_driver_from_package_dir(&package.root_dir)?;
+        Self::repair_and_wait_until_available(DRIVER_READY_TIMEOUT)?;
+        Self::self_test()
+    }
+
+    /// Get the path to the driver file
+    fn get_driver_path() -> Option<PathBuf> {
+        // First try: Same directory as executable (for dev builds)
+        if let Ok(exe_path) = std::env::current_exe()
+            && let Some(exe_dir) = exe_path.parent()
+        {
+            let driver_path = exe_dir.join("drivers").join("ndisrd.sys");
+            if driver_path.exists() {
+                return Some(driver_path);
+            }
+        }
+
+        // Second try: Program Files installation
+        let program_files =
+            std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string());
+        let install_path = PathBuf::from(&program_files)
+            .join("SwiftTunnel")
+            .join("drivers")
+            .join("ndisrd.sys");
+        if install_path.exists() {
+            return Some(install_path);
+        }
+
+        // Third try: System32 drivers folder (default WinpkFilter location)
+        let system_path = crate::utils::trusted_windows_root()?
+            .join("System32")
+            .join("drivers")
+            .join("ndisrd.sys");
+        if system_path.exists() {
+            return Some(system_path);
+        }
+
+        None
+    }
+
+    pub fn repair_and_wait_until_available(timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut last_error: Option<String> = None;
+        let mut first_attempt = true;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            let health = Self::health_check();
+            if health.ready {
+                return Ok(());
+            }
+
+            let result = if first_attempt {
+                Self::repair_driver_service_registration(remaining)
+            } else {
+                Self::ensure_driver_service(remaining)
+            };
+            first_attempt = false;
+
+            let repair_error = if let Err(err) = result {
+                log::warn!("NDISRD readiness repair attempt failed: {}", err);
+                Some(err)
+            } else {
+                None
+            };
+
+            let health = Self::health_check();
+            if health.ready {
+                return Ok(());
+            }
+            last_error = Some(match repair_error {
+                Some(err) => format!("{} Last repair attempt: {}", health.message, err),
+                None => health.message,
+            });
+
+            if Instant::now() >= deadline {
+                break;
+            }
+
+            std::thread::sleep(DRIVER_READY_POLL_INTERVAL);
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            format!(
+                "Windows Packet Filter driver did not become available within {} seconds.",
+                timeout.as_secs()
+            )
+        }))
+    }
+
+    fn repair_driver_service_registration(timeout: Duration) -> Result<(), String> {
+        log::info!("Repairing NDISRD driver service registration");
+        Self::cleanup_driver_service_for_uninstall()?;
+        let sleep_for = DRIVER_READY_POLL_INTERVAL.min(timeout);
+        if !sleep_for.is_zero() {
+            std::thread::sleep(sleep_for);
+        }
+
+        let remaining = timeout.saturating_sub(sleep_for);
+        if remaining.is_zero() {
+            return Err("Timed out while repairing NDISRD service registration.".to_string());
+        }
+
+        Self::ensure_driver_service(remaining)
+    }
+
+    /// Extract Win32 error code from a `windows::core::Error`.
+    ///
+    /// The `windows` crate wraps Win32 errors as HRESULT values of the form
+    /// `0x8007_XXXX`. This extracts the lower 16 bits (the Win32 code).
+    fn win32_error_code(err: &windows::core::Error) -> u32 {
+        let hr = err.code().0 as u32;
+        if (hr & 0xFFFF_0000) == 0x8007_0000 {
+            hr & 0xFFFF
+        } else {
+            hr
+        }
+    }
+
+    /// Ensure the driver service exists and is started
+    ///
+    /// Requires administrator privileges to create or start the driver service.
+    /// Handles common edge cases:
+    /// - `ERROR_SERVICE_MARKED_FOR_DELETE` (1072): waits and retries
+    /// - `ERROR_SERVICE_ALREADY_RUNNING` (1056): treats as success
+    /// - `ERROR_SERVICE_DISABLED` (1058): re-enables and retries start
+    /// - Stale binary path: detects and corrects via `ChangeServiceConfigW`
+    fn ensure_driver_service(timeout: Duration) -> Result<(), String> {
+        use windows::Win32::System::Services::*;
+        use windows::core::PCWSTR;
+
+        const ERROR_SERVICE_ALREADY_RUNNING: u32 = 1056;
+        const ERROR_SERVICE_DISABLED: u32 = 1058;
+        const ERROR_SERVICE_MARKED_FOR_DELETE: u32 = 1072;
+
+        // Check for administrator privileges first
+        if !crate::utils::is_administrator() {
+            return Err(
+                "Administrator privileges required to manage driver service. \
+                Please run SwiftTunnel as Administrator."
+                    .to_string(),
+            );
+        }
+
+        // Get driver path
+        let driver_path = Self::get_driver_path();
+
+        unsafe {
+            let wait_for_running = |service, wait_timeout: Duration| -> Result<(), String> {
+                let effective_timeout = wait_timeout.min(DRIVER_SERVICE_START_TIMEOUT);
+                if effective_timeout.is_zero() {
+                    return Err(format!(
+                        "Timed out waiting for {} service to reach RUNNING state.",
+                        SERVICE_NAME
+                    ));
+                }
+
+                let deadline = Instant::now() + effective_timeout;
+
+                loop {
+                    let mut status = SERVICE_STATUS::default();
+                    QueryServiceStatus(service, &mut status).map_err(|e| {
+                        format!("Failed to query {} service status: {}", SERVICE_NAME, e)
+                    })?;
+
+                    if status.dwCurrentState == SERVICE_RUNNING {
+                        return Ok(());
+                    }
+
+                    if status.dwCurrentState != SERVICE_START_PENDING {
+                        return Err(format!(
+                            "{} service is not running (state {}).",
+                            SERVICE_NAME, status.dwCurrentState.0
+                        ));
+                    }
+
+                    if Instant::now() >= deadline {
+                        return Err(format!(
+                            "Timed out waiting for {} service to reach RUNNING state.",
+                            SERVICE_NAME
+                        ));
+                    }
+
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            };
+
+            // Start the service, handling ERROR_SERVICE_ALREADY_RUNNING and
+            // ERROR_SERVICE_DISABLED gracefully.
+            let start_service_resilient = |service| -> Result<(), String> {
+                match StartServiceW(service, None) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        let code = Self::win32_error_code(&e);
+
+                        if code == ERROR_SERVICE_ALREADY_RUNNING {
+                            log::info!("NDISRD service is already running");
+                            return Ok(());
+                        }
+
+                        if code == ERROR_SERVICE_DISABLED {
+                            log::warn!("NDISRD service is disabled; re-enabling to DEMAND_START");
+                            // Re-enable the service and retry start.
+                            let no_change_str = PCWSTR::null();
+                            if let Err(ce) = ChangeServiceConfigW(
+                                service,
+                                ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
+                                SERVICE_DEMAND_START,
+                                SERVICE_ERROR(SERVICE_NO_CHANGE),
+                                no_change_str,
+                                no_change_str,
+                                None,
+                                no_change_str,
+                                no_change_str,
+                                no_change_str,
+                                no_change_str,
+                            ) {
+                                return Err(format!("Failed to re-enable NDISRD service: {}", ce));
+                            }
+                            // Retry start after re-enabling.
+                            return StartServiceW(service, None).map_err(|e2| {
+                                format!("Failed to start NDISRD service after re-enabling: {}", e2)
+                            });
+                        }
+
+                        Err(format!("Failed to start NDISRD service: {}", e))
+                    }
+                }
+            };
+
+            // Open Service Control Manager
+            let scm = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ALL_ACCESS)
+                .map_err(|e| format!("Failed to open SCM: {}", e))?;
+
+            let service_name_wide: Vec<u16> = SERVICE_NAME
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+
+            // Try to open existing service, with retry for MARKED_FOR_DELETE
+            let open_result = {
+                let mut last_open_err = None;
+                let mut opened = None;
+                for attempt in 0..3u32 {
+                    match OpenServiceW(scm, PCWSTR(service_name_wide.as_ptr()), SERVICE_ALL_ACCESS)
+                    {
+                        Ok(service) => {
+                            opened = Some(service);
+                            break;
+                        }
+                        Err(e) => {
+                            let code = Self::win32_error_code(&e);
+                            if code == ERROR_SERVICE_MARKED_FOR_DELETE && attempt < 2 {
+                                log::warn!(
+                                    "NDISRD service is marked for delete; waiting 2s before retry (attempt {}/3)",
+                                    attempt + 1
+                                );
+                                std::thread::sleep(Duration::from_secs(2));
+                                continue;
+                            }
+                            last_open_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                match opened {
+                    Some(s) => Ok(s),
+                    None => Err(last_open_err),
+                }
+            };
+
+            let result = match open_result {
+                Ok(service) => {
+                    log::info!("NDISRD service exists, checking status...");
+
+                    let result = (|| -> Result<(), String> {
+                        // Verify and fix the binary path if we know the correct driver location.
+                        if let Some(expected_path) = &driver_path {
+                            Self::verify_and_fix_service_binary_path(service, expected_path);
+                        }
+
+                        let mut status = SERVICE_STATUS::default();
+                        QueryServiceStatus(service, &mut status)
+                            .map_err(|e| format!("Failed to query NDISRD service status: {}", e))?;
+
+                        if status.dwCurrentState == SERVICE_RUNNING {
+                            log::info!("NDISRD service is running");
+                            return Ok(());
+                        }
+
+                        if status.dwCurrentState != SERVICE_START_PENDING {
+                            log::info!("Starting NDISRD service...");
+                            start_service_resilient(service)?;
+                        }
+
+                        wait_for_running(service, timeout)?;
+                        log::info!("NDISRD service is running");
+                        Ok(())
+                    })();
+                    let _ = CloseServiceHandle(service);
+                    result
+                }
+                Err(_) => {
+                    log::info!("NDISRD service does not exist, creating...");
+
+                    (|| -> Result<(), String> {
+                        let driver_path = driver_path.as_ref().ok_or_else(|| {
+                            "Driver file not found, cannot create NDISRD service".to_string()
+                        })?;
+
+                        log::info!(
+                            "Creating NDISRD service with driver: {}",
+                            driver_path.display()
+                        );
+
+                        let display_name_wide: Vec<u16> = SERVICE_DISPLAY_NAME
+                            .encode_utf16()
+                            .chain(std::iter::once(0))
+                            .collect();
+                        let binary_path_wide: Vec<u16> = driver_path
+                            .to_string_lossy()
+                            .encode_utf16()
+                            .chain(std::iter::once(0))
+                            .collect();
+
+                        let create_result = CreateServiceW(
+                            scm,
+                            PCWSTR(service_name_wide.as_ptr()),
+                            PCWSTR(display_name_wide.as_ptr()),
+                            SERVICE_ALL_ACCESS,
+                            SERVICE_KERNEL_DRIVER,
+                            SERVICE_DEMAND_START,
+                            SERVICE_ERROR_NORMAL,
+                            PCWSTR(binary_path_wide.as_ptr()),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+
+                        match create_result {
+                            Ok(service) => {
+                                let result = (|| -> Result<(), String> {
+                                    log::info!("NDISRD service created, starting...");
+                                    start_service_resilient(service)?;
+                                    wait_for_running(service, timeout)?;
+                                    Ok(())
+                                })();
+                                let _ = CloseServiceHandle(service);
+                                result
+                            }
+                            Err(e) => {
+                                let code = Self::win32_error_code(&e);
+                                if code == ERROR_SERVICE_MARKED_FOR_DELETE {
+                                    Err(format!(
+                                        "Cannot create NDISRD service: previous instance is \
+                                         still marked for deletion. A reboot may be required. ({})",
+                                        e
+                                    ))
+                                } else {
+                                    Err(format!("Failed to create NDISRD service: {}", e))
+                                }
+                            }
+                        }
+                    })()
+                }
+            };
+
+            let _ = CloseServiceHandle(scm);
+            result
+        }
+    }
+
+    /// Reduce a service ImagePath to a comparable form.
+    ///
+    /// The Service Control Manager reports a kernel driver's path in NT
+    /// namespace form, and the registry may hold it relative to the Windows
+    /// directory, so all three of these describe the same healthy file:
+    ///
+    ///   \??\C:\Windows\System32\drivers\ndisrd.sys
+    ///   C:\Windows\System32\drivers\ndisrd.sys
+    ///   System32\drivers\ndisrd.sys
+    ///
+    /// Comparing those as raw strings reports a mismatch every time, which is
+    /// what drove the repeated service rewrites that wedged NDISRD.
+    fn normalize_service_binary_path(raw: &str) -> Option<String> {
+        Self::normalize_service_binary_path_with_root(
+            raw,
+            crate::utils::trusted_windows_root().as_deref(),
+        )
+    }
+
+    fn normalize_service_binary_path_with_root(
+        raw: &str,
+        windows_dir: Option<&Path>,
+    ) -> Option<String> {
+        let mut path = raw
+            .trim()
+            .trim_matches('"')
+            .replace('/', "\\")
+            .to_ascii_lowercase();
+
+        // NT namespace prefix, and the \SystemRoot\ alias the SCM also uses.
+        for prefix in ["\\??\\", "\\\\?\\"] {
+            if let Some(stripped) = path.strip_prefix(prefix) {
+                path = stripped.to_string();
+            }
+        }
+        for prefix in ["\\systemroot\\", "%systemroot%\\"] {
+            if let Some(stripped) = path.strip_prefix(prefix) {
+                path = windows_dir?
+                    .join(stripped)
+                    .to_string_lossy()
+                    .to_ascii_lowercase();
+            }
+        }
+
+        // A bare relative path in the registry is relative to the Windows dir.
+        let looks_absolute = path.chars().nth(1) == Some(':') || path.starts_with('\\');
+        if !looks_absolute && !path.is_empty() {
+            path = windows_dir?
+                .join(path)
+                .to_string_lossy()
+                .to_ascii_lowercase();
+        }
+
+        Some(path)
+    }
+
+    /// Check the service's binary path and update it if it points to the wrong location.
+    ///
+    /// This handles the case where a previous install left a stale service entry pointing
+    /// to a deleted or moved driver binary.
+    unsafe fn verify_and_fix_service_binary_path(
+        service: windows::Win32::System::Services::SC_HANDLE,
+        expected_path: &Path,
+    ) {
+        unsafe {
+            use windows::Win32::System::Services::*;
+            use windows::core::PCWSTR;
+
+            // Query the current service config to get the binary path.
+            let mut bytes_needed = 0u32;
+            let _ = QueryServiceConfigW(service, None, 0, &mut bytes_needed);
+            if bytes_needed == 0 {
+                return;
+            }
+
+            // Use Vec<u64> instead of Vec<u8> to guarantee pointer-width alignment,
+            // which QUERY_SERVICE_CONFIGW requires (it contains pointer fields).
+            let u64_len = (bytes_needed as usize).div_ceil(8);
+            let mut buf = vec![0u64; u64_len];
+            let config_ptr = buf.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW;
+            if QueryServiceConfigW(service, Some(config_ptr), bytes_needed, &mut bytes_needed)
+                .is_err()
+            {
+                log::warn!("Could not query NDISRD service config for binary path verification");
+                return;
+            }
+
+            let config = &*config_ptr;
+            let current_path_raw = config.lpBinaryPathName;
+            if current_path_raw.is_null() {
+                return;
+            }
+
+            let current_path_str = current_path_raw.to_string().unwrap_or_default();
+            let expected_str = expected_path.to_string_lossy();
+
+            // Compare normalized, NOT raw. Windows stores a driver's ImagePath in NT
+            // namespace form, so a perfectly healthy NDISRD reads back as
+            // `\??\C:\Windows\System32\drivers\ndisrd.sys` (or the registry-relative
+            // `System32\drivers\ndisrd.sys`), which never string-matches the plain
+            // Win32 path we expect.
+            //
+            // Comparing raw meant every check decided the service was broken and
+            // rewrote its config. One user's log shows that firing 113 times, and
+            // hammering ChangeServiceConfigW on a driver service is how it ends up
+            // "marked for deletion" — after which the driver cannot load at all and
+            // the machine loses networking until the service is rebuilt. That user
+            // could not reach the internet after boot, or run any other VPN, until
+            // they ran SwiftTunnel's repair.
+            let (Some(current), Some(expected)) = (
+                Self::normalize_service_binary_path(&current_path_str),
+                Self::normalize_service_binary_path(&expected_str),
+            ) else {
+                // An unresolved Windows root does not prove a mismatch.
+                log::warn!("Could not resolve the Windows folder for driver path verification");
+                return;
+            };
+            if current == expected {
+                return;
+            }
+
+            if !expected_path.exists() {
+                // Don't update to a path that doesn't exist.
+                log::debug!(
+                    "NDISRD service binary path mismatch but expected path does not exist: current='{}', expected='{}'",
+                    current_path_str,
+                    expected_str
+                );
+                return;
+            }
+
+            log::warn!(
+                "NDISRD service binary path mismatch: current='{}', expected='{}'; updating",
+                current_path_str,
+                expected_str
+            );
+
+            let new_path_wide: Vec<u16> = expected_str
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let no_change_str = PCWSTR::null();
+            if let Err(e) = ChangeServiceConfigW(
+                service,
+                ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
+                SERVICE_START_TYPE(SERVICE_NO_CHANGE),
+                SERVICE_ERROR(SERVICE_NO_CHANGE),
+                PCWSTR(new_path_wide.as_ptr()),
+                no_change_str,
+                None,
+                no_change_str,
+                no_change_str,
+                no_change_str,
+                no_change_str,
+            ) {
+                log::warn!("Failed to update NDISRD service binary path: {}", e);
+            } else {
+                log::info!("NDISRD service binary path updated to '{}'", expected_str);
+            }
+        }
+    }
+
+    /// `false` means the driver was preserved for the other client; it does
+    /// not mean a removal took place. Repair callers must keep that distinction.
+    pub fn remove_driver_for_uninstall() -> Result<bool, String> {
+        // The packet filter is shared between the full app and Lite, and one
+        // machine can have both. Taking it out while the other client is still
+        // installed leaves that client unable to connect at all, and nothing
+        // says why: the uninstall reports success, the surviving app still
+        // launches and looks healthy, and the failure only appears later at
+        // connect as "could not start its Windows Packet Filter driver". The
+        // cause is by then several steps back and looks unrelated.
+        //
+        // Whichever client is removed last takes the driver with it, so
+        // stopping here costs nothing permanent.
+        #[cfg(windows)]
+        if let Some(other) = crate::installed_clients::other_client_still_installed().map_err(|error| {
+            log::warn!("Driver removal deferred: {error}");
+            "The network driver was left installed because Windows could not check whether the other SwiftTunnel client still needs it. Retry cleanup from Windows Settings > Apps.".to_string()
+        })? {
+            log::info!(
+                "Leaving the packet filter driver installed: {other} is still on this machine \
+                 and shares it. It will be removed when the last client is."
+            );
+            return Ok(false);
+        }
+
+        let mut issues = Vec::new();
+        let mut any_msi_found = false;
+
+        // Best-effort: if binding removal fails we still try the MSI uninstall
+        // below. Returning early used to skip the MSI step entirely, which
+        // left both the bindings and the driver package installed when the
+        // binding call hiccupped — strictly worse than attempting the MSI.
+        if let Err(e) = Self::disable_winpkfilter_bindings_for_uninstall() {
+            issues.push(format!("binding removal failed: {}", e));
+        }
+
+        // Binding removal can leave the network component registered even
+        // after the driver package disappears. Remove the component explicitly
+        // so Windows Settings / Control Panel uninstall does not leave users
+        // with a missing filter still attached to their adapter stack.
+        if let Err(e) = super::winpkfilter::remove_installed_network_component() {
+            issues.push(format!("network component removal failed: {}", e));
+        }
+
+        // Uninstall the MSI variants this machine could actually be carrying.
+        // ARM64 still gets both, because Windows on ARM runs x64 installers
+        // under emulation and an older build could have left an x64
+        // registration. x64 gets only x64: a driver is not emulated, so the
+        // ARM64 package was never installable there, and attempting it cost
+        // three minutes of an uninstall that looked frozen to reach a failure
+        // that was certain before it started.
+        for pkg in super::winpkfilter::removable_msi_packages() {
+            if let Some(msi_path) = Self::find_driver_msi_by_name(pkg.msi_name) {
+                any_msi_found = true;
+                // Uninstall also opens the package. Apply the same pinned
+                // integrity check as install before passing a file to MSI.
+                if let Err(error) = super::winpkfilter::validate_msi_file(&msi_path, pkg) {
+                    issues.push(format!(
+                        "Driver MSI ({}) was not opened because its integrity check failed: {error}",
+                        pkg.arch
+                    ));
+                    continue;
+                }
+                log::info!(
+                    "Uninstalling WinpkFilter MSI ({}) from: {}",
+                    pkg.arch,
+                    msi_path.display()
+                );
+
+                let res = run_driver_msi("/x", &msi_path);
+                match res {
+                    Ok(output) => {
+                        let code = output.status.code().unwrap_or(-1);
+                        if Self::driver_uninstall_success_exit_code(code) {
+                            log::info!(
+                                "WinpkFilter MSI ({}) uninstall completed with code {}",
+                                pkg.arch,
+                                code
+                            );
+                        } else {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            issues.push(format!(
+                                "Driver MSI ({}) uninstall failed with code {}: {}",
+                                pkg.arch, code, stderr
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        issues.push(format!(
+                            "Driver MSI ({}) uninstall did not finish: {e}",
+                            pkg.arch
+                        ));
+                        // Installer's service may still be completing or
+                        // rolling back work. Do not race it with another MSI
+                        // or direct driver/service removal after a timeout.
+                        if e.kind() == std::io::ErrorKind::TimedOut {
+                            return Err(issues.join("; "));
+                        }
+                    }
+                }
+            }
+        }
+
+        if !any_msi_found {
+            log::warn!(
+                "No WinpkFilter MSI found during uninstall; falling back to service cleanup only"
+            );
+        }
+
+        // The MSI installer path now installs the extracted INF/SYS/CAT package
+        // with pnputil, so uninstall must remove the Driver Store package
+        // directly even when no WinpkFilter product registration exists.
+        if let Err(e) = super::winpkfilter::remove_installed_driver_package() {
+            issues.push(format!("driver-store package removal failed: {}", e));
+        }
+
+        if let Err(e) = Self::cleanup_driver_service_for_uninstall() {
+            issues.push(e);
+        }
+
+        if issues.is_empty() {
+            Ok(true)
+        } else {
+            Err(issues.join("; "))
+        }
+    }
+
+    fn driver_msi_not_found_message() -> String {
+        let pkg = super::winpkfilter::native_msi_package();
+        format!(
+            "{} not found. Please download from: https://github.com/wiresock/ndisapi/releases",
+            pkg.msi_name
+        )
+    }
+
+    fn find_driver_msi_by_name(msi_name: &str) -> Option<PathBuf> {
+        let msi_paths = [
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(|dir| dir.join("drivers").join(msi_name))),
+            std::env::current_exe().ok().and_then(|path| {
+                path.parent()
+                    .map(|dir| dir.join("resources").join("drivers").join(msi_name))
+            }),
+            std::env::current_exe().ok().and_then(|path| {
+                path.parent()
+                    .map(|dir| dir.join("resources").join(msi_name))
+            }),
+            Some(PathBuf::from(format!(
+                r"C:\Program Files\SwiftTunnel\drivers\{msi_name}"
+            ))),
+            Some(PathBuf::from(format!(
+                r"C:\Program Files\SwiftTunnel\resources\drivers\{msi_name}"
+            ))),
+        ];
+
+        msi_paths.into_iter().flatten().find(|path| path.exists())
+    }
+
+    fn find_driver_msi() -> Option<PathBuf> {
+        let pkg = super::winpkfilter::native_msi_package();
+        Self::find_driver_msi_by_name(pkg.msi_name)
+    }
+
+    fn driver_uninstall_success_exit_code(code: i32) -> bool {
+        matches!(code, 0 | 1605 | 1614 | 1641 | 3010)
+    }
+
+    fn build_winpkfilter_binding_cleanup_script() -> &'static str {
+        r#"
+        $ErrorActionPreference = 'Stop'
+        $bindings = @(
+            Get-NetAdapterBinding -ComponentID 'nt_ndisrd' -ErrorAction SilentlyContinue |
+                Where-Object { $_.Enabled -eq $true } |
+                Sort-Object -Property Name -Unique
+        )
+
+        if ($bindings.Count -eq 0) {
+            Write-Output 'No enabled WinpkFilter bindings found during uninstall cleanup.'
+            exit 0
+        }
+
+        $disabled = New-Object System.Collections.Generic.List[string]
+        $failures = New-Object System.Collections.Generic.List[string]
+
+        foreach ($binding in $bindings) {
+            $adapterName = [string]$binding.Name
+            if ([string]::IsNullOrWhiteSpace($adapterName)) {
+                continue
+            }
+
+            try {
+                Disable-NetAdapterBinding -Name $adapterName -ComponentID 'nt_ndisrd' -Confirm:$false -ErrorAction Stop | Out-Null
+                Start-Sleep -Milliseconds 500
+                $verification = Get-NetAdapterBinding -Name $adapterName -ComponentID 'nt_ndisrd' -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+
+                if ($verification -and $verification.Enabled) {
+                    $failures.Add($adapterName + ': binding still enabled after Disable-NetAdapterBinding')
+                    continue
+                }
+
+                $disabled.Add($adapterName)
+            } catch {
+                $failures.Add($adapterName + ': ' + $_.Exception.Message)
+            }
+        }
+
+        if ($disabled.Count -gt 0) {
+            Write-Output ('Disabled WinpkFilter binding on adapters: ' + ($disabled -join ', '))
+        }
+
+        if ($failures.Count -gt 0) {
+            Write-Error ('Failed to disable WinpkFilter binding on adapters: ' + ($failures -join '; '))
+            exit 1
+        }
+        "#
+    }
+
+    fn collect_binding_cleanup(script: &str) -> crate::utils::BoundedCommandOutput {
+        let script = format!(
+            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); {script}"
+        );
+        crate::run_hidden_command_with_timeout(
+            "powershell",
+            &["-NoProfile", "-NonInteractive", "-Command", &script],
+            WINPKFILTER_BINDING_CLEANUP_TIMEOUT,
+        )
+    }
+
+    fn disable_winpkfilter_bindings_for_uninstall() -> Result<(), String> {
+        log::info!("Disabling WinpkFilter adapter bindings before uninstall");
+
+        let output =
+            Self::collect_binding_cleanup(Self::build_winpkfilter_binding_cleanup_script());
+
+        let stdout = output.stdout.trim().to_string();
+        let stderr = output.stderr.trim().to_string();
+
+        if output.success {
+            if stdout.is_empty() {
+                log::info!("WinpkFilter binding cleanup completed");
+            } else {
+                log::info!("{}", stdout);
+            }
+            return Ok(());
+        }
+
+        let details = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!(
+                "PowerShell exited with code {}",
+                output.exit_code.unwrap_or(-1)
+            )
+        };
+
+        Err(format!(
+            "Failed to disable WinpkFilter bindings before uninstall: {}",
+            details
+        ))
+    }
+
+    /// Parse the adapter names from the binding-cleanup script's success output.
+    ///
+    /// The script emits `Disabled WinpkFilter binding on adapters: A, B` when it
+    /// unbinds anything, and a "no enabled bindings" line otherwise. Returns the
+    /// adapter names that were unbound (empty when there was nothing to do).
+    #[cfg(windows)]
+    fn parse_disabled_winpkfilter_adapters(stdout: &str) -> Vec<String> {
+        const PREFIX: &str = "Disabled WinpkFilter binding on adapters: ";
+        stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(PREFIX))
+            .map(|rest| {
+                rest.split(',')
+                    .map(|name| name.trim().to_string())
+                    .filter(|name| !name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Disable any leftover `nt_ndisrd` adapter bindings as part of Internet
+    /// recovery.
+    ///
+    /// After a crash or force-close the WinpkFilter LWF can stay bound to one or
+    /// more adapters and silently blackhole all traffic — the "No internet,
+    /// Secured" state users hit until they reconnect SwiftTunnel (or run the
+    /// manual `Disable-NetAdapterBinding -ComponentId nt_ndisrd` fix support has
+    /// been handing out). Unbinding it here self-heals that without a reboot.
+    /// Safe while disconnected: the next connect re-enables the binding on the
+    /// active adapter.
+    ///
+    /// Reuses the uninstall cleanup script (the action is identical) and returns
+    /// the adapters that were actually unbound so the repair can report a result.
+    #[cfg(windows)]
+    pub fn disable_leftover_winpkfilter_bindings() -> Result<Vec<String>, String> {
+        let output =
+            Self::collect_binding_cleanup(Self::build_winpkfilter_binding_cleanup_script());
+
+        let stdout = output.stdout.trim().to_string();
+        let stderr = output.stderr.trim().to_string();
+
+        if !output.success {
+            let details = if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                format!(
+                    "PowerShell exited with code {}",
+                    output.exit_code.unwrap_or(-1)
+                )
+            };
+            return Err(format!(
+                "Failed to disable leftover WinpkFilter adapter bindings: {}",
+                details
+            ));
+        }
+
+        let disabled = Self::parse_disabled_winpkfilter_adapters(&stdout);
+        if disabled.is_empty() {
+            log::info!("Internet recovery: no leftover WinpkFilter adapter bindings to disable");
+        } else {
+            log::info!(
+                "Internet recovery: disabled leftover WinpkFilter binding on adapter(s): {}",
+                disabled.join(", ")
+            );
+        }
+        Ok(disabled)
+    }
+
+    /// Stop the driver service
+    pub fn stop_driver_service() -> Result<(), String> {
+        use windows::Win32::System::Services::*;
+        use windows::core::PCWSTR;
+
+        unsafe {
+            let scm = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ALL_ACCESS)
+                .map_err(|e| format!("Failed to open SCM: {}", e))?;
+
+            let service_name_wide: Vec<u16> = SERVICE_NAME
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+
+            match OpenServiceW(scm, PCWSTR(service_name_wide.as_ptr()), SERVICE_STOP) {
+                Ok(service) => {
+                    let mut status = SERVICE_STATUS::default();
+                    let _ = ControlService(service, SERVICE_CONTROL_STOP, &mut status);
+                    let _ = CloseServiceHandle(service);
+                    log::info!("NDISRD service stop requested");
+                }
+                Err(_) => {
+                    log::debug!("NDISRD service not found (may not be installed)");
+                }
+            }
+
+            let _ = CloseServiceHandle(scm);
+        }
+
+        Ok(())
+    }
+
+    /// Restart the driver service
+    pub fn restart_driver_service() -> Result<(), String> {
+        Self::stop_driver_service()?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        Self::ensure_driver_service(DRIVER_SERVICE_START_TIMEOUT)
+    }
+
+    /// Cleanup stale state from previous sessions (logging wrapper around
+    /// [`Self::cleanup_stale_state_checked`] for call sites that don't act on
+    /// the result, e.g. uninstall).
+    pub fn cleanup_stale_state() {
+        let _ = Self::cleanup_stale_state_checked();
+    }
+
+    /// Reset every TCP/IP-bound adapter's WinpkFilter mode flags to default
+    /// and verify the reset by reading the mode back.
+    ///
+    /// The primary success condition is the verified read-back, not the set
+    /// call returning Ok: a session that died ungracefully leaves adapters in
+    /// `MSTCP_FLAG_SENT_RECEIVE_TUNNEL`, which blackholes all traffic on the
+    /// adapter, so callers (startup recovery, the network repair command, the
+    /// disconnect path) must be able to trust `fully_clean()` before clearing
+    /// the tunnel-mode marker.
+    pub fn cleanup_stale_state_checked() -> StaleCleanupReport {
+        log::info!("Cleaning up stale split tunnel state...");
+        let mut report = StaleCleanupReport::default();
+
+        let driver = match ndisapi::Ndisapi::new("NDISRD") {
+            Ok(driver) => driver,
+            Err(e) => {
+                // Not an adapter-level failure: the device didn't open at all.
+                // The caller decides whether this is benign (driver not
+                // installed → nothing can be stuck) or a repair failure
+                // (install evidence present → keep retrying).
+                log::debug!(
+                    "Stale split tunnel cleanup skipped; NDISRD is not available: {}",
+                    e
+                );
+                report.driver_open_error = Some(e.to_string());
+                return report;
+            }
+        };
+
+        let adapters = match driver.get_tcpip_bound_adapters_info() {
+            Ok(adapters) => adapters,
+            Err(e) => {
+                log::warn!(
+                    "Stale split tunnel cleanup could not enumerate adapters: {}",
+                    e
+                );
+                report
+                    .errors
+                    .push(format!("adapter enumeration failed: {}", e));
+                return report;
+            }
+        };
+
+        report.adapters_total = adapters.len();
+        for adapter in adapters {
+            let handle = adapter.get_handle();
+            let name = adapter.get_name();
+
+            // Diagnostic pre-read: lets the repair UI say "N adapter(s) were
+            // stuck in tunnel mode". A pre-read failure is not a cleanup
+            // failure — the set+verify below still decides success.
+            let was_filtering = driver
+                .get_adapter_mode(handle)
+                .map(|mode| !mode.is_empty())
+                .unwrap_or(false);
+            if was_filtering {
+                report.adapters_were_filtering += 1;
+                log::warn!(
+                    "Adapter '{}' was left with WinpkFilter mode flags set (stale tunnel mode); resetting",
+                    name
+                );
+            }
+
+            match driver.set_adapter_mode(handle, ndisapi::FilterFlags::default()) {
+                Ok(()) => match driver.get_adapter_mode(handle) {
+                    Ok(mode) if mode.is_empty() => report.adapters_reset += 1,
+                    Ok(mode) => report.errors.push(format!(
+                        "adapter '{}' still reports mode flags {:?} after reset",
+                        name, mode
+                    )),
+                    Err(e) => {
+                        // Verification, not the reset, failed. Treated as an
+                        // error so the marker is kept and recovery retries —
+                        // an unverified reset must not count as success.
+                        report.errors.push(format!(
+                            "adapter '{}' mode could not be verified after reset: {}",
+                            name, e
+                        ));
+                    }
+                },
+                Err(e) => report
+                    .errors
+                    .push(format!("adapter '{}' mode reset failed: {}", name, e)),
+            }
+        }
+
+        if report.errors.is_empty() {
+            log::info!(
+                "Stale split tunnel cleanup complete ({} adapter(s) verified default, {} had stale filter flags)",
+                report.adapters_reset,
+                report.adapters_were_filtering
+            );
+        } else {
+            log::warn!(
+                "Stale split tunnel cleanup incomplete ({}/{} adapter(s) verified default): {}",
+                report.adapters_reset,
+                report.adapters_total,
+                report.errors.join("; ")
+            );
+        }
+        report
+    }
+
+    /// Stop and delete the NDISRD driver service from SCM for uninstall.
+    ///
+    /// This removes the kernel driver registration so no artifacts remain.
+    /// Individual errors are ignored so the rest of uninstall can proceed.
+    pub fn cleanup_driver_service_for_uninstall() -> Result<(), String> {
+        use windows::Win32::System::Services::*;
+        use windows::core::PCWSTR;
+
+        log::info!("Cleaning up NDISRD driver service for uninstall");
+
+        unsafe {
+            let scm = match OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ALL_ACCESS) {
+                Ok(scm) => scm,
+                Err(e) => {
+                    let message = format!("Failed to open SCM for driver cleanup: {}", e);
+                    log::warn!("{}", message);
+                    return Err(message);
+                }
+            };
+
+            let service_name_wide: Vec<u16> = SERVICE_NAME
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+
+            match OpenServiceW(scm, PCWSTR(service_name_wide.as_ptr()), SERVICE_ALL_ACCESS) {
+                Ok(service) => {
+                    // Stop the service first (ignore error — may already be stopped)
+                    let mut status = SERVICE_STATUS::default();
+                    let _ = ControlService(service, SERVICE_CONTROL_STOP, &mut status);
+
+                    // Delete the service from SCM
+                    match DeleteService(service) {
+                        Ok(_) => log::info!("NDISRD service deleted from SCM"),
+                        Err(e) => {
+                            let message = format!("Failed to delete NDISRD service: {}", e);
+                            log::warn!("{}", message);
+                            let _ = CloseServiceHandle(service);
+                            let _ = CloseServiceHandle(scm);
+                            return Err(message);
+                        }
+                    }
+
+                    let _ = CloseServiceHandle(service);
+                }
+                Err(error) => {
+                    let _ = CloseServiceHandle(scm);
+                    return driver_service_open_failure(error);
+                }
+            }
+
+            let _ = CloseServiceHandle(scm);
+        }
+
+        log::info!("NDISRD driver service cleanup completed");
+        Ok(())
+    }
+
+    /// Open the driver
+    pub fn open(&mut self) -> VpnResult<()> {
+        if self.parallel_interceptor.is_some() {
+            log::warn!("Split tunnel already open");
+            return Ok(());
+        }
+
+        log::info!("Opening split tunnel driver (ndisapi, parallel)...");
+
+        let tunnel_apps: Vec<String> = self
+            .config
+            .as_ref()
+            .map(|c| c.tunnel_apps.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let interceptor = ParallelInterceptor::new(tunnel_apps);
+        self.parallel_interceptor = Some(interceptor);
+
+        self.state = DriverState::NotConfigured;
+
+        log::info!("Split tunnel driver opened");
+        Ok(())
+    }
+
+    /// Initialize the driver
+    pub fn initialize(&mut self) -> VpnResult<()> {
+        log::info!("Initializing split tunnel driver...");
+
+        let interceptor = self
+            .parallel_interceptor
+            .as_mut()
+            .ok_or_else(|| VpnError::SplitTunnel("Driver not open".to_string()))?;
+        interceptor.initialize()?;
+
+        self.state = DriverState::Initialized;
+        log::info!("Split tunnel driver initialized");
+        Ok(())
+    }
+
+    /// Get running tunnel app names
+    pub fn get_running_tunnel_apps(&mut self) -> Vec<String> {
+        self.get_running_tunnel_processes()
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect()
+    }
+
+    /// Get running tunnel processes as `(pid, process_name)` pairs.
+    pub fn get_running_tunnel_processes(&mut self) -> Vec<(u32, String)> {
+        if let Some(ref interceptor) = self.parallel_interceptor {
+            let snapshot = interceptor.get_snapshot();
+            let mut processes: Vec<(u32, String)> = snapshot
+                .tunnel_pids
+                .iter()
+                .filter_map(|pid| snapshot.pid_names.get(pid).map(|name| (*pid, name.clone())))
+                .collect();
+            processes.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+            processes
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Get running target names (alias for get_running_tunnel_apps)
+    pub fn get_running_target_names(&mut self) -> Vec<String> {
+        self.get_running_tunnel_apps()
+    }
+
+    /// Configure split tunnel with the given settings
+    pub fn configure(&mut self, config: SplitTunnelConfig) -> VpnResult<()> {
+        if self.state == DriverState::NotAvailable {
+            return Err(VpnError::SplitTunnelNotAvailable);
+        }
+
+        log::info!(
+            "Configuring split tunnel: {} apps to tunnel",
+            config.tunnel_apps.len()
+        );
+        log::debug!("Tunnel apps: {:?}", config.tunnel_apps);
+
+        let interceptor = self
+            .parallel_interceptor
+            .as_mut()
+            .ok_or_else(|| VpnError::SplitTunnel("Driver not open".to_string()))?;
+
+        // Configure the interceptor
+        // Pass the LUID for reliable adapter identification even when
+        // Windows API friendly name lookup fails (issue after v0.9.11)
+        interceptor.configure(
+            "SwiftTunnel", // VPN adapter name
+            config.tunnel_apps.iter().cloned().collect(),
+            config.tunnel_interface_luid, // LUID for reliable detection
+            config.binding_preference.clone(),
+        )?;
+
+        // Start packet interception
+        interceptor.start()?;
+
+        self.config = Some(config);
+        self.state = DriverState::Active;
+
+        log::info!("Split tunnel configured and active");
+        Ok(())
+    }
+
+    /// Refresh process exclusions
+    pub fn refresh_exclusions(&mut self) -> VpnResult<bool> {
+        // Cache refresher runs automatically in background
+        // Just check if tunnel apps are running
+        let running = !self.get_running_tunnel_apps().is_empty();
+        Ok(running)
+    }
+
+    /// Re-bind split tunnel interception to the currently active network interface if needed.
+    ///
+    /// This is primarily to handle default-route changes (Ethernet <-> Wi-Fi) while the app
+    /// remains connected, which otherwise results in "connected but 0 packets tunneled".
+    pub fn maybe_rebind_on_default_route_change(&mut self) -> VpnResult<bool> {
+        if self.state != DriverState::Active {
+            return Ok(false);
+        }
+
+        let config = match self.config.as_ref() {
+            Some(c) => c,
+            None => return Ok(false),
+        };
+
+        let interceptor = match self.parallel_interceptor.as_mut() {
+            Some(i) => i,
+            None => return Ok(false),
+        };
+
+        interceptor
+            .maybe_rebind_on_default_route_change("SwiftTunnel", config.tunnel_interface_luid)
+    }
+
+    /// Refresh processes (alias for refresh_exclusions)
+    pub fn refresh_processes(&mut self) -> VpnResult<bool> {
+        self.refresh_exclusions()
+    }
+
+    /// Get driver state value (for compatibility)
+    pub fn get_driver_state(&self) -> VpnResult<u64> {
+        match &self.state {
+            DriverState::NotAvailable => Ok(0),
+            DriverState::NotConfigured => Ok(1),
+            DriverState::Initialized => Ok(2),
+            DriverState::Active => Ok(4),
+            DriverState::Error(_) => Ok(0),
+        }
+    }
+
+    /// Clear configuration
+    pub fn clear(&mut self) -> VpnResult<()> {
+        if let Some(interceptor) = &mut self.parallel_interceptor {
+            interceptor.stop();
+        }
+        self.config = None;
+        self.state = DriverState::NotConfigured;
+        log::info!("Split tunnel configuration cleared");
+        Ok(())
+    }
+
+    /// Close the driver
+    pub fn close(&mut self) -> VpnResult<()> {
+        log::info!("Closing split tunnel driver...");
+
+        if let Some(mut interceptor) = self.parallel_interceptor.take() {
+            // Stop can wait for driver threads and Windows state restoration.
+            // Keep the interceptor owned until its teardown and Drop finish.
+            crate::utils::blocking_step(move || interceptor.stop());
+        }
+
+        self.config = None;
+        self.state = DriverState::NotAvailable;
+        self.stop_flag.store(true, Ordering::SeqCst);
+
+        log::info!("Split tunnel driver closed");
+        Ok(())
+    }
+
+    /// Get current state
+    pub fn state(&self) -> &DriverState {
+        &self.state
+    }
+
+    /// Get current configuration
+    pub fn config(&self) -> Option<&SplitTunnelConfig> {
+        self.config.as_ref()
+    }
+
+    /// Get throughput stats for GUI display
+    ///
+    /// Returns a clonable ThroughputStats that tracks bytes sent/received through the VPN tunnel.
+    /// Returns None if interceptor is not active.
+    pub fn get_throughput_stats(&self) -> Option<ThroughputStats> {
+        self.parallel_interceptor
+            .as_ref()
+            .map(|p| p.get_throughput_stats())
+    }
+
+    /// Get diagnostic info for UI display.
+    pub fn get_diagnostics(&self) -> Option<SplitTunnelDiagnostics> {
+        self.parallel_interceptor
+            .as_ref()
+            .map(|p| p.get_diagnostics())
+    }
+
+    /// Get detected game server IPs for notifications (Bloxstrap-style)
+    pub fn get_detected_game_servers(&self) -> Vec<std::net::Ipv4Addr> {
+        self.parallel_interceptor
+            .as_ref()
+            .map(|p| p.get_detected_game_servers())
+            .unwrap_or_default()
+    }
+
+    /// Clear detected game servers (call on disconnect)
+    pub fn clear_detected_game_servers(&self) {
+        if let Some(ref p) = self.parallel_interceptor {
+            p.clear_detected_game_servers();
+        }
+    }
+
+    /// Immediately register a process detected via ETW for tunneling
+    ///
+    /// Called when ETW detects a watched process starting. This adds the
+    /// PID → name mapping to the process cache INSTANTLY (microseconds),
+    /// so when the first packet arrives, the process is already known.
+    ///
+    /// This fixes Roblox Error 279 when launching from browser:
+    /// - Browser spawns RobloxPlayerBeta.exe via roblox-player:// protocol
+    /// - ETW notifies us within MICROSECONDS (not 50ms polling!)
+    /// - We register the process here
+    /// - First packet arrives → process is already in cache → TUNNELED!
+    pub fn register_process_immediate(&self, pid: u32, name: String) {
+        if let Some(ref interceptor) = self.parallel_interceptor {
+            interceptor.register_process_immediate(pid, name);
+            // Also trigger immediate cache refresh for connection table
+            interceptor.trigger_refresh();
+        } else {
+            log::warn!("Cannot register process: parallel interceptor not active");
+        }
+    }
+
+    pub fn register_udp_port_immediate(&self, local_port: u16) {
+        if let Some(ref interceptor) = self.parallel_interceptor {
+            interceptor.register_udp_port_immediate(local_port);
+        } else {
+            log::warn!("Cannot register UDP port: parallel interceptor not active");
+        }
+    }
+
+    pub fn has_cached_connection_for_pid(&self, pid: u32) -> bool {
+        self.parallel_interceptor
+            .as_ref()
+            .is_some_and(|interceptor| interceptor.has_cached_connection_for_pid(pid))
+    }
+
+    /// Switch relay address (proxy to ParallelInterceptor)
+    pub fn switch_relay_addr(&self, new_addr: std::net::SocketAddr) -> bool {
+        if let Some(ref interceptor) = self.parallel_interceptor {
+            interceptor.switch_relay_addr(new_addr)
+        } else {
+            log::warn!("Cannot switch relay: no parallel interceptor");
+            false
+        }
+    }
+
+    /// Get current relay address (proxy to ParallelInterceptor)
+    pub fn current_relay_addr(&self) -> Option<std::net::SocketAddr> {
+        self.parallel_interceptor
+            .as_ref()
+            .and_then(|p| p.current_relay_addr())
+    }
+
+    /// Enable or disable TCP API tunneling (proxy to ParallelInterceptor).
+    pub fn set_api_tunneling_enabled(&self, enabled: bool) {
+        if let Some(ref interceptor) = self.parallel_interceptor {
+            interceptor.set_api_tunneling_enabled(enabled);
+        }
+    }
+
+    /// Enable or disable UDP gameplay tunneling (proxy to ParallelInterceptor).
+    pub fn set_udp_tunneling_enabled(&self, enabled: bool) {
+        if let Some(ref interceptor) = self.parallel_interceptor {
+            interceptor.set_udp_tunneling_enabled(enabled);
+        }
+    }
+
+    /// Trigger immediate cache refresh (called by ETW when game process detected)
+    /// This wakes up the cache refresher from its 2-second sleep
+    pub fn trigger_cache_refresh(&self) {
+        if let Some(ref interceptor) = self.parallel_interceptor {
+            interceptor.trigger_refresh();
+        }
+    }
+}
+
+impl Default for SplitTunnelDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for SplitTunnelDriver {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn driver_service_cleanup_only_treats_confirmed_absence_as_success() {
+        use windows::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, ERROR_SERVICE_DOES_NOT_EXIST,
+            ERROR_SERVICE_MARKED_FOR_DELETE,
+        };
+        let missing = windows::core::Error::from(windows::core::HRESULT::from_win32(
+            ERROR_SERVICE_DOES_NOT_EXIST.0,
+        ));
+        assert!(driver_service_open_failure(missing).is_ok());
+        for code in [
+            ERROR_ACCESS_DENIED,
+            ERROR_SERVICE_MARKED_FOR_DELETE,
+            ERROR_INVALID_HANDLE,
+        ] {
+            let result = driver_service_open_failure(windows::core::Error::from(
+                windows::core::HRESULT::from_win32(code.0),
+            ));
+            let message = result.expect_err("an unreadable service is not an absent service");
+            if code == ERROR_SERVICE_MARKED_FOR_DELETE {
+                assert!(super::super::error_messages::driver_reboot_pending(
+                    &message
+                ));
+            } else if code == ERROR_ACCESS_DENIED {
+                assert!(message.contains("Access denied"));
+            }
+        }
+    }
+
+    #[test]
+    fn reinstall_stops_before_service_or_package_removal_when_windows_requires_restart() {
+        let pending = "Reboot required to finish WinpkFilter network component removal. netcfg exited with code 3010.";
+        assert_eq!(
+            prepare_driver_reinstall(
+                || Err(pending.into()),
+                || panic!("service removal must wait for restart"),
+                || panic!("package removal must wait for restart"),
+            )
+            .unwrap_err(),
+            pending
+        );
+    }
+
+    #[test]
+    fn reinstall_cleanup_preserves_step_order_and_propagates_service_failure() {
+        let steps = std::cell::RefCell::new(Vec::new());
+        prepare_driver_reinstall(
+            || {
+                steps.borrow_mut().push("component");
+                Err("component already unavailable".into())
+            },
+            || {
+                steps.borrow_mut().push("service");
+                Ok(())
+            },
+            || {
+                steps.borrow_mut().push("package");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*steps.borrow(), ["component", "service", "package"]);
+        let error = prepare_driver_reinstall(
+            || Ok(()),
+            || Err("access denied by service policy".into()),
+            || panic!("a service failure must stop package removal"),
+        )
+        .unwrap_err();
+        assert!(error.contains("access denied by service policy"));
+    }
+
+    /// The exact pair from the report that led here. The service was healthy;
+    /// only the comparison was wrong, and every check rewrote the service
+    /// config until Windows marked it for deletion and the driver stopped
+    /// loading, taking the machine's networking with it.
+    #[test]
+    fn nt_namespace_driver_path_is_not_a_mismatch() {
+        let from_scm = r"\??\C:\Windows\System32\drivers\ndisrd.sys";
+        let expected = r"C:\Windows\System32\drivers\ndisrd.sys";
+        assert_eq!(
+            SplitTunnelDriver::normalize_service_binary_path(from_scm),
+            SplitTunnelDriver::normalize_service_binary_path(expected),
+        );
+    }
+
+    #[test]
+    fn service_path_normalization_handles_the_other_windows_forms() {
+        let expected = SplitTunnelDriver::normalize_service_binary_path(
+            r"C:\Windows\System32\drivers\ndisrd.sys",
+        );
+
+        for equivalent in [
+            r"\??\C:\Windows\System32\drivers\ndisrd.sys",
+            r"\\?\C:\Windows\System32\drivers\ndisrd.sys",
+            "\"C:\\Windows\\System32\\drivers\\ndisrd.sys\"",
+            r"C:\Windows\System32\Drivers\NDISRD.SYS",
+            r"C:/Windows/System32/drivers/ndisrd.sys",
+        ] {
+            assert_eq!(
+                SplitTunnelDriver::normalize_service_binary_path(equivalent),
+                expected,
+                "should match: {equivalent}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_path_normalization_still_detects_a_real_mismatch() {
+        // A genuinely stale entry pointing somewhere else must still be fixed,
+        // which is what this check exists for.
+        assert_ne!(
+            SplitTunnelDriver::normalize_service_binary_path(
+                r"\??\C:\Program Files\Old\ndisrd.sys"
+            ),
+            SplitTunnelDriver::normalize_service_binary_path(
+                r"C:\Windows\System32\drivers\ndisrd.sys"
+            ),
+        );
+    }
+
+    #[test]
+    fn service_paths_resolve_aliases_against_the_actual_windows_installation() {
+        let root = crate::utils::trusted_windows_root().expect("Windows system directory");
+        let expected = SplitTunnelDriver::normalize_service_binary_path(
+            &root.join("System32/drivers/ndisrd.sys").to_string_lossy(),
+        );
+        for path in [
+            r"\SystemRoot\System32\drivers\ndisrd.sys",
+            r"\systemroot\System32\drivers\ndisrd.sys",
+            r"%SYSTEMROOT%\System32\drivers\ndisrd.sys",
+            r"System32\drivers\ndisrd.sys",
+        ] {
+            assert_eq!(
+                SplitTunnelDriver::normalize_service_binary_path(path),
+                expected,
+                "Windows aliases are case insensitive: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_service_paths_use_the_supplied_windows_drive_and_require_a_root() {
+        for root in [r"E:\Windows", r"D:\System Root\Windows"] {
+            let root = Path::new(root);
+            let expected = Some(
+                root.join("System32/drivers/ndisrd.sys")
+                    .to_string_lossy()
+                    .replace('/', "\\")
+                    .to_ascii_lowercase(),
+            );
+            for path in [
+                r"\SystemRoot\System32\drivers\ndisrd.sys",
+                r"%SYSTEMROOT%/System32/drivers/ndisrd.sys",
+                r"System32\drivers\ndisrd.sys",
+            ] {
+                assert_eq!(
+                    SplitTunnelDriver::normalize_service_binary_path_with_root(path, Some(root)),
+                    expected,
+                );
+                assert_eq!(
+                    SplitTunnelDriver::normalize_service_binary_path_with_root(path, None),
+                    None,
+                );
+            }
+        }
+        assert!(
+            SplitTunnelDriver::normalize_service_binary_path_with_root(
+                r"E:\Windows\System32\drivers\ndisrd.sys",
+                None,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn test_game_preset_names() {
+        assert!(!GamePreset::Roblox.process_names().is_empty());
+        assert!(
+            GamePreset::Roblox
+                .process_names()
+                .contains(&"robloxapp.exe")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parses_disabled_winpkfilter_adapters() {
+        assert_eq!(
+            SplitTunnelDriver::parse_disabled_winpkfilter_adapters(
+                "Disabled WinpkFilter binding on adapters: Ethernet, Wi-Fi"
+            ),
+            vec!["Ethernet".to_string(), "Wi-Fi".to_string()]
+        );
+        // "Nothing to do" output yields no adapters.
+        assert!(
+            SplitTunnelDriver::parse_disabled_winpkfilter_adapters(
+                "No enabled WinpkFilter bindings found during uninstall cleanup."
+            )
+            .is_empty()
+        );
+        // Tolerates surrounding log lines and odd spacing around adapter names.
+        assert_eq!(
+            SplitTunnelDriver::parse_disabled_winpkfilter_adapters(
+                "preamble\r\nDisabled WinpkFilter binding on adapters: Ethernet 2 ,  vEthernet (WSL) \r\n"
+            ),
+            vec!["Ethernet 2".to_string(), "vEthernet (WSL)".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_config_creation() {
+        let config = SplitTunnelConfig::new(
+            vec!["robloxplayerbeta.exe".to_string()],
+            12345,
+            Some(AdapterBindingPreference {
+                guid: "{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}".to_string(),
+                source: super::super::parallel_interceptor::BindingPreferenceSource::Manual,
+                network_signature: None,
+            }),
+        );
+        assert!(config.tunnel_apps.contains("robloxplayerbeta.exe"));
+        assert_eq!(
+            config
+                .binding_preference
+                .as_ref()
+                .map(|preference| preference.guid.as_str()),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        );
+    }
+
+    #[test]
+    fn test_driver_state() {
+        let driver = SplitTunnelDriver::new();
+        assert_eq!(*driver.state(), DriverState::NotAvailable);
+    }
+
+    #[test]
+    fn test_binding_cleanup_script_disables_nt_ndisrd() {
+        let script = SplitTunnelDriver::build_winpkfilter_binding_cleanup_script();
+        assert!(script.contains("Disable-NetAdapterBinding"));
+        assert!(script.contains("nt_ndisrd"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn binding_collector_preserves_names_and_errors_without_touching_adapters() {
+        let success = SplitTunnelDriver::collect_binding_cleanup(
+            "Write-Output 'Disabled WinpkFilter binding on adapters: Ethernet, 以太网'",
+        );
+        assert!(success.success, "{}", success.stderr);
+        assert_eq!(
+            SplitTunnelDriver::parse_disabled_winpkfilter_adapters(&success.stdout),
+            vec!["Ethernet", "以太网"]
+        );
+        let failure =
+            SplitTunnelDriver::collect_binding_cleanup("Write-Error 'Sample failure'; exit 7");
+        assert!(!failure.success);
+        assert_eq!(failure.exit_code, Some(7));
+        assert!(failure.stderr.contains("Sample failure"));
+    }
+}

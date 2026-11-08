@@ -1,0 +1,540 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const { boostGetMetrics, boostUpdateConfig, boostSyncEffectiveConfig, boostRestartRoblox, boostGetSystemMemory, boostCleanRam } = vi.hoisted(() => ({
+  boostGetMetrics: vi.fn(),
+  boostUpdateConfig: vi.fn(),
+  boostSyncEffectiveConfig: vi.fn(),
+  boostRestartRoblox: vi.fn(),
+  boostGetSystemMemory: vi.fn(),
+  boostCleanRam: vi.fn(),
+}));
+
+vi.mock("../lib/commands", () => ({
+  boostGetMetrics,
+  boostGetSystemInfo: vi.fn(),
+  boostGetSystemMemory,
+  boostCleanRam,
+  boostUpdateConfig,
+  boostSyncEffectiveConfig,
+  boostRestartRoblox,
+}));
+
+// The settings store owns ordering and publishing. Its tests exercise the real
+// queue; these tests cover Boost warnings, error reporting and metrics.
+vi.mock("./settingsStore", () => ({
+  useSettingsStore: { getState: () => ({
+    applyBoostConfig: boostUpdateConfig,
+    syncBoostConfig: boostSyncEffectiveConfig,
+  }) },
+}));
+
+const { notify } = vi.hoisted(() => ({
+  notify: vi.fn(),
+}));
+
+vi.mock("../lib/notifications", () => ({
+  notify,
+}));
+
+async function loadStore() {
+  vi.resetModules();
+  return (await import("./boostStore")).useBoostStore;
+}
+
+describe("stores/boostStore", () => {
+  beforeEach(() => {
+    boostGetMetrics.mockReset();
+    boostUpdateConfig.mockReset();
+    boostSyncEffectiveConfig.mockReset();
+    boostRestartRoblox.mockReset();
+    boostGetSystemMemory.mockReset();
+    boostCleanRam.mockReset();
+    notify.mockReset();
+  });
+
+  const metrics = { fps: 60, cpu_usage: 10, ram_usage: 100, ram_total: 1000, ping: 20, roblox_running: true, roblox_foreground: true, process_id: 123 };
+
+  it("marks process state ready only after a successful native sample", async () => {
+    const store = await loadStore();
+    expect(store.getState().hasLoadedMetrics).toBe(false);
+    boostGetMetrics.mockRejectedValueOnce(new Error("Sampler unavailable"));
+    expect(await store.getState().fetchMetrics()).toBe(false);
+    expect(store.getState().hasLoadedMetrics).toBe(false);
+    boostGetMetrics.mockResolvedValueOnce(metrics);
+    expect(await store.getState().fetchMetrics()).toBe(true);
+    expect(store.getState().hasLoadedMetrics).toBe(true);
+    expect(store.getState().robloxRunning).toBe(true);
+  });
+
+  it("coalesces overlapping memory reads and permits a fresh read after completion", async () => {
+    let finish!: (value: object) => void;
+    const snapshot = { total_mb: 16000, used_mb: 9000, available_mb: 7000, load_pct: 56, standby_mb: null, modified_mb: null };
+    boostGetSystemMemory.mockReturnValue(new Promise(resolve => { finish = resolve; }));
+    const store = await loadStore();
+    const reads = Array.from({ length: 20 }, () => store.getState().fetchSystemMemory());
+    const requests = boostGetSystemMemory.mock.calls.length;
+    finish(snapshot);
+    await Promise.all(reads);
+    expect(requests).toBe(1);
+    expect(store.getState().systemMem).toEqual(snapshot);
+    await store.getState().fetchSystemMemory();
+    expect(boostGetSystemMemory).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not overwrite cleanup progress with a late memory poll", async () => {
+    let finish!: (value: object) => void;
+    boostGetSystemMemory.mockReturnValue(new Promise(resolve => { finish = resolve; }));
+    const store = await loadStore();
+    const reading = store.getState().fetchSystemMemory();
+    const progress = { stage: "done", total_mb: 16000, used_mb: 8000, available_mb: 8000, load_pct: 50, standby_mb: null, modified_mb: null, trimmed_count: 4, current_process: null, warning: null };
+    store.getState().handleRamCleanProgress(progress);
+    finish({ ...progress, used_mb: 12000 });
+    await reading;
+    expect(store.getState().systemMem?.used_mb).toBe(8000);
+  });
+
+  it("releases failed memory sampling so a later poll can recover", async () => {
+    boostGetSystemMemory.mockRejectedValueOnce(new Error("Sampler unavailable")).mockResolvedValue({ used_mb: 4000 });
+    const store = await loadStore();
+    await store.getState().fetchSystemMemory();
+    await store.getState().fetchSystemMemory();
+    expect(boostGetSystemMemory).toHaveBeenCalledTimes(2);
+    expect(store.getState().systemMem?.used_mb).toBe(4000);
+  });
+
+  it("does not clear the running cleanup when another caller requests cleaning", async () => {
+    let finish!: (value: object) => void;
+    const snapshot = { total_mb: 16000, used_mb: 8000, available_mb: 8000, load_pct: 50, standby_mb: null, modified_mb: null };
+    boostGetSystemMemory.mockResolvedValue(snapshot);
+    boostCleanRam.mockReturnValueOnce(new Promise(resolve => { finish = resolve; })).mockRejectedValue(new Error("Cleanup already running"));
+    const store = await loadStore();
+    const cleaning = store.getState().cleanRam();
+    await vi.waitFor(() => expect(boostCleanRam).toHaveBeenCalledOnce());
+    await store.getState().cleanRam();
+    const stillBusy = store.getState().isCleaningRam;
+    finish({ before: snapshot, after: snapshot, trimmed_count: 0, freed_mb: 0, warnings: [] });
+    await cleaning;
+    expect(stillBusy).toBe(true);
+    expect(boostCleanRam).toHaveBeenCalledOnce();
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes a fresh metrics result from a retained stale sample", async () => {
+    boostGetMetrics.mockResolvedValueOnce(metrics).mockRejectedValueOnce(new Error("sampler failed"));
+    const store = await loadStore();
+    await expect(store.getState().fetchMetrics()).resolves.toBe(true);
+    await expect(store.getState().fetchMetrics()).resolves.toBe(false);
+    expect(store.getState().robloxForeground).toBe(true);
+  });
+
+  it("shares unfinished metrics work across repeated component polls", async () => {
+    let release!: (value: typeof metrics) => void;
+    boostGetMetrics.mockReturnValue(new Promise(resolve => { release = resolve; }));
+    const store = await loadStore();
+    const requests = Array.from({ length: 20 }, () => store.getState().fetchMetrics());
+    const callsWhilePending = boostGetMetrics.mock.calls.length;
+    release(metrics);
+    await Promise.all(requests);
+    expect(callsWhilePending).toBe(1);
+    expect(store.getState().fps).toBe(60);
+    await store.getState().fetchMetrics();
+    expect(boostGetMetrics).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not revive a closed player with a late response from another view", async () => {
+    let oldReply!: (value: typeof metrics) => void;
+    boostGetMetrics.mockReturnValueOnce(new Promise(resolve => { oldReply = resolve; }))
+      .mockResolvedValueOnce({ ...metrics, roblox_running: false, roblox_foreground: false, process_id: null, fps: 0 });
+    const store = await loadStore();
+    const oldRequest = store.getState().fetchMetrics({overlayWantsFps:true});
+    await expect(store.getState().fetchMetrics({overlayWantsFps:false})).resolves.toBe(true);
+    oldReply(metrics);
+    await expect(oldRequest).resolves.toBe(false);
+    expect(store.getState()).toMatchObject({robloxRunning:false,robloxForeground:false,processId:null,fps:0});
+  });
+
+  it("keeps the next game's process and values when an older sample completes last", async () => {
+    let oldReply!: (value: typeof metrics) => void;
+    boostGetMetrics.mockReturnValueOnce(new Promise(resolve => { oldReply = resolve; }))
+      .mockResolvedValueOnce({...metrics,process_id:456,fps:120});
+    const store = await loadStore();
+    const oldRequest = store.getState().fetchMetrics({overlayWantsFps:true});
+    await store.getState().fetchMetrics({overlayWantsFps:false});
+    oldReply(metrics);
+    await oldRequest;
+    expect(store.getState()).toMatchObject({processId:456,fps:120});
+  });
+
+  it("does not merge requests with different overlay settings", async () => {
+    let release!: (value: typeof metrics) => void;
+    boostGetMetrics.mockReturnValue(new Promise(resolve => { release = resolve; }));
+    const store = await loadStore();
+    const requests = [true, false, true, false].map(overlayWantsFps => store.getState().fetchMetrics({ overlayWantsFps }));
+    const callsWhilePending = boostGetMetrics.mock.calls.length;
+    release(metrics);
+    await Promise.all(requests);
+    expect(callsWhilePending).toBe(2);
+    expect(boostGetMetrics).toHaveBeenCalledWith({ overlayWantsFps: true });
+    expect(boostGetMetrics).toHaveBeenCalledWith({ overlayWantsFps: false });
+  });
+
+  it("allows a fresh metrics request after a failed sample", async () => {
+    boostGetMetrics.mockRejectedValueOnce(new Error("sample failed")).mockResolvedValue(metrics);
+    const store = await loadStore();
+    await store.getState().fetchMetrics();
+    await store.getState().fetchMetrics();
+    expect(boostGetMetrics).toHaveBeenCalledTimes(2);
+    expect(store.getState().fps).toBe(60);
+  });
+
+  it("updates config without notifications on success", async () => {
+    boostUpdateConfig.mockResolvedValue({ warnings: [] });
+
+    const useBoostStore = await loadStore();
+    await useBoostStore.getState().updateConfig("{\"profile\":\"Balanced\"}");
+
+    expect(boostUpdateConfig).toHaveBeenCalledTimes(1);
+    expect(boostUpdateConfig).toHaveBeenCalledWith("{\"profile\":\"Balanced\"}");
+    expect(useBoostStore.getState().error).toBeNull();
+    expect(useBoostStore.getState().warning).toBeNull();
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("stores warnings separately from fatal config errors", async () => {
+    boostUpdateConfig.mockResolvedValue({
+      warnings: ["Roblox version folder was not found. Launch Roblox once."],
+      applied_config: { profile: "Balanced" },
+    });
+
+    const useBoostStore = await loadStore();
+    await useBoostStore.getState().updateConfig("{\"profile\":\"Balanced\"}");
+
+    expect(useBoostStore.getState().error).toBeNull();
+    expect(useBoostStore.getState().warning).toContain("Launch Roblox once");
+    expect(notify).toHaveBeenCalledWith(
+      "Boost applied with warnings",
+      "Some optimizations could not be applied.",
+    );
+  });
+
+  it("stores error and notifies when config update fails", async () => {
+    boostUpdateConfig.mockRejectedValue(new Error("boom"));
+
+    const useBoostStore = await loadStore();
+    await expect(
+      useBoostStore.getState().updateConfig("{\"profile\":\"Balanced\"}"),
+    ).rejects.toThrow("boom");
+
+    expect(useBoostStore.getState().error).toBe("boom");
+    expect(useBoostStore.getState().warning).toBeNull();
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith(
+      "Boost config failed",
+      "Could not save optimization profile.",
+    );
+  });
+
+  it("syncs effective config without notifying when persisted toggles were stale", async () => {
+    const applied_config = { profile: "Balanced", network_settings: { disable_nagle: false } };
+    boostSyncEffectiveConfig.mockResolvedValue({
+      warnings: ["Network booster: Disable Nagle's algorithm was not active on Windows"],
+      applied_config,
+    });
+
+    const useBoostStore = await loadStore();
+    await expect(useBoostStore.getState().syncEffectiveConfig()).resolves.toBe(applied_config);
+
+    expect(useBoostStore.getState().error).toBeNull();
+    expect(useBoostStore.getState().warning).toContain("Disable Nagle");
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("cleans RAM and updates state without notifications on success", async () => {
+    boostGetSystemMemory.mockResolvedValue({
+      total_mb: 16000,
+      used_mb: 10000,
+      available_mb: 6000,
+      load_pct: 63,
+      standby_mb: null,
+      modified_mb: null,
+    });
+
+    const resp = {
+      before: { total_mb: 16000, used_mb: 10000, available_mb: 6000, load_pct: 63, standby_mb: null, modified_mb: null },
+      after: { total_mb: 16000, used_mb: 9000, available_mb: 7000, load_pct: 56, standby_mb: null, modified_mb: null },
+      trimmed_count: 8,
+      standby_purge: { attempted: true, success: true, skipped_reason: null },
+      modified_flush: { attempted: true, success: true, skipped_reason: null },
+      freed_mb: 1000,
+      standby_freed_mb: null,
+      modified_freed_mb: null,
+      duration_ms: 900,
+      warnings: [],
+    };
+
+    let resolveClean: (value: typeof resp) => void;
+    boostCleanRam.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveClean = resolve;
+        }),
+    );
+
+    const useBoostStore = await loadStore();
+    const promise = useBoostStore.getState().cleanRam();
+
+    expect(useBoostStore.getState().isCleaningRam).toBe(true);
+    // Allow the click-time baseline snapshot to resolve before the cleaner starts.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(boostCleanRam).toHaveBeenCalledTimes(1);
+    resolveClean!(resp);
+    await promise;
+
+    expect(boostCleanRam).toHaveBeenCalledTimes(1);
+    expect(boostGetSystemMemory).toHaveBeenCalledTimes(1);
+    expect(useBoostStore.getState().isCleaningRam).toBe(false);
+    expect(useBoostStore.getState().ramCleanResult).toEqual(resp);
+    expect(useBoostStore.getState().systemMem).toEqual(resp.after);
+    expect(useBoostStore.getState().ramCleanStartSnapshot).toEqual({
+      total_mb: 16000,
+      used_mb: 10000,
+      available_mb: 6000,
+      load_pct: 63,
+      standby_mb: null,
+      modified_mb: null,
+    });
+    expect(useBoostStore.getState().ramCleanDoneSnapshot).toEqual(resp.after);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("stores error and notifies when RAM clean fails", async () => {
+    boostGetSystemMemory.mockResolvedValue({
+      total_mb: 16000,
+      used_mb: 10000,
+      available_mb: 6000,
+      load_pct: 63,
+      standby_mb: null,
+      modified_mb: null,
+    });
+    boostCleanRam.mockRejectedValue(new Error("boom"));
+
+    const useBoostStore = await loadStore();
+    await useBoostStore.getState().cleanRam();
+
+    expect(useBoostStore.getState().error).toBe("boom");
+    expect(useBoostStore.getState().warning).toBeNull();
+    expect(useBoostStore.getState().isCleaningRam).toBe(false);
+    expect(useBoostStore.getState().ramCleanStartSnapshot).toBeNull();
+    expect(useBoostStore.getState().ramCleanDoneSnapshot).toBeNull();
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith(
+      "RAM cleaner failed",
+      "Could not clean memory.",
+    );
+  });
+
+  it("captures RAM cleaner start and done snapshots from progress events", async () => {
+    const useBoostStore = await loadStore();
+
+    useBoostStore.getState().handleRamCleanProgress({
+      stage: "start",
+      total_mb: 16000,
+      used_mb: 10000,
+      available_mb: 6000,
+      load_pct: 63,
+      standby_mb: 2048,
+      modified_mb: 512,
+      trimmed_count: 0,
+      current_process: null,
+      warning: null,
+    });
+
+    expect(useBoostStore.getState().ramCleanStartSnapshot).toEqual({
+      total_mb: 16000,
+      used_mb: 10000,
+      available_mb: 6000,
+      load_pct: 63,
+      standby_mb: 2048,
+      modified_mb: 512,
+    });
+
+    useBoostStore.getState().handleRamCleanProgress({
+      stage: "trimming",
+      total_mb: 16000,
+      used_mb: 9500,
+      available_mb: 6500,
+      load_pct: 59,
+      standby_mb: 2048,
+      modified_mb: 512,
+      trimmed_count: 1,
+      current_process: "chrome.exe",
+      warning: null,
+    });
+
+    expect(useBoostStore.getState().ramCleanStartSnapshot).toEqual({
+      total_mb: 16000,
+      used_mb: 10000,
+      available_mb: 6000,
+      load_pct: 63,
+      standby_mb: 2048,
+      modified_mb: 512,
+    });
+
+    useBoostStore.getState().handleRamCleanProgress({
+      stage: "done",
+      total_mb: 16000,
+      used_mb: 9000,
+      available_mb: 7000,
+      load_pct: 56,
+      standby_mb: 256,
+      modified_mb: 64,
+      trimmed_count: 1,
+      current_process: null,
+      warning: null,
+    });
+
+    expect(useBoostStore.getState().ramCleanDoneSnapshot).toEqual({
+      total_mb: 16000,
+      used_mb: 9000,
+      available_mb: 7000,
+      load_pct: 56,
+      standby_mb: 256,
+      modified_mb: 64,
+    });
+  });
+
+  it("updates system memory snapshot from ram-clean-progress events", async () => {
+    const useBoostStore = await loadStore();
+
+    useBoostStore.getState().handleRamCleanProgress({
+      stage: "trimming",
+      total_mb: 16000,
+      used_mb: 11000,
+      available_mb: 5000,
+      load_pct: 69,
+      standby_mb: null,
+      modified_mb: null,
+      trimmed_count: 3,
+      current_process: "chrome.exe",
+      warning: null,
+    });
+
+    expect(useBoostStore.getState().systemMem).toEqual({
+      total_mb: 16000,
+      used_mb: 11000,
+      available_mb: 5000,
+      load_pct: 69,
+      standby_mb: null,
+      modified_mb: null,
+    });
+    expect(useBoostStore.getState().ramCleanStage).toBe("trimming");
+    expect(useBoostStore.getState().ramCleanTrimmedCount).toBe(3);
+    expect(useBoostStore.getState().ramCleanCurrentProcess).toBe("chrome.exe");
+  });
+
+  it("updateConfig resolves before restartRoblox can proceed (sequencing contract)", async () => {
+    // Verifies the async contract used by BoostTab.restartAndApply:
+    // updateConfig must fully resolve before restartRoblox is called.
+    const callOrder: string[] = [];
+
+    boostUpdateConfig.mockImplementation(
+      () =>
+        new Promise((resolve) =>
+          setTimeout(() => {
+            callOrder.push("updateConfig:resolved");
+            resolve({ warnings: [] });
+          }, 50),
+        ),
+    );
+    boostRestartRoblox.mockImplementation(async () => {
+      callOrder.push("restartRoblox:called");
+    });
+
+    const useBoostStore = await loadStore();
+    const store = useBoostStore.getState();
+
+    // Simulate the BoostTab.restartAndApply sequencing: await config, then restart
+    await store.updateConfig('{"test":true}');
+    await store.restartRoblox();
+
+    expect(callOrder).toEqual([
+      "updateConfig:resolved",
+      "restartRoblox:called",
+    ]);
+  });
+
+  it("keeps restart failures observable to callers", async () => {
+    boostRestartRoblox.mockRejectedValue(new Error("Roblox is still running"));
+
+    const useBoostStore = await loadStore();
+
+    await expect(useBoostStore.getState().restartRoblox()).rejects.toThrow(
+      "Roblox is still running",
+    );
+    expect(useBoostStore.getState().error).toContain("Roblox is still running");
+    expect(notify).toHaveBeenCalledWith(
+      "Restart failed",
+      "Could not restart Roblox.",
+    );
+  });
+
+  it("keeps structured restart errors readable while preserving the rejection", async () => {
+    const error = { message: "Close Roblox and try again" };
+    boostRestartRoblox.mockRejectedValue(error);
+    const store = await loadStore();
+    await expect(store.getState().restartRoblox()).rejects.toBe(error);
+    expect(store.getState().error).toBe(error.message);
+  });
+
+  it("progresses through flushing_modified stage", async () => {
+    const useBoostStore = await loadStore();
+
+    useBoostStore.getState().handleRamCleanProgress({
+      stage: "start",
+      total_mb: 16000,
+      used_mb: 10000,
+      available_mb: 6000,
+      load_pct: 63,
+      standby_mb: 2048,
+      modified_mb: 512,
+      trimmed_count: 0,
+      current_process: null,
+      warning: null,
+    });
+
+    useBoostStore.getState().handleRamCleanProgress({
+      stage: "flushing_modified",
+      total_mb: 16000,
+      used_mb: 9800,
+      available_mb: 6200,
+      load_pct: 61,
+      standby_mb: 2048,
+      modified_mb: 512,
+      trimmed_count: 5,
+      current_process: null,
+      warning: null,
+    });
+
+    expect(useBoostStore.getState().ramCleanStage).toBe("flushing_modified");
+    expect(useBoostStore.getState().systemMem?.standby_mb).toBe(2048);
+    expect(useBoostStore.getState().systemMem?.modified_mb).toBe(512);
+
+    useBoostStore.getState().handleRamCleanProgress({
+      stage: "standby_purge",
+      total_mb: 16000,
+      used_mb: 9800,
+      available_mb: 6200,
+      load_pct: 61,
+      standby_mb: 2560,
+      modified_mb: 64,
+      trimmed_count: 5,
+      current_process: null,
+      warning: null,
+    });
+
+    expect(useBoostStore.getState().ramCleanStage).toBe("standby_purge");
+    // Modified pages should have been flushed to standby
+    expect(useBoostStore.getState().systemMem?.modified_mb).toBe(64);
+    expect(useBoostStore.getState().systemMem?.standby_mb).toBe(2560);
+  });
+});

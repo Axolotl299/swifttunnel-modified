@@ -1,0 +1,1154 @@
+mod autostart;
+mod commands;
+mod events;
+mod game_shortcut;
+mod harness;
+mod logging;
+mod runtime_assets;
+mod session_metadata;
+mod single_client;
+mod startup_config;
+mod startup_failure;
+mod state;
+mod tray;
+mod window_restore;
+
+use std::sync::Arc;
+
+use log::{info, warn};
+use state::AppState;
+use swifttunnel_core::auth::types::{AuthError, AuthState};
+#[cfg(windows)]
+use tauri::{Emitter, Manager};
+use window_restore::restore_main_window;
+
+const APP_ICON: tauri::image::Image<'static> = tauri::include_image!("./icons/icon.png");
+
+#[cfg(windows)]
+fn sync_runtime_assets(app: &tauri::AppHandle) {
+    let resource_dir = match app.path().resource_dir() {
+        Ok(path) => path,
+        Err(e) => {
+            log::warn!("Could not resolve resource directory: {}", e);
+            return;
+        }
+    };
+
+    let exe_dir = match std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|p| p.to_path_buf()))
+    {
+        Some(path) => path,
+        None => {
+            log::warn!("Could not resolve executable directory");
+            return;
+        }
+    };
+
+    let package = swifttunnel_core::vpn::winpkfilter::native_msi_package();
+    let source = [
+        resource_dir.join("drivers").join(package.msi_name),
+        resource_dir.join(package.msi_name),
+    ]
+    .into_iter()
+    .find(|path| path.is_file());
+    let Some(source) = source else {
+        log::warn!(
+            "Bundled driver {} not found; runtime fallback download will be used",
+            package.msi_name
+        );
+        return;
+    };
+    let destination = exe_dir.join("drivers").join(package.msi_name);
+    match runtime_assets::stage_driver(&source, &destination, package) {
+        Ok(true) => info!(
+            "Staged runtime asset {} -> {}",
+            source.display(),
+            destination.display()
+        ),
+        Ok(false) => {}
+        Err(error) => log::warn!("Could not stage bundled driver: {error}"),
+    }
+}
+
+#[cfg(not(windows))]
+fn sync_runtime_assets(_app: &tauri::AppHandle) {}
+
+fn recover_stale_network_state() {
+    // Clean up any stale hosts-file entries from old proxy versions.
+    swifttunnel_core::roblox_proxy::hosts::recover_stale();
+    // Remove old WFP process-block filters from builds before dynamic WFP sessions.
+    swifttunnel_core::vpn::wfp_block::cleanup_stale();
+    // Reset any adapter left in WinpkFilter tunnel mode by a prior forced
+    // exit. Marker-aware: escalates to verified resets with bounded retries
+    // when a previous session died mid-tunnel (the "no internet after
+    // SwiftTunnel" incident class).
+    swifttunnel_core::vpn::recover_tunnel_mode_on_startup();
+    // Recover adapter settings if the app crashed while connected.
+    swifttunnel_core::vpn::recover_tso_on_startup();
+    swifttunnel_core::vpn::recover_ipv6_on_startup();
+    // Heavier remediation, run ONLY when there's real evidence a previous session
+    // left state behind. The check below is all cheap peeks (three marker file
+    // reads + one device-open probe) — no PowerShell, no netsh — so a healthy PC
+    // short-circuits here and the UI reveals immediately. This is what lets the
+    // self-heal "fix everything the Repair tab does" without lagging normal users:
+    // the expensive steps only touch machines that are actually broken.
+    #[cfg(windows)]
+    {
+        use swifttunnel_core::vpn::{
+            SplitTunnelDriver, ipv6_recovery, tso_recovery, tunnel_mode_recovery,
+        };
+
+        // A clean shutdown leaves no markers; their presence means a session died
+        // mid-tunnel. A driver that's installed but won't open is the half-removed
+        // state that blackholes traffic ("No internet, Secured").
+        let marker_present = tunnel_mode_recovery::read_tunnel_mode_marker().is_some()
+            || ipv6_recovery::read_ipv6_marker().is_some()
+            || tso_recovery::read_tso_marker().is_some();
+        let driver_broken =
+            !SplitTunnelDriver::is_available() && SplitTunnelDriver::driver_install_evidence();
+
+        // Always remove an enabled WinpkFilter adapter binding while SwiftTunnel
+        // is disconnected. Most PCs tolerate the binding sitting enabled, but on
+        // some network stacks it survives reboot/uninstall as "internet only
+        // works after I reconnect SwiftTunnel". This is the same no-op-safe step
+        // used by Repair -> Internet Recovery; connect re-enables it only on the
+        // selected adapter when the tunnel actually starts.
+        match SplitTunnelDriver::disable_leftover_winpkfilter_bindings() {
+            Ok(disabled) if !disabled.is_empty() => info!(
+                "Startup recovery: disabled leftover WinpkFilter binding on adapter(s): {}",
+                disabled.join(", ")
+            ),
+            Ok(_) => {}
+            Err(e) => warn!("Startup recovery: WinpkFilter binding cleanup failed: {e}"),
+        }
+
+        if marker_present || driver_broken {
+            info!(
+                "Startup recovery: leftover network state detected (markers={marker_present}, driver_broken={driver_broken}); running full self-heal"
+            );
+
+            // If the driver is installed but STILL can't be opened after the unbind,
+            // the NDIS state is wedged. Do not restart or reinstall the kernel driver
+            // automatically here; BSOD reports mean this path must fail closed and
+            // let the UI ask for a clean Windows restart instead.
+            let still_broken =
+                !SplitTunnelDriver::is_available() && SplitTunnelDriver::driver_install_evidence();
+            if still_broken {
+                warn!(
+                    "Startup recovery: driver still wedged after unbind; automatic NDISRD service restart skipped"
+                );
+            }
+        }
+    }
+}
+
+fn disconnect_vpn_on_exit(app: &tauri::AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+
+    let conn_state = state.vpn_state_handle.borrow().clone();
+    let has_split_tunnel_handle = state.split_tunnel_handle.read().is_some();
+    if matches!(
+        conn_state,
+        swifttunnel_core::vpn::ConnectionState::Disconnected
+    ) && !has_split_tunnel_handle
+    {
+        return;
+    }
+
+    info!("Disconnecting active VPN session before app exit");
+    let runtime = state.runtime.clone();
+    if let Err(e) = runtime.block_on(commands::vpn::disconnect_and_persist(&state)) {
+        warn!("Failed to disconnect VPN during app exit: {}", e);
+    }
+}
+
+#[cfg(windows)]
+fn reapply_saved_network_boosts(state: &AppState) {
+    match startup_config::reapply_network(
+        &state.network_booster,
+        &state.settings,
+        |booster, config| booster.reconcile_optimizations_checked(config),
+        swifttunnel_core::settings::save_settings,
+    ) {
+        Ok(warnings) if !warnings.is_empty() => warn!(
+            "Saved network boosts reapplied with warnings: {}",
+            warnings.join("; ")
+        ),
+        Ok(_) => {}
+        Err(error) => warn!("Failed to persist reapplied network boost state: {error}"),
+    }
+}
+
+#[cfg(not(windows))]
+fn reapply_saved_network_boosts(_state: &AppState) {}
+
+#[cfg(windows)]
+fn reapply_saved_roblox_fflags(state: &AppState) {
+    let result = reapply_startup_flags(
+        &state.roblox_optimizer,
+        &state.settings,
+        || {
+            swifttunnel_core::roblox_game_profile::pending()
+                || swifttunnel_core::roblox_launch_flags::pending()
+        },
+        |optimizer, config| {
+            info!("Reapplying saved Roblox Ultraboost state on startup");
+            optimizer
+                .reapply_saved_client_fflags(config)
+                .map_err(|error| error.to_string())
+        },
+    );
+    if let Err(error) = result {
+        warn!("Failed to reapply saved Roblox Ultraboost state on startup: {error}");
+    }
+}
+
+#[cfg(windows)]
+fn reapply_startup_flags<T>(
+    optimizer: &parking_lot::Mutex<T>,
+    settings: &parking_lot::Mutex<swifttunnel_core::settings::AppSettings>,
+    pending: impl FnOnce() -> bool,
+    apply: impl FnOnce(&T, &swifttunnel_core::structs::RobloxSettingsConfig) -> Result<(), String>,
+) -> Result<(), String> {
+    let optimizer = optimizer.lock();
+    // Waiting for an editor or native launch can invalidate both the pending
+    // record check and the saved config. Read them only after admission.
+    if pending() {
+        return Ok(());
+    }
+    let config = settings.lock().config.roblox_settings.clone();
+    if !config.ultraboost {
+        return Ok(());
+    }
+    apply(&optimizer, &config)
+}
+
+#[cfg(all(test, windows))]
+mod startup_flag_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+
+    #[test]
+    fn queued_startup_reapply_observes_new_launch_records_and_disabled_flags() {
+        for new_profile in [true, false] {
+            let optimizer = Arc::new(parking_lot::Mutex::new(()));
+            let held = optimizer.lock();
+            let settings = Arc::new(parking_lot::Mutex::new(
+                swifttunnel_core::settings::AppSettings::default(),
+            ));
+            settings.lock().config.roblox_settings.ultraboost = true;
+            let pending = Arc::new(AtomicBool::new(false));
+            let worker_optimizer = optimizer.clone();
+            let worker_settings = settings.clone();
+            let worker_pending = pending.clone();
+            let (started, ready) = mpsc::channel();
+            let task = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                reapply_startup_flags(
+                    &worker_optimizer,
+                    &worker_settings,
+                    || worker_pending.load(Ordering::SeqCst),
+                    |_, _| panic!("queued startup work must not replace the new launch or setting"),
+                )
+            });
+            ready
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            if new_profile {
+                pending.store(true, Ordering::SeqCst);
+            } else {
+                settings.lock().config.roblox_settings.ultraboost = false;
+            }
+            drop(held);
+            task.join().unwrap().unwrap();
+        }
+        let settings = parking_lot::Mutex::new(swifttunnel_core::settings::AppSettings::default());
+        settings.lock().config.roblox_settings.ultraboost = true;
+        let called = AtomicBool::new(false);
+        reapply_startup_flags(
+            &parking_lot::Mutex::new(()),
+            &settings,
+            || false,
+            |_, config| {
+                assert!(config.ultraboost);
+                called.store(true, Ordering::SeqCst);
+                Err("fixture flag error".into())
+            },
+        )
+        .unwrap_err();
+        assert!(called.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(not(windows))]
+fn reapply_saved_roblox_fflags(_state: &AppState) {}
+
+/// Layer SwiftTunnel-specific WebView2 flags on top of wry's defaults via
+/// the official `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` env var. WebView2
+/// merges this with its built-in flag set instead of replacing them, so
+/// we keep wry's `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`
+/// while disabling the additional Edge-only background features below.
+///
+/// We touch the env var only if the user hasn't already set one — an
+/// advanced user or distro packager may have customized it.
+///
+/// Disabled features and why each is safe for a form-only Tauri shell:
+/// - `Translate`, `AutofillServerCommunication`, `OptimizationHints`,
+///   `InterestFeedContentSuggestions`: silent network calls Edge makes by
+///   default; useless for a private desktop UI with our own CSP allowlist.
+/// - `CalculateNativeWinOcclusion`: removes a COM-event hook that contends
+///   on a global Windows lock. We want the webview live in the tray case
+///   anyway, so occlusion throttling is not a feature we benefit from.
+/// - `HardwareMediaKeyHandling`, `MediaSessionService`: stops a global
+///   media-key hook for an app that plays no audio.
+/// - `msEdgeBackgroundProcessing`: reduces idle Edge maintenance work.
+#[cfg(windows)]
+fn apply_webview2_resource_tuning() {
+    const ENV: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
+    if std::env::var_os(ENV).is_some() {
+        return;
+    }
+
+    const FLAGS: &str = "--disable-features=Translate,AutofillServerCommunication,\
+OptimizationHints,InterestFeedContentSuggestions,CalculateNativeWinOcclusion,\
+HardwareMediaKeyHandling,MediaSessionService,msEdgeBackgroundProcessing";
+
+    // Safety: we set the env var before any thread that might read it
+    // exists. `tauri::Builder` is constructed after this call and is the
+    // first consumer of `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`.
+    unsafe { std::env::set_var(ENV, FLAGS) };
+    info!("Applied WebView2 resource-tuning flags: {}", FLAGS);
+}
+
+// WebView2 is Windows-only; nothing to tune on other platforms.
+#[cfg(not(windows))]
+fn apply_webview2_resource_tuning() {}
+
+/// Tail the Roblox log for game-server joins and update the library for
+/// the frontend. The watcher (see `swifttunnel_core::roblox_watcher`) handles
+/// new sessions by switching to the newest log file, so it fires whether Roblox
+/// was already running or launched fresh.
+/// Put the user's launch window size back after Roblox closes.
+///
+/// Roblox writes its own window geometry into GlobalBasicSettings when it
+/// exits, overwriting the size configured in the Boost tab. That is why the
+/// "Window resolution" option looks like it does nothing: it is applied, then
+/// clobbered, so the next launch uses Roblox's number instead.
+///
+/// Restoring it on the way out rather than on the way in is deliberate. By the
+/// time Roblox is running it has already read the file, so writing then would
+/// only affect the launch after next.
+///
+/// Only runs on the falling edge, and only rewrites the window keys, so it is
+/// silent for anyone who never touched the setting.
+/// Put the FFlags back after Roblox updates itself.
+///
+/// A Roblox update arrives as a brand new `version-<hash>` folder, and FFlags
+/// live inside the version folder, so an update throws them away. The frame cap
+/// and graphics level are unaffected: those live in GlobalBasicSettings, which
+/// sits above the version folders.
+///
+/// Recovery used to happen only in `reapply_saved_roblox_fflags` at app
+/// startup, and only when Ultraboost was on. Somebody who turned Ultraboost on
+/// and then launched Roblox directly for a few weeks lost their flags at the
+/// first update, silently, and only got them back if they happened to open
+/// SwiftTunnel before playing again. This is the "it worked and then stopped"
+/// shape of report.
+///
+/// This is what a bootstrapper's own launcher buys, without taking over the
+/// `roblox-player:` protocol handler to get it. Intercepting launches would be
+/// more thorough and can also stop Roblox opening at all when it goes wrong,
+/// which is a far worse failure than stale flags.
+///
+/// Polls, because Roblox writes the folder itself and there is nothing to
+/// subscribe to. A minute is far below how often anyone updates, and the check
+/// is a directory listing.
+fn spawn_roblox_version_watcher(app: tauri::AppHandle) {
+    use swifttunnel_core::roblox_optimizer::RobloxOptimizer;
+
+    let _ = std::thread::Builder::new()
+        .name("roblox-version-watcher".into())
+        .spawn(move || {
+            let mut last_seen = RobloxOptimizer::install_fingerprint();
+
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+
+                let Some(state) = app.try_state::<AppState>() else {
+                    continue;
+                };
+                // Without saved flags there is nothing to restore. Avoid
+                // enumerating Roblox installs every minute while flags are off.
+                let requested = {
+                    let settings = state.settings.lock();
+                    let config = &settings.config.roblox_settings;
+                    config.ultraboost || config.custom_fflags_enabled
+                };
+                if !requested {
+                    continue;
+                }
+                let current = RobloxOptimizer::install_fingerprint();
+                if current == last_seen {
+                    continue;
+                }
+                // Launch/reset/flag work uses this lock. Check temporary state
+                // and read the saved config only after any earlier apply finishes.
+                let optimizer = state.roblox_optimizer.lock();
+                if swifttunnel_core::roblox_game_profile::pending()
+                    || swifttunnel_core::roblox_launch_flags::pending()
+                {
+                    continue;
+                }
+                let config = {
+                    let settings = state.settings.lock();
+                    settings.config.roblox_settings.clone()
+                };
+
+                // Nothing of ours to restore. Custom flags count as well as
+                // Ultraboost: the startup path checks only Ultraboost, so a
+                // custom-flag user was never recovered at all.
+                if !config.ultraboost && !config.custom_fflags_enabled {
+                    last_seen = current;
+                    continue;
+                }
+
+                info!("Roblox install changed; reapplying saved FFlags");
+                match optimizer.reapply_saved_client_fflags(&config) {
+                    Ok(()) => last_seen = current,
+                    Err(e) => {
+                        // A file may still be locked while Roblox updates. Retry
+                        // on the next minute instead of forgetting this version.
+                        warn!("Could not reapply FFlags after a Roblox update: {e}");
+                    }
+                }
+            }
+        });
+}
+
+fn spawn_roblox_window_size_watcher(app: tauri::AppHandle) {
+    use swifttunnel_core::roblox_optimizer::RobloxOptimizer;
+
+    let _ = std::thread::Builder::new()
+        .name("roblox-window-size-watcher".into())
+        .spawn(move || {
+            let mut was_running = false;
+            let mut retry_after: Option<std::time::Instant> = None;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(2000));
+
+                let Some(state) = app.try_state::<AppState>() else {
+                    continue;
+                };
+
+                // Share ordinary discovery with metrics and launch tracking.
+                // No settings lock or separate full snapshot for an idle tick.
+                let running = state.performance_monitor.lock().poll_roblox_pid().is_some();
+                if running {
+                    retry_after = None;
+                }
+
+                if was_running && !running {
+                    if retry_after.is_some_and(|at| std::time::Instant::now() < at) {
+                        continue;
+                    }
+                    let ro = state.roblox_optimizer.lock();
+                    // Cached presence is sufficient for polling, never for a
+                    // file write. The native check also fails closed on errors.
+                    if RobloxOptimizer::player_is_running() {
+                        continue;
+                    }
+                    if swifttunnel_core::roblox_game_profile::pending()
+                        || swifttunnel_core::roblox_launch_flags::pending()
+                    {
+                        // The join watcher restores its temporary profile first.
+                        // Keep the exit pending until that recovery has completed.
+                        continue;
+                    }
+                    let config = {
+                        let s = state.settings.lock();
+                        s.config.roblox_settings.clone()
+                    };
+                    if let Err(e) = ro.reapply_window_size(&config) {
+                        log::warn!("Could not restore Roblox window size after exit: {e}");
+                        // Locked files and a temporarily unavailable disk must
+                        // not permanently consume this exit transition.
+                        retry_after =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+                        continue;
+                    }
+                }
+
+                was_running = running;
+            }
+        });
+}
+
+fn spawn_roblox_game_join_watcher(app: tauri::AppHandle) {
+    use swifttunnel_core::roblox_watcher::{RobloxEvent, RobloxWatcher};
+    let _ = std::thread::Builder::new()
+        .name("roblox-game-join-watcher".into())
+        .spawn(move || {
+            let mut watcher: Option<RobloxWatcher> = None;
+            let mut metadata_task = session_metadata::SessionMetadataTask::default();
+            loop {
+                let mut pending_metadata = None;
+                if watcher.is_none() {
+                    // `None` until the Roblox logs dir exists; cheap to retry.
+                    watcher = RobloxWatcher::new();
+                }
+                if let Some(ref w) = watcher {
+                    for event in w.poll() {
+                        match event {
+                            RobloxEvent::PlayerOpened => {
+                                let state = app.state::<AppState>();
+                                if state.games.lock().player_opened() {
+                                    let _ = app.emit(commands::games::LIBRARY_CHANGED, ());
+                                }
+                            }
+                            RobloxEvent::GameLeft { job_id } => {
+                                let state = app.state::<AppState>();
+                                let mut games = state.games.lock();
+                                if games.record_leave(job_id.as_deref()) {
+                                    metadata_task.cancel();
+                                    pending_metadata = None;
+                                    if let Some(job) = job_id.as_deref() {
+                                        swifttunnel_core::vpn::game_destination::clear_for_session(job);
+                                    }
+                                    let _ = app.emit(commands::games::LIBRARY_CHANGED, ());
+                                } else if games.current.is_none() && games.launch_player_seen
+                                    && !state.performance_monitor.lock().is_roblox_running()
+                                    && !swifttunnel_core::roblox_native_launch::updater_running() {
+                                    games.left_confirmed = true;
+                                    games.cancel_window_placement();
+                                    games.clear_launch();
+                                    games.warning = None;
+                                    let _ = app.emit(commands::games::LIBRARY_CHANGED, ());
+                                }
+                            }
+                            RobloxEvent::GameServerDetected { ip } => {
+                                if !swifttunnel_core::geolocation::is_roblox_game_server_ip(ip) {
+                                    log::info!("Roblox log destination outside the known game ranges: {ip}; route detection has not verified this destination");
+                                }
+                            }
+                            RobloxEvent::GameJoined { ip, place_id, job_id, client, fresh_join } => {
+                                let state = app.state::<AppState>();
+                                if !state.performance_monitor.lock().is_roblox_running() { continue; }
+                                // Publish the destination and session under one
+                                // lock so older cleanup cannot split this join.
+                                let mut games = state.games.lock();
+                                let previous = swifttunnel_core::vpn::game_destination::details(ip)
+                                    .filter(|game| game.job_id == job_id);
+                                swifttunnel_core::vpn::game_destination::register(swifttunnel_core::vpn::game_destination::ObservedGame {
+                                    ip, job_id: job_id.clone(), location: previous.as_ref().and_then(|g| g.location.clone()),
+                                    region: previous.as_ref().and_then(|g| g.region.clone()), prelaunch: previous.is_some_and(|g| g.prelaunch),
+                                });
+                                games.record_join(commands::games::CurrentGame {
+                                    ip: ip.to_string(), place_id: place_id.clone(), job_id: job_id.clone(), client, fresh_join,
+                                    observed_at: chrono::Utc::now().timestamp_millis().max(0) as u64,
+                                    location: None, location_source: None,
+                                });
+                                games.clear_launch();
+                                games.left_confirmed = false;
+                                drop(games);
+                                let _ = app.emit(commands::games::LIBRARY_CHANGED, ());
+                                pending_metadata = Some((ip, place_id, job_id, client));
+                            }
+                        }
+                    }
+                }
+                let state = app.state::<AppState>();
+                if let Some((ip, place_id, job_id, client)) = pending_metadata {
+                    // One poll can contain several old joins and leaves. Only
+                    // resolve the session still current at the end of the batch.
+                    let name_app = app.clone();
+                    let location_app = app.clone();
+                    let name_place = place_id.clone();
+                    metadata_task.replace(state.runtime.handle(), async move {
+                        let state = name_app.state::<AppState>();
+                        if commands::games::refresh_name(&state, &name_place, client).await == Ok(true) {
+                            let _ = name_app.emit(commands::games::LIBRARY_CHANGED, ());
+                        }
+                    }, async move {
+                        let state = location_app.state::<AppState>();
+                        let is_current = || state.games.lock().current.as_ref().is_some_and(|g| g.job_id == job_id && g.ip == ip.to_string());
+                        if !is_current() { return; }
+                        if let Some(center) = swifttunnel_core::roblox_directory::resolve_session(&place_id, &job_id, ip).await {
+                            if commands::game_launch::update_session_location(&state, &job_id, ip, center.city.clone(), "rovalra", commands::game_launch::native_region(&center)) {
+                                let _ = location_app.emit(commands::games::LIBRARY_CHANGED, ());
+                            }
+                        } else if is_current()
+                            && let swifttunnel_core::geolocation::GameServerRegionLookup::Resolved(region, location) = swifttunnel_core::geolocation::lookup_game_server_region(ip).await
+                            && commands::game_launch::update_session_location(&state, &job_id, ip, location, "ip_location", Some(region)) {
+                            let _ = location_app.emit(commands::games::LIBRARY_CHANGED, ());
+                        }
+                    });
+                }
+                let has_game = state.games.lock().current.is_some();
+                if !has_game { metadata_task.cancel(); }
+                let check_process = { let games = state.games.lock(); has_game || games.launch_started.is_some() || games.native_launch_generation.is_some() || (swifttunnel_core::roblox_game_profile::pending() || swifttunnel_core::roblox_launch_flags::pending()) };
+                let running = check_process && state.performance_monitor.lock().poll_roblox_pid().is_some();
+                let updating = !running && state.games.lock().launch_started.is_some_and(|at|at.elapsed()<std::time::Duration::from_secs(600)) && swifttunnel_core::roblox_native_launch::updater_running();
+                if running { swifttunnel_core::vpn::game_destination::refresh(); }
+                let gone_settled={let mut games=state.games.lock();if !running && has_game {games.process_gone_since.get_or_insert(std::time::Instant::now());}else{games.process_gone_since=None;}games.process_gone_since.is_some_and(|at|at.elapsed()>=std::time::Duration::from_secs(3))};
+                if has_game && !running && gone_settled {
+                    metadata_task.cancel();
+                    let mut games=state.games.lock();
+                    games.cancel_window_placement();
+                    let previous=games.current.take();
+                    let unexpected=!games.left_confirmed;
+                    games.recovery_shown.retain(|at|at.elapsed()<std::time::Duration::from_secs(600));
+                    if unexpected && games.recovery_shown.len()<3 && games.recovery_shown.last().is_none_or(|at|at.elapsed()>std::time::Duration::from_secs(30))
+                        && swifttunnel_core::roblox_launcher::LauncherConfig::load().is_ok_and(|c|c.offer_recovery) {
+                        games.recovery=previous;games.recovery_shown.push(std::time::Instant::now());
+                    }
+                    let _ = app.emit(commands::games::LIBRARY_CHANGED, ());
+                }
+                let traffic = state.vpn_connection.try_lock().ok().and_then(|vpn| vpn.auto_router().cloned()).is_some_and(|router| router.has_recent_game_traffic());
+                let mut games = state.games.lock();
+                if traffic { games.game_traffic_seen = true; }
+                if games.track_launch(std::time::Instant::now(), running || traffic, updating) {
+                    let _ = app.emit(commands::games::LIBRARY_CHANGED, ());
+                }
+                if !running && !updating && games.launch_started.is_none() && games.status.take().is_some() {let _=app.emit(commands::games::LIBRARY_CHANGED,());}
+                let idle = games.current.is_none() && games.launch_started.is_none() && games.native_launch_generation.is_none() && !traffic
+                    && (!running || games.left_confirmed);
+                if idle { games.idle_since.get_or_insert(std::time::Instant::now()); } else { games.idle_since = None; }
+                let settled = games.idle_since.is_some_and(|at| at.elapsed() >= std::time::Duration::from_secs(5));
+                let needs_cleanup = swifttunnel_core::roblox_game_profile::pending() || swifttunnel_core::roblox_launch_flags::pending();
+                if idle && settled && needs_cleanup && !games.cleanup_scheduled && games.last_cleanup.is_none_or(|at| at.elapsed() > std::time::Duration::from_secs(10)) {
+                    games.cleanup_scheduled = true;
+                    games.last_cleanup = Some(std::time::Instant::now());
+                    let cleanup_app = app.clone();
+                    state.runtime.spawn(async move {
+                        let state = cleanup_app.state::<AppState>();
+                        commands::game_launch::restore_game_profile(&state).await;
+                        // A ban may have deferred global Roblox restoration
+                        // while this journal still owned the temporary files.
+                        // The account check is inert for ordinary game exits.
+                        if !swifttunnel_core::roblox_game_profile::pending()
+                            && !swifttunnel_core::roblox_launch_flags::pending() {
+                            commands::auth::cleanup_banned_session(&state).await;
+                        }
+                        state.games.lock().cleanup_scheduled = false;
+                        let _ = cleanup_app.emit(commands::games::LIBRARY_CHANGED, ());
+                    });
+                }
+                drop(games);
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+            }
+        });
+}
+
+pub fn run() {
+    logging::init();
+
+    // Before anything touches the network stack. SwiftTunnel and SwiftTunnel
+    // Lite have separate bundle identifiers, so Tauri's own single-instance
+    // guard does not span them, and two clients each installing the packet
+    // filter driver and rewriting routes is not a state worth reaching.
+    // The cross-client lock is acquired in setup, after Tauri can forward a
+    // second desktop instance's game request to the existing window.
+
+    apply_webview2_resource_tuning();
+    let launched_from_startup = autostart::launched_from_startup_flag();
+
+    let mut ctx = tauri::generate_context!();
+    ctx.set_default_window_icon(Some(APP_ICON.clone()));
+    ctx.set_tray_icon(Some(APP_ICON.clone()));
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if let Some(place)=game_shortcut::startup_target(&args) {game_shortcut::queue(place.clone());let _=app.emit("games-open",format!("play:{place}"));}
+            // Focus existing window when second instance launches
+            if let Some(window) = app.get_webview_window("main") {
+                restore_main_window(&window);
+            }
+        }))
+        .invoke_handler(tauri::generate_handler![
+            commands::games::games_get_library,
+            commands::games::games_installed_clients,
+            commands::games::games_dismiss_recovery,
+            commands::games::games_flags,
+            commands::games::games_save_flags,
+            commands::games::games_nvidia_profile,
+            commands::games::games_save_nvidia,
+            commands::games::games_refresh_metadata,
+            commands::game_launch::games_datacenters,
+            commands::game_launch::games_search_servers,
+            commands::game_launch::games_set_preferences,
+            commands::game_launch::games_launch_plan,
+            commands::game_launch::games_launch,
+            commands::game_launch::games_suggest_server,
+            commands::launcher::games_launcher_config,
+            commands::launcher::games_displays,
+            commands::launcher::games_create_shortcut,
+            commands::launcher::games_startup_target,
+            commands::launcher::games_save_launcher_config,
+            commands::games::games_scan_imports,
+            commands::games::games_set_notifications,
+            commands::games::games_set_favourite,
+            commands::games::games_add_favourite,
+            commands::games::games_forget,
+            // Auth
+            commands::auth::auth_get_state,
+            commands::auth::auth_login,
+            commands::auth::auth_start_oauth,
+            commands::auth::auth_poll_oauth,
+            commands::auth::auth_cancel_oauth,
+            commands::auth::auth_complete_oauth,
+            commands::auth::auth_logout,
+            commands::auth::auth_refresh_profile,
+            commands::auth::auth_update_required,
+            commands::system::ensure_overlay_window,
+            commands::overlay::ensure_overlay_shortcut,
+            commands::overlay::overlay_game_monitor,
+            // VPN
+            commands::vpn::vpn_get_state,
+            commands::vpn::vpn_preflight_binding,
+            commands::vpn::vpn_connect,
+            commands::vpn::vpn_disconnect,
+            commands::vpn::vpn_get_throughput,
+            commands::vpn::vpn_get_ping,
+            commands::vpn::vpn_get_free_tier,
+            commands::vpn::vpn_get_diagnostics,
+            commands::vpn::vpn_list_network_adapters,
+            // Servers
+            commands::vpn::server_get_list,
+            commands::vpn::server_get_latencies,
+            commands::vpn::server_refresh,
+            commands::vpn::server_smart_select,
+            // Optimizer
+            commands::optimizer::boost_get_metrics,
+            commands::optimizer::boost_cursor_pos,
+            commands::optimizer::boost_get_system_memory,
+            commands::optimizer::boost_update_config,
+            commands::optimizer::boost_sync_effective_config,
+            commands::optimizer::boost_clean_ram,
+            commands::optimizer::boost_get_system_info,
+            commands::optimizer::boost_restart_roblox,
+            commands::optimizer::boost_close_roblox,
+            commands::optimizer::boost_reset_roblox_settings,
+            commands::optimizer::boost_reset_roblox_client,
+            // Network
+            commands::network::network_start_stability_test,
+            commands::network::network_start_speed_test,
+            commands::network::network_start_bufferbloat_test,
+            commands::network::network_cancel_test,
+            // Settings
+            commands::settings::settings_load,
+            commands::settings::settings_save,
+            commands::settings::settings_generate_network_diagnostics_bundle,
+            commands::settings::preset_save_to_downloads,
+            // Updater
+            commands::updater::updater_check_channel,
+            commands::updater::updater_install_channel,
+            // System
+            commands::system::system_is_admin,
+            commands::system::system_startup_recovery_done,
+            commands::system::system_check_driver,
+            commands::system::system_install_driver,
+            commands::system::system_repair_driver,
+            commands::system::system_reinstall_driver,
+            commands::system::system_repair_windows_firewall,
+            commands::system::system_reset_driver,
+            commands::system::system_get_startup_registration,
+            commands::system::system_repair_startup_registration,
+            commands::system::system_restore_startup_registration,
+            commands::system::system_open_url,
+            commands::system::system_restart_as_admin,
+            commands::system::system_show_notification,
+            commands::system::system_launched_from_startup,
+            commands::system::system_cleanup,
+            commands::system::system_cleanup_tunnel_state,
+            commands::system::system_repair_network,
+            commands::system::system_uninstall,
+            commands::system::system_copy_log_to_clipboard,
+            commands::optimization::optimization_apply,
+            commands::optimization::optimization_revert,
+            commands::optimization::optimization_get_active,
+            // i18n
+            commands::i18n::i18n_translate,
+        ])
+        .setup(move |app| {
+            if !single_client::acquire() {
+                // Do not run exit network recovery against the active Lite
+                // client. No application/network state has been created yet.
+                std::process::exit(0);
+            }
+            info!("SwiftTunnel desktop app starting up");
+
+            // Report our version to the API so the server can lock out old builds
+            // (X-SwiftTunnel-Version). Set before any auth/relay-ticket call.
+            swifttunnel_core::auth::set_client_version(app.package_info().version.to_string());
+
+            // Finish required initialization before optional installer work starts.
+            // Setup errors otherwise panic inside Tauri's Ready event handler.
+            let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap_or_else(|error| {
+                startup_failure::abort(startup_failure::Stage::Engine, error)
+            }));
+            let app_state = AppState::new(runtime.clone(), launched_from_startup)
+                .unwrap_or_else(|error| {
+                    startup_failure::abort(startup_failure::Stage::Account, error)
+                });
+
+            // Reserve before exposing command state. Startup must restore old
+            // records before any user apply can create a new recovery record.
+            let startup_config_operation = commands::optimizer::begin_config_change()
+                .unwrap_or_else(|error| {
+                    startup_failure::abort(startup_failure::Stage::Settings, error)
+                });
+
+            // Clear an orphaned registration now, while the machine is healthy.
+            //
+            // A registration whose cached package has gone cannot be upgraded
+            // or uninstalled: the major upgrade has to remove the old version
+            // first, asks for a package that is not there, and dies on "the
+            // feature you are trying to use is on a network resource that is
+            // unavailable". The updater and the setup launcher both repair
+            // this, but neither is on the path most people take, which is
+            // downloading the .msi from the site and double-clicking it. That
+            // path runs no repair at all, and by then the app cannot help
+            // because the failure happens before it is replaced.
+            //
+            // Doing it at startup is what makes the fix reach that path: any
+            // launch of the working version leaves the registration sound, so
+            // the next upgrade has nothing to trip over however it is started.
+            //
+            // Off the main thread and best effort. It reads the registry and
+            // touches nothing when there is no orphan, but it must never delay
+            // a window appearing or stop the app starting if it fails.
+            if let Err(error) = std::thread::Builder::new()
+                .name("installer-maintenance".into())
+                .spawn(|| {
+                match swifttunnel_msi_repair::repair() {
+                    Ok(cleared) if !cleared.is_empty() => {
+                        log::warn!(
+                            "cleared {} orphaned SwiftTunnel registration(s) at startup; \
+                             upgrading and uninstalling will work again",
+                            cleared.len()
+                        );
+                    }
+                    Ok(_) => log::debug!("no orphaned SwiftTunnel registration"),
+                    Err(error) => {
+                        log::warn!("could not check for an orphaned registration: {error}")
+                    }
+                }
+
+                // Then stop the next one happening. The repair above is the
+                // cure; this is the prevention, and it is the half that
+                // reaches everybody. Windows falls back to the recorded
+                // install source when a cleanup tool deletes its cached
+                // package, and that source is usually a Downloads folder
+                // since tidied or a temp directory Windows wiped itself.
+                // Copying the package somewhere durable and pointing the
+                // source at it costs one file and means the fallback
+                // actually resolves.
+                //
+                // This runs after the fact, so unlike the launcher's own
+                // staging it covers an install done straight from the .msi
+                // as well.
+                match swifttunnel_msi_repair::preserve_installer_sources() {
+                    Ok(kept) if !kept.is_empty() => {
+                        log::info!("installer source preserved for: {}", kept.join(", "));
+                    }
+                    Ok(_) => log::debug!("no installer source needed preserving"),
+                    Err(error) => log::warn!("could not preserve the installer source: {error}"),
+                }
+                })
+            {
+                log::warn!("Could not start optional installer maintenance: {error}");
+            }
+
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_icon(APP_ICON.clone());
+            }
+
+            // The stats overlay is created on demand. Its WebView renderer is
+            // not needed during startup, and the bar is off by default.
+            // `commands::system::ensure_overlay_window` creates them on first
+            // use and applies WS_EX_NOACTIVATE there, which is what stops a
+            // topmost window activating on click and knocking Roblox out of
+            // the foreground.
+
+            // ALL heavy startup work (stale network recovery, profile refresh,
+            // boost/FFlag reapply) runs in the background task spawned below.
+            // It used to run inline here — but setup blocks the event loop, so
+            // the window could not even appear until it finished, and the
+            // profile refresh alone could hold it for its full 8s network
+            // timeout (the reported "app takes 5-10s to open").
+
+            let run_on_startup_enabled = app_state.settings.lock().run_on_startup;
+            let vpn_state_rx = app_state.vpn_state_handle.clone();
+            app.manage(app_state);
+
+            // Bridge every `VpnConnection` state transition — explicit
+            // transitions AND the silent in-place mutations from the relay
+            // health / auto-routing / process monitor tasks — to the UI's
+            // `VPN_STATE_CHANGED` event. Without this, the UI can render a
+            // state the backend has already moved past (e.g. showing a live
+            // session timer after the relay reported "dead").
+            commands::vpn::spawn_vpn_state_bridge(app.handle().clone(), vpn_state_rx);
+
+            if swifttunnel_core::settings::settings_load_error().is_some() {
+                log::warn!("Startup registration was left unchanged because saved preferences could not be loaded");
+            } else if let Err(e) = autostart::sync_run_on_startup(app.handle(), run_on_startup_enabled) {
+                log::warn!("Failed to sync startup registration: {}", e);
+            }
+
+            // Window starts hidden via tauri.conf.json ("visible": false).
+            // The frontend will call getCurrentWindow().show() after React loads,
+            // unless launched_from_startup is true (user clicks tray to reveal).
+            // Its first screen is the loading screen, so there is no separate
+            // boot splash window.
+
+            // Set up system tray
+            if let Err(e) = tray::setup_tray(app.handle()) {
+                log::error!("Failed to set up system tray: {}", e);
+            }
+
+            // Spawn background task to load server list
+            let app_handle = app.handle().clone();
+            runtime.spawn(async move {
+                info!("Loading server list in background...");
+                match swifttunnel_core::vpn::servers::load_server_list().await {
+                    Ok((servers, regions, source)) => {
+                        info!(
+                            "Server list loaded: {} servers, {} regions (source: {})",
+                            servers.len(),
+                            regions.len(),
+                            source
+                        );
+                        if let Some(state) = app_handle.try_state::<AppState>() {
+                            let mut sl = state.server_list.lock();
+                            sl.update(servers, regions, source.clone());
+                        }
+                        let _ = app_handle.emit(events::SERVER_LIST_UPDATED, source.to_string());
+                    }
+                    Err(e) => {
+                        log::error!("Failed to load server list: {}", e);
+                    }
+                }
+            });
+
+            // Background: tail Roblox logs for Games and the current server display.
+            spawn_roblox_game_join_watcher(app.handle().clone());
+
+            // Background: put the configured Roblox launch window size back
+            // after Roblox overwrites it on exit.
+            spawn_roblox_window_size_watcher(app.handle().clone());
+
+            // Background: put the FFlags back after Roblox updates itself,
+            // which lands as a new version folder and discards them.
+            spawn_roblox_version_watcher(app.handle().clone());
+
+            // Background startup chain: everything slow that used to block
+            // setup, in the same order it ran before. Runs on the app's own
+            // runtime, so Tauri commands and the UI are never blocked by it.
+            let app_handle = app.handle().clone();
+            runtime.spawn(async move {
+                // 1. Crash recovery for stale network state (drivers, hosts
+                //    file, adapter modes). vpn_connect waits on the signal so
+                //    a quick connect can't race the reset.
+                let recovery_handle = app_handle.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    startup_config::recover(startup_config_operation, || {
+                        // The worker retains settings admission through all
+                        // old-record recovery, even if its waiter disappears.
+                        sync_runtime_assets(&recovery_handle);
+                        recover_stale_network_state();
+                        if let Some(state) = recovery_handle.try_state::<AppState>() {
+                            state.sync_roblox_window_settings();
+                            state.system_optimizer.lock().recover_from_snapshot();
+                            state.network_booster.lock().recover_from_snapshot();
+                        }
+                    })
+                }).await {
+                    // Keep Connect's readiness signal false if the owned
+                    // worker panics, instead of connecting during partial reset.
+                    log::warn!("Startup settings recovery task failed: {error}");
+                    return;
+                }
+                let Some(state) = app_handle.try_state::<AppState>() else {
+                    return;
+                };
+                match commands::system::system_startup_repair_driver_if_needed(
+                    app_handle.clone(),
+                    state,
+                )
+                .await
+                {
+                    Ok(Some(driver)) if driver.reboot_required || driver.recommended_action == "reboot" => {
+                        swifttunnel_core::notification::show_notification(
+                            "SwiftTunnel repair needs a restart",
+                            "SwiftTunnel repaired the network driver. Restart Windows once, then open SwiftTunnel again.",
+                        );
+                    }
+                    Ok(Some(driver)) if driver.ready => {
+                        info!("Startup driver recovery repaired the split tunnel driver");
+                        swifttunnel_core::notification::show_notification(
+                            "SwiftTunnel repaired itself",
+                            "SwiftTunnel fixed a startup network issue. You can connect now.",
+                        );
+                    }
+                    Ok(Some(driver)) => {
+                        warn!(
+                            "Startup driver recovery could not fully repair the split tunnel driver: {}",
+                            driver.message
+                        );
+                        swifttunnel_core::notification::show_notification(
+                            "SwiftTunnel repair could not finish",
+                            "Restart Windows once, then open SwiftTunnel again. If this returns, contact support with your log file.",
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!("Startup driver recovery skipped after error: {}", e);
+                        swifttunnel_core::notification::show_notification(
+                            "SwiftTunnel repair could not run",
+                            "Restart Windows once, then open SwiftTunnel again. If this returns, contact support with your log file.",
+                        );
+                    }
+                }
+
+                let Some(state) = app_handle.try_state::<AppState>() else {
+                    return;
+                };
+                let _ = state.startup_recovery_signal.send(true);
+                // Let the UI drop its "preparing your connection" screen now that
+                // the network self-heal has run.
+                let _ = app_handle.emit(events::STARTUP_RECOVERY_COMPLETE, ());
+
+                // 2. Runtime GPU recovery also belongs off async workers.
+                match tokio::task::spawn_blocking(move || {
+                    swifttunnel_core::vpn::process_performance::recover_gpu_preferences()
+                }).await {
+                    Ok(Ok(_)) => {},
+                    Ok(Err(error)) => log::warn!("Runtime GPU recovery has pending originals: {error}"),
+                    Err(error) => log::warn!("Local startup recovery task failed: {error}"),
+                }
+
+                // 3. Refresh the profile (bounded) so boost recovery knows
+                //    whether the stored account is banned.
+                let should_refresh = {
+                    let auth = state.auth_manager.lock().await;
+                    matches!(
+                        auth.get_state(),
+                        AuthState::LoggedIn(_) | AuthState::Banned(_)
+                    )
+                };
+                if should_refresh {
+                    info!("Refreshing user profile on startup...");
+                    let auth = state.auth_manager.lock().await;
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(8),
+                        auth.refresh_profile(),
+                    )
+                    .await;
+                    drop(auth);
+
+                    match &result {
+                        Ok(Ok(())) | Ok(Err(AuthError::UserBanned(_))) => {
+                            // Publish auth promptly. The single ban-gated
+                            // recovery branch below owns Windows cleanup.
+                            commands::auth::emit_auth_state(&app_handle, &state).await;
+                        }
+                        Ok(Err(e)) => {
+                            warn!("Failed to refresh profile on startup: {}", e);
+                        }
+                        Err(_) => {
+                            warn!("Timed out refreshing profile on startup");
+                        }
+                    }
+                }
+
+                // 4. Boost recovery, gated on the (possibly refreshed) ban state.
+                let account_is_banned = {
+                    let auth = state.auth_manager.lock().await;
+                    matches!(auth.get_state(), AuthState::Banned(_))
+                };
+                if account_is_banned {
+                    info!("Stored account is banned; clearing boosts after startup recovery");
+                    commands::auth::cleanup_banned_session(&state).await;
+                } else {
+                    // Crash recovery finished before config admission opened.
+                    // Reapply only the current preferences, under a fresh
+                    // reservation shared with user applies and account cleanup.
+                    // Network commands and launcher file scans can block, so
+                    // the physical worker retains this reservation too.
+                    let handle = app_handle.clone();
+                    let operation = match commands::optimizer::wait_for_config_change().await {
+                        Ok(operation) => operation,
+                        Err(error) => {
+                            log::warn!("Startup boost reapply skipped: {error}");
+                            return;
+                        }
+                    };
+                    if let Err(error) = tokio::task::spawn_blocking(move || {
+                        let _operation = operation;
+                        let Some(state) = handle.try_state::<AppState>() else {
+                            return;
+                        };
+                        if matches!(state.auth_manager.blocking_lock().get_state(), AuthState::Banned(_)) {
+                            return;
+                        }
+                        reapply_saved_network_boosts(&state);
+                        reapply_saved_roblox_fflags(&state);
+                    })
+                    .await {
+                        log::warn!("Startup boost reapply task failed: {error}");
+                    }
+                }
+            });
+
+            Ok(())
+        })
+        .build(ctx)
+        .unwrap_or_else(|error| startup_failure::abort(startup_failure::Stage::Window, error))
+        .run(|_app, event| {
+            match event {
+                tauri::RunEvent::WindowEvent {
+                    label,
+                    event: tauri::WindowEvent::Destroyed,
+                    ..
+                } => {
+                    if label == "main" {
+                        // The main window was destroyed (not hidden). Exit the app
+                        // so the tray icon doesn't leave a zombie process. The
+                        // minimize-to-tray path uses hide(), not close(), so
+                        // Destroyed only fires when the user actually wants to quit
+                        // or an unexpected close occurred.
+                        _app.exit(0);
+                    }
+                }
+                tauri::RunEvent::Exit => {
+                    disconnect_vpn_on_exit(_app);
+                    recover_stale_network_state();
+                    // Restore network booster modifications (registry, MTU, firewall)
+                    if let Some(state) = _app.try_state::<crate::state::AppState>() {
+                        let roblox_pid = {
+                            let mut monitor = state.performance_monitor.lock();
+                            monitor.get_roblox_pid().unwrap_or(0)
+                        };
+                        if let Err(e) = state.system_optimizer.lock().restore(roblox_pid) {
+                            log::warn!("Failed to restore system settings on exit: {e}");
+                        }
+                        if let Err(e) = state.network_booster.lock().restore() {
+                            log::warn!("Failed to restore network settings on exit: {e}");
+                        }
+                    }
+                }
+                _ => {}
+            }
+        });
+}
+
+pub fn run_testbench_harness(args: &[String]) -> i32 {
+    harness::run_testbench_harness(args)
+}

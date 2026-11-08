@@ -1,0 +1,1095 @@
+//! Each screen, as a list of items.
+//!
+//! This is the whole interface. Everything about how it is measured, drawn and
+//! clicked lives in `view`, so what is left here is what the screen actually
+//! says, which is the part worth being able to read and change quickly.
+
+use crate::state::{Lockout, Push, ResetState, Roblox, RobloxDraft, State, Status, UpdateState};
+use crate::theme;
+use crate::view::{Action, Chip, FieldId, Flag, Item, Right, Row, Screen, Tone, Variant};
+
+/// Build the current screen, or whatever is pushed over it.
+pub fn build(state: &State) -> Vec<Item> {
+    // A lockout takes the whole window. Tabs would imply there is something
+    // useful behind them, and there is not: the account or the build is the
+    // problem and nothing on the other screens changes that.
+    if let Some(lockout) = &state.lockout {
+        // Signing out is not a failure, so it does not get the red dot and the
+        // apologetic copy the ban and update screens use.
+        if matches!(lockout, Lockout::SignedOut) {
+            return sign_in_screen(state);
+        }
+        return locked_out(state, lockout);
+    }
+
+    let mut items = match state.push {
+        Push::Regions => regions(state),
+        Push::Relays => relays(state),
+        Push::Adapters => adapters(state),
+        Push::None => match state.screen {
+            Screen::Connect => connect(state),
+            Screen::Roblox => roblox(state),
+            Screen::Settings => settings(state),
+        },
+    };
+    if let Some(warning) = &state.settings_warning {
+        let mut notice = vec![Item::Note(warning.clone())];
+        if !state.settings_reload_required {
+            notice.push(Item::Group(vec![
+                Row::new("Retry settings")
+                    .right(Right::Chevron)
+                    .action(Action::RetrySettingsSave)
+                    .disabled(state.startup_busy),
+            ]));
+        }
+        notice.push(Item::Gap(12));
+        items.splice(0..0, notice);
+    }
+    items
+}
+
+/// The screen shown instead of everything else.
+fn locked_out(state: &State, lockout: &Lockout) -> Vec<Item> {
+    let (headline, detail) = match lockout {
+        Lockout::Banned(reason) => (
+            "Account suspended",
+            if reason.trim().is_empty() {
+                "This account cannot use SwiftTunnel. Contact support if you think this is wrong."
+                    .to_string()
+            } else {
+                reason.clone()
+            },
+        ),
+        Lockout::UpdateRequired(message) => (
+            "Update required",
+            if message.trim().is_empty() {
+                "This build is too old to connect. Install the latest SwiftTunnel.".to_string()
+            } else {
+                message.clone()
+            },
+        ),
+        // SignedOut never reaches here: build() sends it to sign_in_screen.
+        Lockout::SignedOut => ("Sign in", String::new()),
+    };
+
+    let mut items = vec![
+        Item::Gap(16),
+        Item::Status {
+            headline: headline.to_string(),
+            sub: String::new(),
+            dot: Some(theme::ERROR),
+            sub_ink: theme::TEXT_MUTED,
+            right: None,
+        },
+        Item::Note(detail),
+        Item::Gap(8),
+    ];
+
+    // The update screen used to offer nothing, so it named the problem and
+    // left the reader to go and find the download. Lite cannot be updated from
+    // anywhere else in the window, because this screen replaces the window.
+    if matches!(lockout, Lockout::UpdateRequired(_)) {
+        items.push(Item::Group(vec![
+            Row::new(match &state.update {
+                UpdateState::Idle => "Update now",
+                UpdateState::Working(step) => step.as_str(),
+                UpdateState::Failed(_) => "Try again",
+            })
+            .action(Action::UpdateNow),
+        ]));
+
+        if let UpdateState::Failed(why) = &state.update {
+            items.push(Item::Note(format!(
+                "{why} You can also download SwiftTunnel Lite again from swifttunnel.net."
+            )));
+        }
+    }
+
+    // Core keeps a banned session for its details and sign-out, while
+    // is_logged_in() correctly refuses to authorize it for a connection.
+    if matches!(lockout, Lockout::Banned(_)) {
+        items.push(Item::Group(vec![sign_out_row(state)]));
+        if let Some(error) = &state.login.error {
+            items.push(Item::Note(error.clone()));
+        }
+    }
+
+    items
+}
+
+/// The whole window when nobody is signed in.
+///
+/// The full app swaps its UI for a login screen on any auth state that is not
+/// logged in, and Lite showed the tabs regardless, so signing out left every
+/// control sitting there looking usable. This is that screen: no tabs behind
+/// it, no status light, one thing to do.
+fn sign_in_screen(state: &State) -> Vec<Item> {
+    let form = &state.login;
+    let ready = !form.email.text.trim().is_empty() && !form.password.text.is_empty();
+
+    let mut items = vec![
+        Item::Atmosphere,
+        Item::Gap(26),
+        Item::Brand,
+        Item::Gap(18),
+        Item::Input {
+            id: FieldId::Email,
+            placeholder: "Email".to_string(),
+            value: form.email.text.clone(),
+            caret: form.email.caret,
+            selection: form.email.selection(),
+            masked: false,
+            focused: state.focus == Some(FieldId::Email),
+        },
+        Item::Input {
+            id: FieldId::Password,
+            placeholder: "Password".to_string(),
+            value: form.password.text.clone(),
+            caret: form.password.caret,
+            selection: form.password.selection(),
+            masked: true,
+            focused: state.focus == Some(FieldId::Password),
+        },
+        Item::Gap(2),
+        Item::Button {
+            label: if form.busy {
+                "Signing in".to_string()
+            } else {
+                "Sign in".to_string()
+            },
+            action: Action::SubmitLogin,
+            variant: Variant::Solid,
+            disabled: !ready || form.busy,
+        },
+    ];
+
+    if let Some(error) = &form.error {
+        items.push(Item::Gap(4));
+        items.push(Item::Fine(error.clone()));
+    }
+
+    items.push(Item::Gap(8));
+    items.push(Item::Divider("OR".to_string()));
+    items.push(Item::Button {
+        label: "Continue with Google".to_string(),
+        action: Action::SignIn,
+        variant: Variant::Outline,
+        disabled: form.busy,
+    });
+    items.push(Item::Gap(8));
+    items.push(Item::Fine(
+        "Same account as the desktop app: free hours are per account, not per device.".to_string(),
+    ));
+    items
+}
+
+// ── Connect ─────────────────────────────────────────────────────────────────
+
+fn connect(state: &State) -> Vec<Item> {
+    let t = &state.tunnel;
+    let connected = t.status == Status::Connected;
+
+    let headline = if connected {
+        state
+            .connected_region()
+            .map(|r| r.name.clone())
+            .or_else(|| t.region.clone())
+            .unwrap_or_else(|| "Connected".to_string())
+    } else if t.status == Status::Working {
+        t.detail.clone()
+    } else if state.auto_routing {
+        "Automatic".to_string()
+    } else {
+        state
+            .selected()
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| "No region".to_string())
+    };
+
+    let sub = if connected {
+        "Roblox traffic is tunneled".to_string()
+    } else if state.free_tier_spent {
+        "Free hours used up".to_string()
+    } else if t.detail.is_empty() {
+        "Ready to connect".to_string()
+    } else {
+        t.detail.clone()
+    };
+
+    let mut items = vec![Item::Status {
+        headline,
+        sub,
+        dot: Some(match t.status {
+            Status::Connected => theme::CONNECTED,
+            Status::Working => theme::WARNING,
+            Status::Error => theme::ERROR,
+            Status::Disconnected => theme::INACTIVE,
+        }),
+        sub_ink: if t.status == Status::Error || (!connected && state.free_tier_spent) {
+            theme::ERROR_TEXT
+        } else {
+            theme::TEXT_MUTED
+        },
+        right: connected.then(|| elapsed(t.elapsed)),
+    }];
+
+    // The advice half of a failure sits under the status and above the button
+    // that retries it, so the order reads: what happened, what to do, try again.
+    if !t.hint.is_empty() {
+        items.push(Item::Gap(6));
+        items.push(Item::Note(t.hint.clone()));
+    }
+
+    items.push(Item::Gap(8));
+    items.push(Item::Button {
+        label: primary_label(state),
+        action: Action::Primary,
+        variant: if connected {
+            Variant::Outline
+        } else {
+            Variant::Solid
+        },
+        disabled: t.status == Status::Working,
+    });
+
+    if !connected && state.free_tier_spent {
+        items.push(Item::Note(
+            "Your last reported allowance was used up. Retry after your allowance resets. SwiftTunnel checks your balance again when you connect."
+                .to_string(),
+        ));
+    }
+    items.push(Item::Gap(12));
+
+    if connected {
+        items.push(Item::Stats([
+            (
+                "Ping".into(),
+                t.ping_ms.map_or("--".into(), |v| format!("{v}ms")),
+            ),
+            ("Down".into(), bytes(t.bytes_down)),
+            ("Up".into(), bytes(t.bytes_up)),
+        ]));
+        items.push(Item::Gap(12));
+    }
+
+    items.push(caption("Tunnel"));
+    items.push(Item::Group(vec![
+        Row::new("Region")
+            .right(Right::TextChevron(region_label(state)))
+            .action(Action::OpenRegions),
+        Row::new("Relay")
+            .right(Right::TextChevron(
+                state
+                    .manual_relay
+                    .as_ref()
+                    .map_or("Automatic".into(), |r| r.server_id.clone()),
+            ))
+            .action(Action::OpenRelays)
+            .disabled(
+                state.auto_routing
+                    || state.custom_relay
+                    || matches!(state.tunnel.status, Status::Connected | Status::Working),
+            ),
+        Row::new("Adapter")
+            .right(Right::TextChevron(adapter_label(state)))
+            .action(Action::OpenAdapters),
+        Row::new("Route Assist")
+            .sub("Join servers in the tunneled region")
+            .right(Right::Switch(state.route_assist))
+            .action(Action::Toggle(Flag::RouteAssist)),
+        Row::new("Bypass country ban")
+            .sub("Use when Roblox is blocked entirely")
+            .right(Right::Switch(state.country_ban))
+            .action(Action::Toggle(Flag::CountryBan)),
+    ]));
+
+    items
+}
+
+/// What the one button on Connect currently does.
+fn primary_label(state: &State) -> String {
+    match state.tunnel.status {
+        Status::Connected => "Disconnect".into(),
+        Status::Working => {
+            if state.tunnel.detail.is_empty() {
+                "Working".into()
+            } else {
+                state.tunnel.detail.clone()
+            }
+        }
+        _ => "Connect".into(),
+    }
+}
+
+fn region_label(state: &State) -> String {
+    if state.auto_routing {
+        return "Automatic".into();
+    }
+    match state.selected() {
+        Some(r) => r.name.clone(),
+        None if state.selected_region.is_empty() => "Choose".into(),
+        None => state.selected_region.clone(),
+    }
+}
+
+// ── Region picker ───────────────────────────────────────────────────────────
+
+fn regions(state: &State) -> Vec<Item> {
+    let busy = matches!(state.tunnel.status, Status::Connected | Status::Working);
+    let mut rows = vec![
+        Row::new("Automatic")
+            .sub("Measured gameplay paths. Turn off to choose a region.")
+            .right(Right::Tick(state.auto_routing))
+            .action(Action::PickAutoRegion)
+            .disabled(busy),
+    ];
+
+    for region in &state.regions {
+        let selected = !state.auto_routing && state.selected_region == region.id;
+        let reference = region
+            .relays
+            .iter()
+            .filter_map(|relay| relay.reference())
+            .min_by_key(|row| row.estimate.estimated_game_ms);
+        rows.push(
+            Row::new(format!("{}  {}", region.country, region.name))
+                .sub(
+                    reference
+                        .map(|row| format!("{} datacenter", row.location))
+                        .unwrap_or_else(|| "Ping to relay".into()),
+                )
+                .right(if selected {
+                    Right::Tick(true)
+                } else {
+                    Right::Latency(
+                        reference
+                            .map(|row| row.estimate.estimated_game_ms)
+                            .or(region.ping_ms),
+                    )
+                })
+                .action(Action::PickRegion(region.id.clone()))
+                .disabled(state.auto_routing || busy),
+        );
+    }
+
+    if state.regions.is_empty() {
+        rows.push(Row::new("Fetching relays...").disabled(true));
+    }
+
+    vec![Item::Back("Region".into()), Item::Group(rows)]
+}
+
+fn relays(state: &State) -> Vec<Item> {
+    let disabled = state.auto_routing
+        || state.custom_relay
+        || matches!(state.tunnel.status, Status::Connected | Status::Working);
+    let mut rows = vec![
+        Row::new("Automatic")
+            .sub(if state.route_assist || state.country_ban {
+                "Lowest relay ping in this region"
+            } else {
+                "Compare game paths at join; stays in this region"
+            })
+            .right(Right::Tick(state.manual_relay.is_none()))
+            .action(Action::PickRelay(None))
+            .disabled(disabled),
+    ];
+    if let Some(pin) = &state.manual_relay {
+        let valid = state.selected().is_some_and(|r| {
+            r.id == pin.region
+                && r.relays.iter().any(|s| {
+                    s.id == pin.server_id && s.ip == pin.ip && s.port == pin.port && s.available
+                })
+        });
+        if !valid {
+            rows.push(
+                Row::new(format!("{} unavailable or changed", pin.server_id))
+                    .sub("Choose another relay or Automatic")
+                    .disabled(true),
+            );
+        }
+    }
+    if let Some(region) = state.selected() {
+        for relay in &region.relays {
+            let selected = state.manual_relay.as_ref().is_some_and(|p| {
+                p.region == region.id
+                    && p.server_id == relay.id
+                    && p.ip == relay.ip
+                    && p.port == relay.port
+            });
+            let reference = relay.reference();
+            rows.push(
+                Row::new(&relay.id)
+                    .sub(if !relay.available {
+                        "Unavailable".into()
+                    } else if let Some(row) = reference {
+                        format!("{} datacenter", row.location)
+                    } else if selected {
+                        "Selected / ping to relay".into()
+                    } else {
+                        "Ping to relay".into()
+                    })
+                    .right(Right::Latency(
+                        reference
+                            .map(|row| row.estimate.estimated_game_ms)
+                            .or(relay.ping_ms),
+                    ))
+                    .action(Action::PickRelay(Some(relay.id.clone())))
+                    .disabled(disabled || !relay.available),
+            );
+        }
+    }
+    vec![Item::Back("Relay".into()), Item::Group(rows)]
+}
+
+// Roblox
+/// The Roblox screen.
+///
+/// Nothing here writes anything. Every control edits a draft, and Apply is
+/// the only thing that touches Roblox's files. The previous version wrote on
+/// every click, from a thread per click, with a busy flag swallowing anything
+/// pressed while a write was in flight; changing three settings raced three
+/// writes against three re-reads and dropped clicks on the floor.
+///
+/// What is shown when there is no draft is what is actually applied to the
+/// client, not what SwiftTunnel last asked for. Core reconciles the two, so a
+/// cap the player changed in Roblox itself, or FFlags a Roblox update wiped,
+/// show up here as gone.
+fn roblox(state: &State) -> Vec<Item> {
+    let r: &Roblox = &state.roblox;
+
+    if !r.installed {
+        return vec![
+            Item::Gap(40),
+            caption("Roblox"),
+            Item::Group(vec![
+                Row::new("Roblox is not installed")
+                    .sub("Install it and reopen SwiftTunnel Lite")
+                    .disabled(true),
+            ]),
+        ];
+    }
+
+    let draft = state.roblox_view();
+    let dirty = state.roblox_dirty();
+
+    let mut items = vec![
+        caption("Frame rate"),
+        Item::Group(vec![
+            Row::new("Unlock frame rate")
+                .sub("Removes Roblox's 60 FPS cap")
+                .right(Right::Switch(draft.unlock_fps))
+                .action(Action::Toggle(Flag::UnlockFps)),
+            Row::new("Cap")
+                .sub(fps_hint(&draft))
+                .right(Right::Field {
+                    text: draft.fps_text.clone(),
+                    focused: state.focus == Some(FieldId::FpsCap),
+                    id: FieldId::FpsCap,
+                    valid: draft.fps().is_some(),
+                })
+                .disabled(!draft.unlock_fps),
+        ]),
+        Item::Gap(12),
+        caption("Game"),
+        Item::Group(vec![
+            Row::new("Graphics").right(Right::Choice(vec![
+                Chip {
+                    label: "Auto".into(),
+                    selected: draft.quality == 0,
+                    action: Action::SetQuality(0),
+                },
+                Chip {
+                    label: "Low".into(),
+                    selected: draft.quality == 1,
+                    action: Action::SetQuality(1),
+                },
+                Chip {
+                    label: "Max".into(),
+                    selected: draft.quality == 10,
+                    action: Action::SetQuality(10),
+                },
+            ])),
+            Row::new("Launch fullscreen")
+                .right(Right::Switch(draft.fullscreen))
+                .action(Action::Toggle(Flag::Fullscreen)),
+        ]),
+        Item::Gap(12),
+        caption("FFlags"),
+        Item::Group(vec![
+            Row::new("Ultraboost")
+                .sub("SwiftTunnel's own performance flags")
+                .right(Right::Switch(draft.ultraboost))
+                .action(Action::Toggle(Flag::Ultraboost)),
+            Row::new("Custom FFlags")
+                .sub(custom_hint(&draft))
+                .right(Right::Switch(draft.custom_fflags))
+                .action(Action::Toggle(Flag::CustomFflags)),
+            Row::new(if state.fflag_import.pending() {
+                "Reading file..."
+            } else {
+                "Import from file"
+            })
+            .sub("A .json or .txt file of flags")
+            .right(Right::Chevron)
+            .action(Action::ImportFflags)
+            .disabled(!draft.custom_fflags || state.roblox_busy || state.fflag_import.pending()),
+        ]),
+        Item::Gap(12),
+        caption("Reset"),
+        Item::Group(vec![reset_row(state)]),
+        Item::Gap(10),
+    ];
+
+    if let Some(note) = &state.roblox_reset_note {
+        items.push(Item::Note(note.clone()));
+    }
+    if let Some(note) = &draft.fflag_note {
+        items.push(Item::Note(note.clone()));
+    }
+    if let Some(error) = &r.error {
+        items.push(Item::Note(error.clone()));
+    }
+
+    let _ = dirty;
+    items
+}
+
+/// The row that puts Roblox back to stock, in whichever of its three states.
+///
+/// The armed line says what is actually at risk rather than repeating the
+/// question. Someone who imported their own flags through a launcher has to
+/// read that they are about to lose them, and reading it is the only chance
+/// they get.
+fn reset_row(state: &State) -> Row {
+    let row = match state.roblox_reset {
+        ResetState::Running => Row::new("Resetting...")
+            .sub("Clearing every FFlag file on this PC")
+            .disabled(true),
+        ResetState::Armed => Row::new("Press again to reset")
+            .sub("Roblox closes now. A launcher's own flags go too.")
+            .right(Right::Chevron)
+            .action(Action::ResetRoblox)
+            .danger_if(true),
+        ResetState::Idle => Row::new("Reset Roblox to default")
+            .sub("Close Roblox and remove every FFlag on this PC")
+            .right(Right::Chevron)
+            .action(Action::ResetRoblox),
+    };
+    row.disabled(
+        state.roblox_busy
+            || state.fflag_import.is_busy()
+            || state.roblox_reset == ResetState::Running,
+    )
+}
+
+/// The control pinned to the bottom of a screen, outside the scroll.
+///
+/// Roblox has more settings than fit, and the one button that writes them must
+/// not be the thing that scrolls off. It sits below the list instead, always
+/// reachable, which also makes it obvious that nothing above it has been
+/// applied yet.
+pub fn footer(state: &State) -> Option<Item> {
+    if state.push != Push::None || state.lockout.is_some() {
+        return None;
+    }
+    if state.screen != Screen::Roblox || !state.roblox.installed {
+        return None;
+    }
+
+    let draft = state.roblox_view();
+    let dirty = state.roblox_dirty();
+
+    // Roblox reads its settings once at launch, so applying while it is open
+    // does nothing until it restarts. The label says which is about to happen.
+    Some(Item::Button {
+        label: if state.roblox_busy {
+            if state.roblox_reset == ResetState::Running {
+                "Resetting..."
+            } else {
+                "Applying..."
+            }
+            .into()
+        } else if state.fflag_import.is_busy() {
+            "Reading flags...".into()
+        } else if !dirty {
+            "No changes to apply".into()
+        } else if state.roblox.running {
+            "Restart Roblox to apply".into()
+        } else {
+            "Apply".into()
+        },
+        action: Action::ApplyRoblox,
+        variant: if dirty {
+            Variant::Solid
+        } else {
+            Variant::Outline
+        },
+        disabled: state.roblox_busy || state.fflag_import.is_busy() || !dirty || !draft.ready(),
+    })
+}
+
+/// What the cap field is doing, said in the row's second line.
+fn fps_hint(draft: &RobloxDraft) -> String {
+    if !draft.unlock_fps {
+        return "Roblox's default 60".into();
+    }
+    match draft.fps() {
+        Some(_) => "Frames per second".into(),
+        None => "Enter a number between 30 and 1000".into(),
+    }
+}
+
+/// Whether a custom payload is loaded, and how big it is.
+fn custom_hint(draft: &RobloxDraft) -> String {
+    if draft.ultraboost {
+        return "Turn Ultraboost off to use your own".into();
+    }
+    if !draft.custom_fflags {
+        return "Import your own allowlisted flags".into();
+    }
+    if draft.custom_json.trim().is_empty() {
+        return "Nothing pasted yet".into();
+    }
+    "Your own flags".into()
+}
+
+// ── Settings ────────────────────────────────────────────────────────────────
+
+/// Settings, and it has to fit.
+///
+/// An earlier version laid out well past the viewport and scrolled, which
+/// sliced the last row in half against the window edge and looked like a
+/// rendering fault rather than a list. Every sub-label that was restating its
+/// own row is gone, the version sits in the caption rather than costing a row,
+/// and the adapter moved to Connect, where the thing it affects is.
+fn settings(state: &State) -> Vec<Item> {
+    vec![
+        caption("General"),
+        Item::Group(vec![
+            Row::new("Start with Windows")
+                .right(Right::Switch(state.run_on_startup))
+                .action(Action::Toggle(Flag::RunOnStartup))
+                .disabled(state.startup_busy),
+            Row::new("Close to tray")
+                .right(Right::Switch(state.close_to_tray))
+                .action(Action::Toggle(Flag::CloseToTray)),
+            Row::new("Reconnect automatically")
+                .right(Right::Switch(state.auto_reconnect))
+                .action(Action::Toggle(Flag::AutoReconnect)),
+            Row::new("Discord Rich Presence")
+                .sub("Show the region you are tunneled to")
+                .right(Right::Switch(state.discord_rpc))
+                .action(Action::Toggle(Flag::DiscordRpc)),
+        ]),
+        Item::Gap(12),
+        caption("Driver"),
+        Item::Group(vec![
+            Row::new("Split tunnel driver")
+                .sub(state.driver.status.clone())
+                .right(Right::Text(if state.driver.ready {
+                    "Ready".into()
+                } else {
+                    "Not ready".into()
+                })),
+            Row::new(if state.driver.repairing {
+                "Reinstalling..."
+            } else {
+                "Reinstall driver"
+            })
+            .sub(if state.tunnel.status == Status::Connected {
+                "Disconnects SwiftTunnel before reinstalling"
+            } else {
+                "Use if the tunnel will not start"
+            })
+            .right(Right::Chevron)
+            .action(Action::RepairDriver)
+            .disabled(state.driver.repairing || state.tunnel.status == Status::Working),
+            // Lite has always written a log; nothing told anyone where. The
+            // first thing asked for in a support thread is the log file, and
+            // hunting through AppData for it is not a reasonable ask.
+            Row::new("Open log file")
+                .sub("Send this when reporting a problem")
+                .right(Right::Chevron)
+                .action(Action::OpenLogs),
+            // Only offered when Lite has its own uninstaller. Installed
+            // alongside the full app there is no separate product to remove,
+            // and a button that silently does nothing is worse than none.
+            Row::new(if state.standalone {
+                "Uninstall SwiftTunnel Lite"
+            } else if state.installation_unknown {
+                "Installation status unavailable"
+            } else {
+                "Installed with SwiftTunnel"
+            })
+            .sub(if state.standalone {
+                "Disconnects and cleans up before opening Windows Installer"
+            } else if state.installation_unknown {
+                "Use Windows Settings > Apps to select this installation"
+            } else {
+                "Remove SwiftTunnel to remove Lite"
+            })
+            .right(if state.standalone {
+                Right::Chevron
+            } else {
+                Right::None
+            })
+            .action(Action::Uninstall)
+            .danger_if(state.standalone)
+            .disabled(!state.standalone || state.uninstall_busy),
+        ]),
+        Item::Gap(12),
+        // Whatever the last attempt had to say, if it had anything.
+        Item::Note(state.uninstall_note.clone().unwrap_or_default()),
+        // No update check. Lite ships inside the same installer as the full app
+        // and is replaced when it is, so a button offering to look for one
+        // would be a button that does nothing.
+        Item::Caption {
+            text: "Account".into(),
+            trailing: Some(format!("v{}", env!("CARGO_PKG_VERSION"))),
+        },
+        Item::Group(vec![
+            Row::new(state.email.clone().unwrap_or_else(|| "Signed out".into())),
+            if state.signed_in {
+                sign_out_row(state)
+            } else {
+                Row::new("Sign in")
+                    .action(Action::SignIn)
+                    .disabled(state.login.busy)
+            },
+        ]),
+        Item::Note(state.login.error.clone().unwrap_or_default()),
+    ]
+}
+
+fn sign_out_row(state: &State) -> Row {
+    Row::new(if state.login.busy {
+        "Signing out..."
+    } else {
+        "Sign out"
+    })
+    .action(Action::SignOut)
+    .danger_if(true)
+    .disabled(state.login.busy)
+}
+
+/// A plain uppercase caption, which is almost all of them.
+fn caption(text: &str) -> Item {
+    Item::Caption {
+        text: text.into(),
+        trailing: None,
+    }
+}
+
+fn adapter_label(state: &State) -> String {
+    match &state.adapter_guid {
+        None => "Automatic".into(),
+        Some(guid) => state
+            .adapters
+            .iter()
+            .find(|a| &a.guid == guid)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| "Manual".into()),
+    }
+}
+
+// ── Adapter picker ──────────────────────────────────────────────────────────
+
+fn adapters(state: &State) -> Vec<Item> {
+    let mut rows = vec![
+        Row::new("Automatic")
+            .sub("Let SwiftTunnel pick the adapter carrying your traffic")
+            .right(Right::Tick(state.adapter_guid.is_none()))
+            .action(Action::PickAdapter(None)),
+    ];
+
+    for adapter in &state.adapters {
+        rows.push(
+            Row::new(adapter.name.clone())
+                .sub(adapter.detail.clone())
+                .right(Right::Tick(
+                    state.adapter_guid.as_deref() == Some(adapter.guid.as_str()),
+                ))
+                .action(Action::PickAdapter(Some(adapter.guid.clone()))),
+        );
+    }
+
+    let mut items = vec![Item::Back("Network adapter".into())];
+    if state.adapter_busy {
+        items.push(Item::Note("Refreshing network adapters...".into()));
+    } else if let Some(error) = &state.adapter_error {
+        items.push(Item::Note(error.clone()));
+    }
+    items.push(Item::Group(rows));
+    items
+}
+
+// ── Formatting ──────────────────────────────────────────────────────────────
+
+/// `1:04:21` once past an hour, `04:21` before it.
+fn elapsed(seconds: u64) -> String {
+    let h = seconds / 3600;
+    let m = (seconds % 3600) / 60;
+    let s = seconds % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+/// Decimal units, matching the app's own readout.
+fn bytes(value: u64) -> String {
+    const KB: f64 = 1024.0;
+    let v = value as f64;
+    if v < KB {
+        format!("{value}B")
+    } else if v < KB * KB {
+        format!("{:.0}K", v / KB)
+    } else if v < KB * KB * KB {
+        format!("{:.1}M", v / (KB * KB))
+    } else {
+        format!("{:.2}G", v / (KB * KB * KB))
+    }
+}
+
+impl Row {
+    /// Red only when the action is destructive, so one row can serve both
+    /// "Sign out" and "Sign in".
+    fn danger_if(mut self, yes: bool) -> Self {
+        if yes {
+            self.tone = Tone::Danger;
+        }
+        self
+    }
+}
+
+#[cfg(test)]
+mod quota_retry_tests {
+    use super::*;
+
+    #[test]
+    fn startup_setup_disables_duplicate_toggles_and_retry_while_busy() {
+        let state = State {
+            screen: Screen::Settings,
+            startup_busy: true,
+            settings_warning: Some("Couldn't finish Windows startup setup.".into()),
+            ..Default::default()
+        };
+        let items = build(&state);
+        for expected in [
+            Action::Toggle(Flag::RunOnStartup),
+            Action::RetrySettingsSave,
+        ] {
+            let row = items
+                .iter()
+                .filter_map(|item| {
+                    if let Item::Group(rows) = item {
+                        Some(rows)
+                    } else {
+                        None
+                    }
+                })
+                .flatten()
+                .find(|row| row.action.as_ref() == Some(&expected))
+                .unwrap();
+            assert!(row.disabled);
+        }
+    }
+
+    #[test]
+    fn failed_settings_saves_offer_retry_across_normal_screens_and_clear_after_recovery() {
+        for screen in [Screen::Connect, Screen::Roblox, Screen::Settings] {
+            let mut state = State {
+                screen,
+                settings_warning: Some(
+                    "Couldn't save your settings. Check disk space, then retry.".into(),
+                ),
+                ..Default::default()
+            };
+            let items = build(&state);
+            assert!(
+                items
+                    .iter()
+                    .any(|item| matches!(item, Item::Note(text) if text.contains("Couldn't save")))
+            );
+            assert!(items.iter().any(|item| matches!(item, Item::Group(rows)
+                if rows.iter().any(|row| row.action == Some(Action::RetrySettingsSave)))));
+            state.settings_warning = None;
+            assert!(
+                !build(&state)
+                    .iter()
+                    .any(|item| matches!(item, Item::Group(rows)
+                if rows.iter().any(|row| row.action == Some(Action::RetrySettingsSave))))
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_startup_settings_show_restart_guidance_without_a_save_retry() {
+        let state = State {
+            settings_warning: Some(
+                "Restart SwiftTunnel to reload your saved settings before saving changes.".into(),
+            ),
+            settings_reload_required: true,
+            ..Default::default()
+        };
+        let items = build(&state);
+        assert!(
+            items.iter().any(
+                |item| matches!(item, Item::Note(text) if text.contains("Restart SwiftTunnel"))
+            )
+        );
+        assert!(!items.iter().any(|item| matches!(item, Item::Group(rows) if rows.iter().any(|row| row.action == Some(Action::RetrySettingsSave)))));
+    }
+
+    #[test]
+    fn a_failed_sign_out_remains_visible_and_busy_sign_out_cannot_repeat() {
+        let mut state = State {
+            signed_in: true,
+            screen: Screen::Settings,
+            ..Default::default()
+        };
+        state.login.error = Some("Could not remove the saved login. Try signing out again.".into());
+        for banned in [false, true] {
+            state.lockout = banned.then(|| Lockout::Banned("fixture".into()));
+            state.signed_in = !banned;
+            let items = build(&state);
+            assert!(items.iter().any(|item| matches!(item, Item::Note(message) if Some(message) == state.login.error.as_ref())));
+            state.login.busy = true;
+            let items = build(&state);
+            assert!(items.iter().any(|item| matches!(item, Item::Group(rows) if rows.iter().any(|row| row.action == Some(Action::SignOut) && row.disabled))));
+            state.login.busy = false;
+        }
+    }
+
+    #[test]
+    fn relay_picker_distinguishes_game_estimates_from_first_leg_and_endpoint_changes() {
+        use swifttunnel_core::vpn::auto_routing::{GameRouteStatus, RelayEstimate};
+        let mut state = State {
+            selected_region: "mumbai".into(),
+            ..State::default()
+        };
+        state.regions.push(crate::state::RegionRow {
+            id: "mumbai".into(),
+            name: "Mumbai".into(),
+            country: "IN".into(),
+            ping_ms: Some(8),
+            relays: vec![crate::state::RelayRow {
+                preview: None,
+                id: "mumbai-04".into(),
+                ip: "192.0.2.4".into(),
+                port: 51821,
+                available: true,
+                ping_ms: Some(8),
+            }],
+        });
+        state.tunnel.game_route = Some(GameRouteStatus {
+            game_location: "Mumbai".into(),
+            game_server_ip: Some("128.116.47.33".parse().unwrap()),
+            relay: "mumbai-04".into(),
+            estimated_path_ms: Some(26),
+            bypassed: false,
+            selection: "measured".into(),
+            relay_estimates: vec![RelayEstimate {
+                relay: "mumbai-04".into(),
+                address: "192.0.2.4:51821".parse().unwrap(),
+                relay_ms: 8,
+                second_leg_ms: 18,
+                estimated_game_ms: 26,
+            }],
+        });
+        let rows = relays(&state);
+        let Item::Group(rows) = &rows[1] else {
+            panic!("missing relay choices");
+        };
+        assert_eq!(rows[1].sub.as_deref(), Some("Ping to relay"));
+        assert!(matches!(rows[1].right, Right::Latency(Some(8))));
+        state.regions[0].relays[0].ip = "192.0.2.5".into();
+        let rows = relays(&state);
+        let Item::Group(rows) = &rows[1] else {
+            panic!("missing relay choices");
+        };
+        assert_eq!(rows[1].sub.as_deref(), Some("Ping to relay"));
+        assert!(matches!(rows[1].right, Right::Latency(Some(8))));
+    }
+
+    #[test]
+    fn manual_relay_picker_handles_unavailable_and_connected_states() {
+        let mut state = State {
+            selected_region: "singapore".into(),
+            ..State::default()
+        };
+        state.regions.push(crate::state::RegionRow {
+            id: "singapore".into(),
+            name: "Singapore".into(),
+            country: "SG".into(),
+            ping_ms: Some(5),
+            relays: vec![crate::state::RelayRow {
+                preview: None,
+                id: "singapore-01".into(),
+                ip: "192.0.2.1".into(),
+                port: 51821,
+                available: false,
+                ping_ms: None,
+            }],
+        });
+        let items = relays(&state);
+        let Item::Group(rows) = &items[1] else {
+            panic!("missing relay choices")
+        };
+        assert!(!rows[0].disabled);
+        assert_eq!(rows[0].action, Some(Action::PickRelay(None)));
+        assert!(rows[1].disabled);
+        state.manual_relay = Some(swifttunnel_core::settings::ManualRelay {
+            region: "singapore".into(),
+            server_id: "removed".into(),
+            ip: "192.0.2.2".into(),
+            port: 51821,
+        });
+        let items = relays(&state);
+        let Item::Group(rows) = &items[1] else {
+            panic!("missing relay choices")
+        };
+        assert!(
+            rows.iter()
+                .any(|r| r.label.contains("removed unavailable or changed"))
+        );
+        state.tunnel.status = Status::Connected;
+        let items = relays(&state);
+        let Item::Group(rows) = &items[1] else {
+            panic!("missing relay choices")
+        };
+        assert!(rows.iter().all(|r| r.disabled));
+    }
+
+    #[test]
+    fn stale_zero_balance_does_not_disable_a_fresh_connect_attempt() {
+        let state = State {
+            free_tier_spent: true,
+            ..State::default()
+        };
+        assert!(connect(&state).iter().any(|item| matches!(
+            item,
+            Item::Button {
+                action: Action::Primary,
+                disabled: false,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_connect_in_progress_still_disables_the_button() {
+        let mut state = State::default();
+        state.tunnel.status = Status::Working;
+        assert!(connect(&state).iter().any(|item| matches!(
+            item,
+            Item::Button {
+                action: Action::Primary,
+                disabled: true,
+                ..
+            }
+        )));
+    }
+}

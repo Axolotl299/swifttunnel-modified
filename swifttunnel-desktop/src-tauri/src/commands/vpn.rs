@@ -1,0 +1,1771 @@
+use serde::Serialize;
+use std::collections::HashSet;
+use std::net::SocketAddr;
+use std::time::Duration;
+use tauri::{AppHandle, Emitter, Manager, State};
+
+use crate::events::{
+    COUNTRY_BAN_BYPASS_UNAVAILABLE, SERVER_LIST_UPDATED, VPN_STATE_CHANGED, VpnStateEvent,
+};
+use crate::state::AppState;
+use swifttunnel_core::auth::types::AuthError;
+use swifttunnel_core::vpn::{
+    BindingPreferenceSource, BindingPreflightInfo, VpnError, preflight_binding,
+    preflight_binding_for_connect,
+};
+// The connect-time policy: which adapter to bind, which region to land in,
+// which relays to offer. It lives in core so SwiftTunnel Lite runs the same
+// decisions rather than its own approximation of them.
+pub(crate) use swifttunnel_core::vpn::connect_policy::{
+    build_available_servers, connect_candidates, current_binding_preference,
+};
+
+const VPN_CONNECT_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
+
+type BindingSnapshot = (
+    swifttunnel_core::settings::AppSettings,
+    Option<swifttunnel_core::vpn::AdapterBindingPreference>,
+    BindingPreflightInfo,
+);
+
+fn binding_snapshot_with(
+    settings: &parking_lot::Mutex<swifttunnel_core::settings::AppSettings>,
+    probe: impl FnOnce(
+        &mut swifttunnel_core::settings::AppSettings,
+    ) -> Result<
+        (
+            BindingPreflightInfo,
+            Option<swifttunnel_core::vpn::AdapterBindingPreference>,
+        ),
+        String,
+    >,
+    save: impl FnOnce(&swifttunnel_core::settings::AppSettings) -> Result<(), String>,
+) -> Result<BindingSnapshot, String> {
+    let original = settings.lock().clone();
+    let mut validated = original.clone();
+    // Adapter enumeration and binding repair can block for seconds. Never
+    // hold the shared settings lock while Windows performs that work.
+    let (preflight, preference) = probe(&mut validated)?;
+    let mut current = settings.lock();
+    if current.adapter_binding_mode != original.adapter_binding_mode
+        || current.preferred_physical_adapter_guid != original.preferred_physical_adapter_guid
+        || current.network_binding_overrides != original.network_binding_overrides
+    {
+        return Err("Your network adapter choice changed. Try connecting again.".into());
+    }
+    if validated.network_binding_overrides != original.network_binding_overrides {
+        let mut updated = current.clone();
+        updated.network_binding_overrides = validated.network_binding_overrides;
+        save(&updated)?;
+        *current = updated;
+    }
+    // Keep unrelated settings changed during the probe instead of restoring
+    // the older snapshot over the user's edits.
+    Ok((current.clone(), preference, preflight))
+}
+
+async fn binding_snapshot(
+    settings: std::sync::Arc<parking_lot::Mutex<swifttunnel_core::settings::AppSettings>>,
+    repair: bool,
+) -> Result<BindingSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        log::info!("Adapter preflight started: repair={repair}");
+        let result = binding_snapshot_with(
+            &settings,
+            |snapshot| validated_binding_preflight(snapshot, repair),
+            swifttunnel_core::settings::save_settings,
+        );
+        log::info!(
+            "Adapter preflight finished: repair={} elapsed_ms={} success={}",
+            repair,
+            started.elapsed().as_millis(),
+            result.is_ok()
+        );
+        result
+    })
+    .await
+    .map_err(|e| format!("Adapter preflight task failed: {e}"))?
+}
+
+#[derive(Serialize)]
+pub struct VpnStateResponse {
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub game_route: Option<swifttunnel_core::vpn::auto_routing::GameRouteStatus>,
+    pub region: Option<String>,
+    pub server_endpoint: Option<String>,
+    pub assigned_ip: Option<String>,
+    pub relay_auth_mode: Option<String>,
+    pub split_tunnel_active: bool,
+    pub tunneled_processes: Vec<String>,
+    pub error: Option<String>,
+    /// Relay health status: None/absent = healthy, "stale" = no traffic 30s+, "dead" = no response 60s+
+    pub relay_status: Option<String>,
+}
+
+fn map_vpn_state(conn_state: swifttunnel_core::vpn::ConnectionState) -> VpnStateResponse {
+    match conn_state {
+        swifttunnel_core::vpn::ConnectionState::Disconnected => VpnStateResponse {
+            game_route: None,
+            state: "disconnected".to_string(),
+            region: None,
+            server_endpoint: None,
+            assigned_ip: None,
+            relay_auth_mode: None,
+            split_tunnel_active: false,
+            tunneled_processes: vec![],
+            error: None,
+            relay_status: None,
+        },
+        swifttunnel_core::vpn::ConnectionState::FetchingConfig => VpnStateResponse {
+            game_route: None,
+            state: "fetching_config".to_string(),
+            region: None,
+            server_endpoint: None,
+            assigned_ip: None,
+            relay_auth_mode: None,
+            split_tunnel_active: false,
+            tunneled_processes: vec![],
+            error: None,
+            relay_status: None,
+        },
+        swifttunnel_core::vpn::ConnectionState::ConfiguringSplitTunnel => VpnStateResponse {
+            game_route: None,
+            state: "configuring_split_tunnel".to_string(),
+            region: None,
+            server_endpoint: None,
+            assigned_ip: None,
+            relay_auth_mode: None,
+            split_tunnel_active: false,
+            tunneled_processes: vec![],
+            error: None,
+            relay_status: None,
+        },
+        swifttunnel_core::vpn::ConnectionState::Connected {
+            server_region,
+            server_endpoint,
+            assigned_ip,
+            relay_auth_mode,
+            split_tunnel_active,
+            tunneled_processes,
+            relay_status,
+            ..
+        } => VpnStateResponse {
+            game_route: None,
+            state: "connected".to_string(),
+            region: Some(server_region),
+            server_endpoint: Some(server_endpoint),
+            assigned_ip: Some(assigned_ip),
+            relay_auth_mode: Some(relay_auth_mode),
+            split_tunnel_active,
+            tunneled_processes,
+            error: None,
+            relay_status,
+        },
+        swifttunnel_core::vpn::ConnectionState::Disconnecting => VpnStateResponse {
+            game_route: None,
+            state: "disconnecting".to_string(),
+            region: None,
+            server_endpoint: None,
+            assigned_ip: None,
+            relay_auth_mode: None,
+            split_tunnel_active: false,
+            tunneled_processes: vec![],
+            error: None,
+            relay_status: None,
+        },
+        swifttunnel_core::vpn::ConnectionState::Error(msg) => VpnStateResponse {
+            game_route: None,
+            state: "error".to_string(),
+            region: None,
+            server_endpoint: None,
+            assigned_ip: None,
+            relay_auth_mode: None,
+            split_tunnel_active: false,
+            tunneled_processes: vec![],
+            error: Some(msg),
+            relay_status: None,
+        },
+    }
+}
+
+fn resolve_discord_region(
+    conn_state: &swifttunnel_core::vpn::ConnectionState,
+    requested_region: &str,
+) -> String {
+    match conn_state {
+        swifttunnel_core::vpn::ConnectionState::Connected { server_region, .. }
+            if !server_region.trim().is_empty() =>
+        {
+            server_region.clone()
+        }
+        _ => requested_region.to_string(),
+    }
+}
+
+pub(crate) fn parse_game_presets(
+    game_presets: &[String],
+) -> HashSet<swifttunnel_core::vpn::GamePreset> {
+    game_presets
+        .iter()
+        .filter_map(|preset| {
+            let normalized = preset.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "roblox" => Some(swifttunnel_core::vpn::GamePreset::Roblox),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn build_binding_preflight(
+    settings: &mut swifttunnel_core::settings::AppSettings,
+) -> Result<BindingPreflightInfo, String> {
+    build_binding_preflight_with_repair(settings, false)
+}
+
+pub(crate) fn build_connect_binding_preflight(
+    settings: &mut swifttunnel_core::settings::AppSettings,
+) -> Result<BindingPreflightInfo, String> {
+    build_binding_preflight_with_repair(settings, true)
+}
+
+fn build_binding_preflight_with_repair(
+    settings: &mut swifttunnel_core::settings::AppSettings,
+    repair_winpkfilter_binding: bool,
+) -> Result<BindingPreflightInfo, String> {
+    validated_binding_preflight(settings, repair_winpkfilter_binding).map(|(info, _)| info)
+}
+
+fn validated_binding_preflight(
+    settings: &mut swifttunnel_core::settings::AppSettings,
+    repair_winpkfilter_binding: bool,
+) -> Result<
+    (
+        BindingPreflightInfo,
+        Option<swifttunnel_core::vpn::AdapterBindingPreference>,
+    ),
+    String,
+> {
+    let mut binding_preference = current_binding_preference(settings)?;
+    let preflight = if repair_winpkfilter_binding {
+        preflight_binding_for_connect(binding_preference.clone()).map_err(|e| e.to_string())?
+    } else {
+        preflight_binding(binding_preference.clone()).map_err(|e| e.to_string())?
+    };
+
+    if let Some(preference) = &binding_preference
+        && preference.source == BindingPreferenceSource::RememberedAuto
+        && !preflight.cached_override_used
+        && preflight.recommended_guid.as_deref() != Some(preference.guid.as_str())
+    {
+        settings
+            .network_binding_overrides
+            .remove(&preference.network_signature.clone().unwrap_or_default());
+        binding_preference = None;
+    }
+
+    Ok((preflight, binding_preference))
+}
+
+fn apply_connected_session_settings(
+    settings: &mut swifttunnel_core::settings::AppSettings,
+    region: &str,
+) {
+    settings.last_connected_region = Some(region.to_string());
+    settings.resume_vpn_on_startup = true;
+}
+
+fn apply_disconnected_session_settings(settings: &mut swifttunnel_core::settings::AppSettings) {
+    settings.resume_vpn_on_startup = false;
+}
+
+async fn persist_session_settings(
+    state: &AppState,
+    connected_region: Option<&str>,
+) -> Result<(), String> {
+    let observed = state.vpn_state_handle.borrow().clone();
+    let state_handle = state.vpn_state_handle.clone();
+    let settings = state.settings.clone();
+    let region = connected_region.map(str::to_owned);
+    tauri::async_runtime::spawn_blocking(move || {
+        persist_session_settings_with(
+            &settings,
+            region.as_deref(),
+            &observed,
+            || state_handle.borrow().clone(),
+            swifttunnel_core::settings::save_settings,
+        )
+    })
+    .await
+    .map_err(|error| format!("Connection settings save could not finish: {error}"))?
+}
+
+fn persist_session_settings_with(
+    settings: &parking_lot::Mutex<swifttunnel_core::settings::AppSettings>,
+    connected_region: Option<&str>,
+    observed: &swifttunnel_core::vpn::ConnectionState,
+    current: impl FnOnce() -> swifttunnel_core::vpn::ConnectionState,
+    persist: impl FnOnce(&swifttunnel_core::settings::AppSettings) -> Result<(), String>,
+) -> Result<(), String> {
+    use swifttunnel_core::vpn::ConnectionState;
+    let mut settings = settings.lock();
+    // Inspect the live session only after acquiring the writer lock. A queued
+    // connect/disconnect save must never overwrite a newer session's intent.
+    // Clone and release the watch borrow before file I/O so state publication
+    // does not have to wait for storage.
+    let current = current();
+    if connected_region.is_some() {
+        if !matches!((observed, &current),
+            (ConnectionState::Connected { since: old, .. }, ConnectionState::Connected { since: new, .. }) if old == new)
+        {
+            return Ok(());
+        }
+    } else if matches!(current, ConnectionState::Connected { .. }) {
+        return Ok(());
+    }
+    if let Some(region) = connected_region {
+        apply_connected_session_settings(&mut settings, region);
+    } else {
+        apply_disconnected_session_settings(&mut settings);
+    }
+    // Keep the safer in-memory intent after a failed write. All other writers
+    // use this same lock through persistence, so unrelated changes stay ordered.
+    persist(&settings)
+}
+
+fn vpn_error_is_user_banned(error: &VpnError) -> bool {
+    matches!(error, VpnError::UserBanned(_))
+}
+
+async fn emit_ban_cleanup(app: &AppHandle, state: &AppState) {
+    let emitted = crate::commands::auth::apply_ban_cleanup(app, state).await;
+    if !emitted {
+        crate::commands::auth::emit_auth_state(app, state).await;
+    }
+}
+
+async fn mark_and_emit_ban_cleanup(app: &AppHandle, state: &AppState, reason: &str) {
+    let mark_result = {
+        let auth = state.auth_manager.lock().await;
+        auth.mark_current_session_banned(reason)
+    };
+    if let Err(e) = mark_result {
+        log::warn!("Failed to mark session banned after VPN ban signal: {}", e);
+    }
+
+    emit_ban_cleanup(app, state).await;
+}
+
+/// Sign the user out when their session is the thing that failed.
+///
+/// A dead session surfaced as "not authorized" on every connect attempt while
+/// leaving the user apparently signed in, so the only way out was to log out and
+/// back in — which nobody guesses. Ending the session puts them on the sign-in
+/// screen, where the fix is the obvious next action rather than a secret.
+///
+/// Only for errors that mean the session itself is finished. A network blip or a
+/// server-side fault must not throw someone out of the app.
+async fn sign_out_if_session_dead(app: &AppHandle, state: &AppState, error: &AuthError) {
+    if !matches!(
+        error,
+        AuthError::RefreshTokenInvalid | AuthError::NotAuthenticated
+    ) {
+        return;
+    }
+
+    log::warn!("Session rejected during connect; signing out so the user can sign back in");
+
+    {
+        let auth = state.auth_manager.lock().await;
+        if let Err(e) = auth.logout() {
+            log::warn!("Failed to clear the dead session: {}", e);
+        }
+    }
+
+    // Tells the UI to drop to the sign-in screen. Without this the app keeps
+    // rendering as signed in against a session that no longer exists.
+    crate::commands::auth::emit_auth_state(app, state).await;
+}
+
+async fn handle_connect_auth_error(app: &AppHandle, state: &AppState, error: AuthError) -> String {
+    let message = error.to_string();
+    if let AuthError::UserBanned(reason) = error {
+        mark_and_emit_ban_cleanup(app, state, &reason).await;
+    } else {
+        sign_out_if_session_dead(app, state, &error).await;
+    }
+    message
+}
+
+/// Tear down the live VPN session and drop all in-memory state that points at
+/// it. Always clears the published split-tunnel handle, sets Discord idle, and
+/// persists the disconnected session — even when the driver-level disconnect
+/// returns an error, because at that point the driver state is undefined and
+/// we'd rather report `None` to the UI (and refuse to auto-resume on next
+/// launch) than leave a stale handle or a stale `resume_vpn_on_startup` flag.
+///
+/// Shared between `vpn_disconnect` (explicit user action) and the in-app
+/// uninstall path in `commands::system`, which needs the same teardown
+/// ordering before it queues the NSIS uninstaller.
+pub(crate) async fn disconnect_and_persist(state: &AppState) -> Result<(), String> {
+    let mut vpn = state.vpn_connection.lock().await;
+    let result = vpn
+        .disconnect()
+        .await
+        .map_err(|e| swifttunnel_core::vpn::user_friendly_error(&e));
+    // Clear the published handles whether disconnect succeeded or not — on
+    // failure the driver state is undefined and we'd rather report None to
+    // the UI than hand it a stale pointer.
+    *state.split_tunnel_handle.write() = None;
+    *state.throughput_stats.write() = None;
+    drop(vpn);
+
+    {
+        let mut discord = state.discord_manager.lock();
+        discord.set_idle();
+    }
+
+    // Always persist the disconnected session. If disconnect failed the
+    // driver is in an unknown state, so clearing `resume_vpn_on_startup` is
+    // safer than letting the app auto-resume into it on next launch.
+    if let Err(e) = persist_session_settings(state, None).await {
+        log::warn!("Failed to persist disconnected session settings: {}", e);
+    }
+
+    result
+}
+
+async fn cleanup_terminal_vpn_error(state: &AppState) {
+    let mut vpn = state.vpn_connection.lock().await;
+    if !vpn.take_terminal_cleanup_request() {
+        return;
+    }
+
+    vpn.cleanup_after_terminal_error().await;
+    *state.split_tunnel_handle.write() = None;
+    *state.throughput_stats.write() = None;
+    drop(vpn);
+
+    state.discord_manager.lock().set_idle();
+
+    if let Err(e) = persist_session_settings(state, None).await {
+        log::warn!("Failed to persist terminal VPN cleanup: {}", e);
+    }
+}
+
+fn vpn_state_event(conn_state: swifttunnel_core::vpn::ConnectionState) -> VpnStateEvent {
+    let response = map_vpn_state(conn_state);
+    VpnStateEvent {
+        state: response.state,
+        region: response.region,
+        server_endpoint: response.server_endpoint,
+        assigned_ip: response.assigned_ip,
+        error: response.error,
+    }
+}
+
+/// Subscribe to VPN state transitions and bridge each one to the
+/// `VPN_STATE_CHANGED` Tauri event.
+///
+/// `VpnConnection` publishes every state change (explicit `set_state`, the
+/// relay-health / auto-routing / process-monitor in-place updates, and
+/// `switch_server`) through a single `tokio::sync::watch` channel. This
+/// bridge is the ONLY place that forwards those updates to the UI, which
+/// is why individual command handlers no longer need to emit manually —
+/// any code path that reaches `self.state` is already covered.
+pub(crate) fn spawn_vpn_state_bridge(
+    app: AppHandle,
+    mut rx: tokio::sync::watch::Receiver<swifttunnel_core::vpn::ConnectionState>,
+) {
+    tauri::async_runtime::spawn(async move {
+        // The initial value is marked unseen on `subscribe()`, so the first
+        // `changed()` returns immediately and the UI gets a definitive
+        // snapshot right after startup. Subsequent iterations wake only on
+        // actual transitions.
+        loop {
+            let conn_state = rx.borrow_and_update().clone();
+            let terminal_error = matches!(
+                &conn_state,
+                swifttunnel_core::vpn::ConnectionState::Error(_)
+            );
+            let _ = app.emit(VPN_STATE_CHANGED, vpn_state_event(conn_state));
+            if terminal_error {
+                let state = app.state::<AppState>();
+                cleanup_terminal_vpn_error(state.inner()).await;
+            }
+            if rx.changed().await.is_err() {
+                // Sender dropped — the VpnConnection is gone, which only
+                // happens during app teardown. Stop the bridge cleanly.
+                break;
+            }
+        }
+    });
+}
+
+#[tauri::command]
+pub async fn vpn_get_state(state: State<'_, AppState>) -> Result<VpnStateResponse, String> {
+    // Read the inner state Arc directly so we don't have to wait on the
+    // outer vpn_connection mutex while a connect or disconnect is mid-flight.
+    let conn_state = state.vpn_state_handle.borrow().clone();
+    let mut response = map_vpn_state(conn_state);
+    if response.state == "connected" {
+        if let Ok(vpn) = state.vpn_connection.try_lock() {
+            response.game_route = vpn
+                .auto_router()
+                .and_then(|router| router.game_route_status());
+        }
+    }
+    Ok(response)
+}
+
+#[tauri::command]
+pub async fn vpn_preflight_binding(
+    state: State<'_, AppState>,
+    _region: String,
+    _game_presets: Vec<String>,
+) -> Result<BindingPreflightInfo, String> {
+    let (_, _, preflight) = binding_snapshot(state.settings.clone(), true).await?;
+    Ok(preflight)
+}
+
+#[tauri::command]
+pub async fn vpn_connect(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    region: String,
+    game_presets: Vec<String>,
+    game_region: Option<bool>,
+) -> Result<(), String> {
+    // Startup crash-recovery (stale adapter/tunnel-mode reset) runs in the
+    // background so launch is instant - but a tunnel must never start while
+    // adapters are mid-reset. Normally done long before anyone can click
+    // Connect; bounded so a wedged recovery can't brick connecting forever.
+    swifttunnel_core::vpn::connect_policy::wait_for_startup_recovery(
+        state.startup_recovery_done.clone(),
+        Duration::from_secs(20),
+    )
+    .await?;
+
+    // Commands can also be invoked without the UI preflight. Preserve their
+    // repair behavior, but run Windows checks off async executor threads.
+    let (mut settings_snapshot, binding_preference, preflight) =
+        binding_snapshot(state.settings.clone(), true).await?;
+    if preflight.status != "ok" {
+        return Err(preflight.reason);
+    }
+
+    if game_region == Some(true) {
+        // A game-specific region is deliberate. Keep the user's saved Auto
+        // and manual relay preferences intact, but don't let them replace this
+        // one connection's requested datacenter route.
+        if !settings_snapshot.custom_relay_server.is_empty() {
+            return Err("Game region routing is unavailable while a custom relay is configured. Use your current connection or clear the custom relay first.".into());
+        }
+        settings_snapshot.auto_routing_enabled = false;
+        settings_snapshot.manual_relay = None;
+        settings_snapshot.whitelisted_regions.clear();
+    }
+
+    let (
+        custom_relay,
+        mut auto_routing,
+        whitelisted_regions,
+        game_process_performance,
+        enable_api_tunneling,
+        enable_country_ban,
+    ) = (
+        if settings_snapshot.custom_relay_server.is_empty() {
+            None
+        } else {
+            Some(settings_snapshot.custom_relay_server.clone())
+        },
+        settings_snapshot.auto_routing_enabled,
+        settings_snapshot.whitelisted_regions.clone(),
+        settings_snapshot.game_process_performance,
+        settings_snapshot.enable_api_tunneling,
+        settings_snapshot.enable_country_ban,
+    );
+    if custom_relay.is_some() && auto_routing {
+        log::info!("Auto-routing disabled for this session because custom_relay_server is set");
+        auto_routing = false;
+    }
+
+    let preset_set = parse_game_presets(&game_presets);
+    let tunnel_apps = swifttunnel_core::vpn::get_apps_for_preset_set(&preset_set);
+
+    // Refresh before choosing endpoints: a saved id may now name a new box.
+    // The total wait is bounded and an API outage retains the last usable list.
+    if custom_relay.is_none() {
+        match swifttunnel_core::vpn::servers::fetch_server_list_for_connect().await {
+            Ok(data) => {
+                state.server_list.lock().update(
+                    data.servers,
+                    data.regions,
+                    swifttunnel_core::vpn::servers::ServerListSource::Api,
+                );
+                let _ = app.emit(SERVER_LIST_UPDATED, "API");
+            }
+            Err(error) => {
+                log::warn!("Fleet refresh before connect failed; retaining last list: {error}")
+            }
+        }
+    }
+
+    // Build available_servers list from the dynamic server list
+    let (connect_region, available_servers): (String, Vec<(String, SocketAddr, Option<u32>)>) = {
+        let sl = state.server_list.lock();
+        connect_candidates(
+            &sl,
+            &region,
+            auto_routing,
+            settings_snapshot
+                .manual_relay
+                .as_ref()
+                .filter(|_| custom_relay.is_none()),
+        )?
+    };
+    if connect_region != region {
+        log::info!(
+            "Auto-routing: initial connect region resolved from '{}' to '{}' using ping-test latency cache",
+            region,
+            connect_region
+        );
+    }
+
+    {
+        let mut discord = state.discord_manager.lock();
+        discord.set_connecting(&connect_region);
+    }
+
+    // Get access token
+    let access_token = {
+        let auth = state.auth_manager.lock().await;
+        match auth.get_access_token().await {
+            Ok(token) => token,
+            Err(e) => {
+                drop(auth);
+                return Err(handle_connect_auth_error(&app, &state, e).await);
+            }
+        }
+    };
+
+    let mut vpn = state.vpn_connection.lock().await;
+    // Auto-routing fetches relay tickets for mid-session switches through
+    // the shared auth manager.
+    vpn.set_auth_manager(state.auth_manager.clone());
+    vpn.set_regional_auto_scope(swifttunnel_core::vpn::connect_policy::regional_auto_scope(
+        &settings_snapshot,
+        &region,
+    ));
+    let connect_result = tokio::time::timeout(
+        VPN_CONNECT_COMMAND_TIMEOUT,
+        vpn.connect(
+            &access_token,
+            &connect_region,
+            tunnel_apps,
+            custom_relay,
+            auto_routing,
+            available_servers,
+            whitelisted_regions,
+            binding_preference,
+            game_process_performance,
+            enable_api_tunneling,
+            enable_country_ban,
+        ),
+    )
+    .await;
+
+    let country_ban_bypass_failure = vpn.take_country_ban_bypass_failure();
+
+    let mut connect_ban_reason = None;
+    let mut connect_session_expired = false;
+    let result = match connect_result {
+        Ok(result) => result.map_err(|e| {
+            if vpn_error_is_user_banned(&e)
+                && let VpnError::UserBanned(reason) = &e
+            {
+                connect_ban_reason = Some(reason.clone());
+            }
+            if matches!(e, VpnError::SessionExpired) {
+                connect_session_expired = true;
+            }
+            swifttunnel_core::vpn::user_friendly_error(&e)
+        }),
+        Err(_) => {
+            log::error!(
+                "vpn_connect timed out after {}s; cleaning up partial tunnel state",
+                VPN_CONNECT_COMMAND_TIMEOUT.as_secs()
+            );
+            let cleanup_result = vpn
+                .disconnect()
+                .await
+                .map_err(|e| swifttunnel_core::vpn::user_friendly_error(&e));
+            let mut message = format!(
+                "VPN connection timed out after {}s. SwiftTunnel stopped this connect attempt and cleaned up the partial tunnel state.",
+                VPN_CONNECT_COMMAND_TIMEOUT.as_secs()
+            );
+            if let Err(cleanup_error) = cleanup_result {
+                log::warn!("vpn_connect timeout cleanup also failed: {}", cleanup_error);
+                message.push_str(" Cleanup after the timeout also failed: ");
+                message.push_str(&cleanup_error);
+            }
+            Err(message)
+        }
+    };
+
+    if result.is_ok()
+        && let Some(reason) = country_ban_bypass_failure
+    {
+        log::warn!("Country ban bypass unavailable after connect: {reason}");
+        let _ = app.emit(COUNTRY_BAN_BYPASS_UNAVAILABLE, ());
+    }
+
+    if result.is_ok() {
+        // Publish the inner split-tunnel driver handle so polling commands
+        // can read throughput/diagnostics/ping without queuing behind the
+        // outer vpn_connection mutex.
+        let driver_handle = vpn.split_tunnel_handle();
+        // Also publish the interceptor's atomic throughput counters. The
+        // driver mutex can be busy for long stretches (process scans,
+        // auto-routing), so the 1Hz+ throughput poll must not depend on
+        // winning a try_lock against it. Locking here once is fine: connect
+        // has just finished, and this is an async command handler.
+        let throughput = match driver_handle.as_ref() {
+            Some(handle) => handle.lock().await.get_throughput_stats(),
+            None => None,
+        };
+        *state.split_tunnel_handle.write() = driver_handle;
+        *state.throughput_stats.write() = throughput;
+    } else {
+        *state.split_tunnel_handle.write() = None;
+        *state.throughput_stats.write() = None;
+    }
+    drop(vpn);
+
+    if let Some(reason) = connect_ban_reason {
+        mark_and_emit_ban_cleanup(&app, &state, &reason).await;
+    } else if connect_session_expired {
+        // Deliberately after the teardown above, so the tunnel is already down
+        // before the UI drops to the sign-in screen.
+        sign_out_if_session_dead(&app, &state, &AuthError::RefreshTokenInvalid).await;
+    }
+
+    let discord_region = if result.is_ok() {
+        let conn_state = state.vpn_state_handle.borrow().clone();
+        Some(resolve_discord_region(&conn_state, &connect_region))
+    } else {
+        None
+    };
+
+    {
+        let mut discord = state.discord_manager.lock();
+        if let Some(ref connected_region) = discord_region {
+            discord.set_connected(connected_region);
+        } else {
+            discord.set_idle();
+        }
+    }
+
+    if result.is_ok()
+        && let Err(e) = persist_session_settings(&state, Some(&connect_region)).await
+    {
+        log::warn!("Failed to persist connected session settings: {}", e);
+    }
+
+    // No manual emit here — `spawn_vpn_state_bridge` forwards every
+    // state transition published by `VpnConnection` to the UI.
+    result
+}
+
+#[tauri::command]
+pub async fn vpn_disconnect(state: State<'_, AppState>) -> Result<(), String> {
+    disconnect_and_persist(&state).await
+}
+
+/// Attempts `try_lock` a few times with a short yield between tries.
+///
+/// A read-only UI poll must not block behind the packet path, so a plain
+/// `.lock().await` is out. But a single `try_lock` gives up on contention that
+/// lasts microseconds, which under live traffic is most of the time. Bounded
+/// retries keep the non-blocking guarantee while making a successful read the
+/// normal outcome instead of a coin flip.
+async fn try_lock_briefly<T>(
+    handle: &tokio::sync::Mutex<T>,
+) -> Option<tokio::sync::MutexGuard<'_, T>> {
+    const ATTEMPTS: usize = 5;
+    for attempt in 0..ATTEMPTS {
+        if let Ok(guard) = handle.try_lock() {
+            return Some(guard);
+        }
+        if attempt + 1 < ATTEMPTS {
+            tokio::task::yield_now().await;
+        }
+    }
+    None
+}
+
+#[tauri::command]
+pub async fn vpn_get_ping(state: State<'_, AppState>) -> Result<Option<u32>, String> {
+    // Read both the relay ping snapshot and the current relay address from
+    // the split-tunnel driver handle directly so we don't have to wait on
+    // the outer vpn_connection mutex while connect/disconnect is in flight.
+    let driver = state.split_tunnel_handle.read().clone();
+    let (relay_ping, relay_addr) = match driver {
+        // try_lock, not lock: this must never block the UI behind the packet
+        // path. But a single failed attempt is far too eager — the lock is
+        // routinely held for microseconds while traffic flows, and giving up
+        // discarded the relay address too, so the whole command returned None
+        // and the reading blanked to an em dash mid-session. Retry briefly;
+        // this still cannot stall, and in practice the first or second attempt
+        // wins.
+        Some(handle) => match try_lock_briefly(&handle).await {
+            Some(driver) => {
+                let snapshot = driver
+                    .get_relay_context()
+                    .map(|relay| relay.ping_snapshot());
+                let relay_ping = snapshot.and_then(|snapshot| {
+                    if !snapshot.enabled {
+                        return None;
+                    }
+                    // p99 here would mislead the UI: it's the worst-case tail,
+                    // not the current ping. Stick to last_rtt and fall back to
+                    // median only.
+                    snapshot.last_rtt_ms.or(snapshot.p50_rtt_ms)
+                });
+                let relay_addr = driver.current_relay_addr();
+                (relay_ping, relay_addr)
+            }
+            None => (None, None),
+        },
+        None => (None, None),
+    };
+
+    // Preferred source: in-tunnel relay RTT telemetry from control-plane ping/pong.
+    // This keeps ping populated even when ICMP is blocked or rate-limited.
+    if relay_ping.is_some() {
+        return Ok(relay_ping);
+    }
+
+    let addr = match relay_addr {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+
+    let ip = addr.ip().to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        swifttunnel_core::vpn::servers::measure_latency_icmp(&ip)
+    })
+    .await
+    .map_err(|e| format!("Ping task failed: {}", e))?;
+
+    Ok(result)
+}
+
+#[derive(Serialize)]
+pub struct FreeTierQuota {
+    /// Seconds of free relay time left, or `None` when no limit applies.
+    pub remaining_seconds: Option<i64>,
+    /// Total allowance the remaining figure counts down from.
+    pub limit_seconds: Option<i64>,
+    /// Seconds of grace left once the allowance is spent, `None` otherwise.
+    /// While this is set the backend is still issuing leases, so the client
+    /// warns and keeps the session up rather than hanging up at zero.
+    pub grace_seconds: Option<i64>,
+}
+
+/// Latest free-tier budget reported by the backend.
+///
+/// The shared native clock subtracts connected time since the latest ticket.
+/// Repeated reads cannot restore time that has already elapsed. The UI only
+/// smooths this display; native core owns warnings and the local cutoff.
+#[tauri::command]
+pub async fn vpn_get_free_tier() -> Result<FreeTierQuota, String> {
+    let (remaining_seconds, limit_seconds) = swifttunnel_core::vpn::connection::free_tier_quota();
+    Ok(FreeTierQuota {
+        remaining_seconds,
+        limit_seconds,
+        grace_seconds: swifttunnel_core::vpn::connection::free_tier_grace_seconds(),
+    })
+}
+
+#[derive(Serialize)]
+pub struct ThroughputResponse {
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+    pub packets_tunneled: u64,
+    pub packets_bypassed: u64,
+}
+
+#[tauri::command]
+pub async fn vpn_get_throughput(
+    state: State<'_, AppState>,
+) -> Result<Option<ThroughputResponse>, String> {
+    // Read the throughput counters published at connect time. These are
+    // shared atomics, so this never contends on the driver mutex — the old
+    // try_lock path made the graph read zero whenever the driver was busy.
+    let mut stats = state.throughput_stats.read().clone();
+
+    if stats.is_none() {
+        // Fallback for sessions where the counters were not published (e.g.
+        // the interceptor was rebuilt outside vpn_connect). Opportunistic
+        // try_lock: a miss just means we report None this tick.
+        let driver = state.split_tunnel_handle.read().clone();
+        stats = match driver {
+            Some(handle) => handle
+                .try_lock()
+                .ok()
+                .and_then(|driver| driver.get_throughput_stats()),
+            None => None,
+        };
+        if stats.is_some() {
+            *state.throughput_stats.write() = stats.clone();
+        }
+    }
+
+    // bytes_up/bytes_down are what the UI graphs: total game traffic handled
+    // by SwiftTunnel — relayed bytes plus classified direct flows (TCP
+    // without Route Assist, whitelisted-region bypass).
+    Ok(stats.map(|stats| ThroughputResponse {
+        bytes_up: stats.get_bytes_tx() + stats.get_bytes_direct_tx(),
+        bytes_down: stats.get_bytes_rx() + stats.get_bytes_direct_rx(),
+        packets_tunneled: 0,
+        packets_bypassed: 0,
+    }))
+}
+
+#[derive(Serialize)]
+pub struct DiagnosticsResponse {
+    pub adapter_name: Option<String>,
+    pub adapter_guid: Option<String>,
+    pub selected_if_index: Option<u32>,
+    pub resolved_if_index: Option<u32>,
+    pub has_default_route: bool,
+    pub route_resolution_source: Option<String>,
+    pub route_resolution_target_ip: Option<String>,
+    pub manual_binding_active: bool,
+    pub binding_reason: String,
+    pub binding_stage: String,
+    pub cached_override_used: bool,
+    pub network_signature: Option<String>,
+    pub last_validation_result: String,
+    pub packets_tunneled: u64,
+    pub packets_bypassed: u64,
+}
+
+#[tauri::command]
+pub async fn vpn_get_diagnostics(
+    state: State<'_, AppState>,
+) -> Result<Option<DiagnosticsResponse>, String> {
+    let driver = state.split_tunnel_handle.read().clone();
+    let diag = match driver {
+        Some(handle) => handle
+            .try_lock()
+            .ok()
+            .and_then(|driver| driver.get_diagnostics()),
+        None => None,
+    };
+    Ok(diag.map(|diag| DiagnosticsResponse {
+        adapter_name: diag.adapter_name,
+        adapter_guid: diag.adapter_guid,
+        selected_if_index: diag.selected_if_index,
+        resolved_if_index: diag.resolved_if_index,
+        has_default_route: diag.has_default_route,
+        route_resolution_source: Some(diag.route_resolution_source),
+        route_resolution_target_ip: diag.route_resolution_target_ip,
+        manual_binding_active: diag.manual_binding_active,
+        binding_reason: diag.binding_reason,
+        binding_stage: diag.binding_stage,
+        cached_override_used: diag.cached_override_used,
+        network_signature: diag.network_signature,
+        last_validation_result: diag.last_validation_result,
+        packets_tunneled: diag.packets_tunneled,
+        packets_bypassed: diag.packets_bypassed,
+    }))
+}
+
+#[tauri::command]
+pub async fn vpn_list_network_adapters()
+-> Result<Vec<swifttunnel_core::vpn::NetworkAdapterInfo>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        swifttunnel_core::vpn::list_network_adapters().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Adapter enumeration task failed: {e}"))?
+}
+
+// --- Server commands ---
+
+#[derive(Serialize)]
+pub struct ServerRegionResponse {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub country_code: String,
+    pub servers: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct ServerInfoResponse {
+    pub region: String,
+    pub name: String,
+    pub country_code: String,
+    pub ip: String,
+    pub port: u16,
+    pub relay_available: bool,
+    pub relay_port: Option<u16>,
+}
+
+#[derive(Serialize)]
+pub struct ServerListResponse {
+    pub regions: Vec<ServerRegionResponse>,
+    pub servers: Vec<ServerInfoResponse>,
+    pub source: String,
+}
+
+#[tauri::command]
+pub async fn server_get_list(state: State<'_, AppState>) -> Result<ServerListResponse, String> {
+    let server_list = state.server_list.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let sl = server_list.lock();
+        ServerListResponse {
+            regions: sl
+                .regions()
+                .iter()
+                .map(|r| ServerRegionResponse {
+                    id: r.id.clone(),
+                    name: r.name.clone(),
+                    description: r.description.clone(),
+                    country_code: r.country_code.clone(),
+                    servers: r.servers.clone(),
+                })
+                .collect(),
+            servers: sl
+                .servers()
+                .iter()
+                .map(|s| ServerInfoResponse {
+                    region: s.region.clone(),
+                    name: s.name.clone(),
+                    country_code: s.country_code.clone(),
+                    ip: s.ip.clone(),
+                    port: s.port,
+                    relay_available: s.relay_available,
+                    relay_port: s.relay_port,
+                })
+                .collect(),
+            source: sl.source.to_string(),
+        }
+    })
+    .await
+    .map_err(|e| format!("Server list task failed: {}", e))
+}
+
+#[derive(Serialize)]
+pub struct LatencyEntry {
+    pub region: String,
+    pub latency_ms: Option<u32>,
+    pub server_id: Option<String>,
+    pub preview: Option<swifttunnel_core::vpn::route_preview::ReferenceEstimate>,
+}
+
+const LATENCY_PROBE_CONCURRENCY: usize = 8;
+
+fn build_latency_probe_targets(
+    sl: &swifttunnel_core::vpn::servers::DynamicServerList,
+) -> Vec<(String, String, u16)> {
+    sl.servers()
+        .iter()
+        .filter(|server| server.relay_available)
+        .map(|server| {
+            (
+                server.region.clone(),
+                server.ip.clone(),
+                server.effective_relay_port(),
+            )
+        })
+        .collect()
+}
+
+fn apply_latency_measurements(
+    sl: &mut swifttunnel_core::vpn::servers::DynamicServerList,
+    measurements: &[(String, String, u16, Option<u32>)],
+) -> Vec<LatencyEntry> {
+    for (server_id, ip, port, latency) in measurements {
+        sl.set_endpoint_latency(server_id, ip, *port, *latency);
+    }
+
+    sl.regions()
+        .iter()
+        .map(|region| LatencyEntry {
+            region: region.id.clone(),
+            latency_ms: region
+                .servers
+                .iter()
+                .filter_map(|id| {
+                    sl.get_server(id)
+                        .filter(|server| server.relay_available)
+                        .and_then(|_| sl.get_display_latency(id))
+                })
+                .min(),
+            server_id: None,
+            preview: None,
+        })
+        .chain(sl.servers().iter().map(|server| LatencyEntry {
+            region: server.region.clone(),
+            latency_ms: if server.relay_available {
+                sl.get_display_latency(&server.region)
+            } else {
+                None
+            },
+            server_id: Some(server.region.clone()),
+            preview: None,
+        }))
+        .collect()
+}
+
+fn select_best_server_in_region(
+    sl: &swifttunnel_core::vpn::servers::DynamicServerList,
+    region_id: &str,
+) -> Option<String> {
+    let region = sl.get_region(region_id)?;
+    let mut best: Option<(String, u32)> = None;
+    for server_id in &region.servers {
+        if !sl
+            .get_server(server_id)
+            .is_some_and(|server| server.relay_available)
+        {
+            continue;
+        }
+        if let Some(latency) = sl.get_latency(server_id)
+            && best.as_ref().is_none_or(|(_, best_ms)| latency < *best_ms)
+        {
+            best = Some((server_id.clone(), latency));
+        }
+    }
+    best.map(|(id, _)| id).or_else(|| {
+        region
+            .servers
+            .iter()
+            .find(|server_id| {
+                sl.get_server(server_id)
+                    .is_some_and(|server| server.relay_available)
+            })
+            .cloned()
+    })
+}
+
+#[tauri::command]
+pub async fn server_get_latencies(
+    state: State<'_, AppState>,
+    cached_only: Option<bool>,
+) -> Result<Vec<LatencyEntry>, String> {
+    if cached_only.unwrap_or(false) {
+        // A picker opened/reloaded during a game may need its last readings,
+        // but must not start fleet probes or make old readings fresh for Auto.
+        return Ok(apply_latency_measurements(
+            &mut state.server_list.lock(),
+            &[],
+        ));
+    }
+    let probes = {
+        let sl = state.server_list.lock();
+        build_latency_probe_targets(&sl)
+    };
+
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut measured: Vec<(String, String, u16, Option<u32>)> = Vec::with_capacity(probes.len());
+    for (server_id, ip, port) in probes {
+        if tasks.len() >= LATENCY_PROBE_CONCURRENCY
+            && let Some(result) = tasks.join_next().await
+            && let Ok(sample) = result
+        {
+            measured.push(sample);
+        }
+        tasks.spawn(async move {
+            let probe_ip = ip.clone();
+            // V3 relays do not echo unauthenticated probes. Use ICMP.
+            // measure_latency_icmp blocks for up to 2s — keep it off the
+            // async runtime's worker threads.
+            let latency = tokio::task::spawn_blocking(move || {
+                swifttunnel_core::vpn::servers::measure_latency_icmp(&probe_ip)
+            })
+            .await
+            .unwrap_or(None);
+            (server_id, ip, port, latency)
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        if let Ok(sample) = result {
+            measured.push(sample);
+        }
+    }
+
+    let samples = swifttunnel_core::vpn::route_preview::fetch().await;
+    let (mut entries, available_servers, regions) = {
+        let mut sl = state.server_list.lock();
+        let entries = apply_latency_measurements(&mut sl, &measured);
+        let available_servers = build_available_servers(&sl);
+        (entries, available_servers, sl.regions().to_vec())
+    };
+
+    let previews =
+        swifttunnel_core::vpn::route_preview::estimates(&available_servers, &samples, &regions);
+    state.games.lock().previews = previews.clone();
+    for entry in &mut entries {
+        entry.preview = previews
+            .iter()
+            .find(|row| entry.server_id.as_deref() == Some(&row.estimate.relay))
+            .cloned();
+    }
+    sync_auto_router_available_servers(&state.vpn_connection, available_servers);
+
+    Ok(entries)
+}
+
+fn sync_auto_router_available_servers(
+    connection: &tokio::sync::Mutex<swifttunnel_core::vpn::VpnConnection>,
+    available_servers: Vec<(String, SocketAddr, Option<u32>)>,
+) {
+    let auto_router = {
+        // Connecting owns this lock for up to 90 seconds. Returning measured
+        // pings must not wait for it. The cache is already updated; the next
+        // refresh can hand those readings to the live router after setup.
+        let Ok(vpn) = connection.try_lock() else {
+            return;
+        };
+        vpn.auto_router().cloned()
+    };
+
+    if let Some(router) = auto_router {
+        router.set_available_servers(available_servers);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+    use swifttunnel_core::vpn::servers::{
+        DynamicGamingRegion, DynamicServerInfo, DynamicServerList, ServerListSource,
+    };
+
+    #[tokio::test]
+    async fn latency_handoff_does_not_wait_for_connection_setup() {
+        let connection = tokio::sync::Mutex::new(swifttunnel_core::vpn::VpnConnection::new());
+        let connecting = connection.lock().await;
+        sync_auto_router_available_servers(&connection, vec![]);
+        drop(connecting);
+        sync_auto_router_available_servers(&connection, vec![]);
+    }
+
+    fn make_server(region: &str, ip: &str) -> DynamicServerInfo {
+        make_server_with_port(region, ip, 51821)
+    }
+
+    fn make_server_with_port(region: &str, ip: &str, port: u16) -> DynamicServerInfo {
+        DynamicServerInfo {
+            region: region.to_string(),
+            name: region.to_string(),
+            country_code: "XX".to_string(),
+            ip: ip.to_string(),
+            port,
+            phantun_available: false,
+            phantun_port: None,
+            relay_available: true,
+            relay_port: Some(port),
+            active_users: None,
+            busy: false,
+            full: false,
+            metered: false,
+        }
+    }
+
+    fn make_unavailable_server(region: &str, ip: &str) -> DynamicServerInfo {
+        DynamicServerInfo {
+            relay_available: false,
+            relay_port: None,
+            ..make_server_with_port(region, ip, 51821)
+        }
+    }
+
+    fn make_region(id: &str, servers: &[&str]) -> DynamicGamingRegion {
+        DynamicGamingRegion {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: id.to_string(),
+            country_code: "XX".to_string(),
+            servers: servers.iter().map(|server| (*server).to_string()).collect(),
+        }
+    }
+
+    fn make_dynamic_server_list() -> DynamicServerList {
+        let mut list = DynamicServerList::new_empty();
+        list.update(
+            vec![
+                make_server("singapore", "1.1.1.1"),
+                make_server("singapore-02", "1.1.1.2"),
+                make_server("tokyo-01", "2.2.2.1"),
+            ],
+            vec![
+                make_region("singapore", &["singapore", "singapore-02"]),
+                make_region("tokyo", &["tokyo-01"]),
+            ],
+            ServerListSource::Api,
+        );
+        list
+    }
+
+    #[test]
+    fn vpn_ban_detection_uses_typed_error_only() {
+        assert!(vpn_error_is_user_banned(&VpnError::UserBanned(
+            ": chargeback".to_string()
+        )));
+        assert!(!vpn_error_is_user_banned(&VpnError::Connection(
+            "Account banned appears in unrelated text".to_string()
+        )));
+    }
+
+    fn fake_preflight() -> BindingPreflightInfo {
+        BindingPreflightInfo {
+            status: "ok".into(),
+            reason: String::new(),
+            network_signature: "test".into(),
+            route_resolution_source: "test".into(),
+            route_resolution_target_ip: None,
+            resolved_if_index: None,
+            recommended_guid: None,
+            cached_override_used: false,
+            binding_stage: None,
+            candidates: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn preflight_releases_settings_lock_and_preserves_concurrent_edits() {
+        let settings = parking_lot::Mutex::new(swifttunnel_core::settings::AppSettings::default());
+        let (snapshot, _, _) = binding_snapshot_with(
+            &settings,
+            |_| {
+                let mut current = settings
+                    .try_lock()
+                    .expect("adapter probe must not hold settings");
+                current.selected_region = "tokyo".into();
+                Ok((fake_preflight(), None))
+            },
+            |_| panic!("no settings change needs persistence"),
+        )
+        .unwrap();
+        assert_eq!(snapshot.selected_region, "tokyo");
+        assert_eq!(settings.lock().selected_region, "tokyo");
+    }
+
+    #[test]
+    fn preflight_rejects_a_changed_binding_without_losing_the_new_choice() {
+        let settings = parking_lot::Mutex::new(swifttunnel_core::settings::AppSettings::default());
+        let result = binding_snapshot_with(
+            &settings,
+            |snapshot| {
+                snapshot.network_binding_overrides.clear();
+                settings.lock().preferred_physical_adapter_guid = Some("new-choice".into());
+                Ok((fake_preflight(), None))
+            },
+            |_| panic!("stale validation must not save"),
+        );
+        assert!(result.unwrap_err().contains("choice changed"));
+        assert_eq!(
+            settings.lock().preferred_physical_adapter_guid.as_deref(),
+            Some("new-choice")
+        );
+    }
+
+    #[test]
+    fn preflight_saves_only_merged_settings_and_retains_state_if_save_fails() {
+        let mut original = swifttunnel_core::settings::AppSettings::default();
+        original
+            .network_binding_overrides
+            .insert("test".into(), "stale".into());
+        let settings = parking_lot::Mutex::new(original);
+        let result = binding_snapshot_with(
+            &settings,
+            |snapshot| {
+                snapshot.network_binding_overrides.clear();
+                settings.lock().selected_region = "tokyo".into();
+                Ok((fake_preflight(), None))
+            },
+            |updated| {
+                assert_eq!(updated.selected_region, "tokyo");
+                assert!(updated.network_binding_overrides.is_empty());
+                Err("fixture save failure".into())
+            },
+        );
+        assert_eq!(result.unwrap_err(), "fixture save failure");
+        assert_eq!(
+            settings
+                .lock()
+                .network_binding_overrides
+                .get("test")
+                .map(String::as_str),
+            Some("stale")
+        );
+        assert_eq!(settings.lock().selected_region, "tokyo");
+        let (snapshot, _, _) = binding_snapshot_with(
+            &settings,
+            |snapshot| {
+                snapshot.network_binding_overrides.clear();
+                Ok((fake_preflight(), None))
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(snapshot.network_binding_overrides.is_empty());
+        assert!(settings.lock().network_binding_overrides.is_empty());
+    }
+
+    #[test]
+    fn apply_connected_session_settings_marks_resume_and_region() {
+        let mut settings = swifttunnel_core::settings::AppSettings::default();
+        apply_connected_session_settings(&mut settings, "singapore");
+        assert_eq!(settings.last_connected_region.as_deref(), Some("singapore"));
+        assert!(settings.resume_vpn_on_startup);
+    }
+
+    #[test]
+    fn apply_disconnected_session_settings_clears_resume_flag() {
+        let mut settings = swifttunnel_core::settings::AppSettings {
+            resume_vpn_on_startup: true,
+            ..Default::default()
+        };
+        apply_disconnected_session_settings(&mut settings);
+        assert!(!settings.resume_vpn_on_startup);
+    }
+
+    fn session_fixture(since: Instant) -> swifttunnel_core::vpn::ConnectionState {
+        swifttunnel_core::vpn::ConnectionState::Connected {
+            since,
+            server_region: "tokyo-01".into(),
+            server_endpoint: "192.0.2.1:51821".into(),
+            assigned_ip: "fixture".into(),
+            relay_auth_mode: "authenticated".into(),
+            split_tunnel_active: true,
+            tunneled_processes: Vec::new(),
+            relay_status: None,
+        }
+    }
+
+    #[test]
+    fn delayed_session_saves_cannot_revive_disconnects_or_change_a_replacement_session() {
+        use swifttunnel_core::{settings::AppSettings, vpn::ConnectionState};
+        let settings = parking_lot::Mutex::new(AppSettings::default());
+        let started = Instant::now();
+        let old = session_fixture(started);
+        let replacement = session_fixture(started + Duration::from_secs(1));
+        for (region, observed, current) in [
+            (Some("mumbai"), old.clone(), ConnectionState::Disconnected),
+            (Some("mumbai"), old.clone(), replacement.clone()),
+            (None, ConnectionState::Disconnected, replacement.clone()),
+        ] {
+            persist_session_settings_with(
+                &settings,
+                region,
+                &observed,
+                || current,
+                |_| panic!("stale connection intent must not be persisted"),
+            )
+            .unwrap();
+        }
+        let mut disk = settings.lock().clone();
+        persist_session_settings_with(
+            &settings,
+            Some("tokyo"),
+            &replacement,
+            || replacement.clone(),
+            |snapshot| {
+                disk = snapshot.clone();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(disk.resume_vpn_on_startup);
+        assert_eq!(disk.last_connected_region.as_deref(), Some("tokyo"));
+        persist_session_settings_with(
+            &settings,
+            None,
+            &replacement,
+            || ConnectionState::Disconnected,
+            |snapshot| {
+                disk = snapshot.clone();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!disk.resume_vpn_on_startup);
+    }
+
+    #[test]
+    fn session_save_keeps_unrelated_preferences_in_the_same_writer_order() {
+        use swifttunnel_core::{settings::AppSettings, vpn::ConnectionState};
+        let settings = parking_lot::Mutex::new(AppSettings {
+            resume_vpn_on_startup: true,
+            idle_when_unfocused: true,
+            ..Default::default()
+        });
+        let mut disk = settings.lock().clone();
+        persist_session_settings_with(
+            &settings,
+            None,
+            &ConnectionState::Disconnected,
+            || ConnectionState::Disconnected,
+            |snapshot| {
+                if let Some(mut competing) = settings.try_lock() {
+                    competing.idle_when_unfocused = false;
+                }
+                disk = snapshot.clone();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            disk.idle_when_unfocused,
+            settings.lock().idle_when_unfocused
+        );
+        assert!(!disk.resume_vpn_on_startup);
+        let result = persist_session_settings_with(
+            &settings,
+            None,
+            &ConnectionState::Disconnected,
+            || ConnectionState::Disconnected,
+            |_| Err("storage unavailable".into()),
+        );
+        assert!(result.is_err());
+        assert!(!settings.lock().resume_vpn_on_startup);
+    }
+
+    #[test]
+    fn resolve_discord_region_prefers_connected_server_region() {
+        let conn_state = swifttunnel_core::vpn::ConnectionState::Connected {
+            since: Instant::now(),
+            server_region: "us-east-nj".to_string(),
+            server_endpoint: "1.2.3.4:51821".to_string(),
+            assigned_ip: "V3-Relay".to_string(),
+            relay_auth_mode: "authenticated".to_string(),
+            split_tunnel_active: true,
+            tunneled_processes: vec!["RobloxPlayerBeta.exe".to_string()],
+            relay_status: None,
+        };
+
+        assert_eq!(
+            resolve_discord_region(&conn_state, "na-east"),
+            "us-east-nj".to_string()
+        );
+    }
+
+    #[test]
+    fn resolve_discord_region_falls_back_when_not_connected() {
+        assert_eq!(
+            resolve_discord_region(
+                &swifttunnel_core::vpn::ConnectionState::FetchingConfig,
+                "singapore"
+            ),
+            "singapore".to_string()
+        );
+    }
+
+    #[test]
+    fn resolve_discord_region_falls_back_when_connected_region_empty() {
+        let conn_state = swifttunnel_core::vpn::ConnectionState::Connected {
+            since: Instant::now(),
+            server_region: "   ".to_string(),
+            server_endpoint: "1.2.3.4:51821".to_string(),
+            assigned_ip: "V3-Relay".to_string(),
+            relay_auth_mode: "authenticated".to_string(),
+            split_tunnel_active: true,
+            tunneled_processes: vec![],
+            relay_status: None,
+        };
+
+        assert_eq!(
+            resolve_discord_region(&conn_state, "germany"),
+            "germany".to_string()
+        );
+    }
+
+    #[test]
+    fn build_latency_probe_targets_includes_every_server() {
+        let list = make_dynamic_server_list();
+        let probes = build_latency_probe_targets(&list);
+
+        assert_eq!(probes.len(), 3);
+        assert!(probes.contains(&("singapore".to_string(), "1.1.1.1".to_string(), 51821)));
+        assert!(probes.contains(&("singapore-02".to_string(), "1.1.1.2".to_string(), 51821)));
+        assert!(probes.contains(&("tokyo-01".to_string(), "2.2.2.1".to_string(), 51821)));
+    }
+
+    #[test]
+    fn build_latency_probe_targets_excludes_unavailable_relays() {
+        let mut list = DynamicServerList::new_empty();
+        list.update(
+            vec![
+                make_server("singapore", "1.1.1.1"),
+                make_unavailable_server("tokyo-01", "2.2.2.1"),
+            ],
+            vec![
+                make_region("singapore", &["singapore"]),
+                make_region("tokyo", &["tokyo-01"]),
+            ],
+            ServerListSource::Api,
+        );
+
+        let probes = build_latency_probe_targets(&list);
+        assert_eq!(
+            probes,
+            vec![("singapore".to_string(), "1.1.1.1".to_string(), 51821)]
+        );
+    }
+
+    #[test]
+    fn apply_latency_measurements_updates_all_servers_and_region_best_latency() {
+        let mut list = make_dynamic_server_list();
+        let measurements = vec![
+            (
+                "singapore".to_string(),
+                "1.1.1.1".to_string(),
+                51821,
+                Some(18),
+            ),
+            (
+                "singapore-02".to_string(),
+                "1.1.1.2".to_string(),
+                51821,
+                Some(7),
+            ),
+            (
+                "tokyo-01".to_string(),
+                "2.2.2.1".to_string(),
+                51821,
+                Some(40),
+            ),
+        ];
+
+        let latencies = apply_latency_measurements(&mut list, &measurements);
+
+        assert_eq!(list.get_latency("singapore"), Some(18));
+        assert_eq!(list.get_latency("singapore-02"), Some(7));
+        assert_eq!(list.get_region_best_latency("singapore"), Some(7));
+        assert_eq!(list.get_region_best_latency("tokyo"), Some(40));
+
+        assert!(
+            latencies
+                .iter()
+                .any(|entry| entry.region == "singapore" && entry.latency_ms == Some(7))
+        );
+        assert!(
+            latencies
+                .iter()
+                .any(|entry| entry.region == "tokyo" && entry.latency_ms == Some(40))
+        );
+    }
+
+    #[test]
+    fn select_best_server_in_region_prefers_lowest_latency() {
+        let mut list = make_dynamic_server_list();
+        list.set_latency("singapore", Some(22));
+        list.set_latency("singapore-02", Some(9));
+
+        let selected = select_best_server_in_region(&list, "singapore");
+        assert_eq!(selected.as_deref(), Some("singapore-02"));
+    }
+
+    #[test]
+    fn select_best_server_in_region_falls_back_to_first_server_without_latency() {
+        let list = make_dynamic_server_list();
+
+        let selected = select_best_server_in_region(&list, "singapore");
+        assert_eq!(selected.as_deref(), Some("singapore"));
+    }
+
+    #[test]
+    fn build_available_servers_uses_dynamic_port() {
+        let mut list = DynamicServerList::new_empty();
+        list.update(
+            vec![
+                make_server_with_port("singapore", "1.1.1.1", 51821),
+                make_server_with_port("alt", "2.2.2.2", 51822),
+                make_server_with_port("phantun", "3.3.3.3", 60001),
+            ],
+            vec![
+                make_region("singapore", &["singapore"]),
+                make_region("alt", &["alt"]),
+                make_region("phantun", &["phantun"]),
+            ],
+            ServerListSource::Api,
+        );
+
+        let built = build_available_servers(&list);
+        let by_region: std::collections::HashMap<_, _> = built
+            .iter()
+            .map(|(region, addr, _)| (region.clone(), *addr))
+            .collect();
+
+        assert_eq!(
+            by_region.get("singapore"),
+            Some(&"1.1.1.1:51821".parse().unwrap())
+        );
+        assert_eq!(
+            by_region.get("alt"),
+            Some(&"2.2.2.2:51822".parse().unwrap())
+        );
+        assert_eq!(
+            by_region.get("phantun"),
+            Some(&"3.3.3.3:60001".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn build_available_servers_excludes_unavailable_relays() {
+        let mut list = DynamicServerList::new_empty();
+        list.update(
+            vec![
+                make_server("singapore", "1.1.1.1"),
+                make_unavailable_server("tokyo-01", "2.2.2.1"),
+            ],
+            vec![
+                make_region("singapore", &["singapore"]),
+                make_region("tokyo", &["tokyo-01"]),
+            ],
+            ServerListSource::Api,
+        );
+
+        let built = build_available_servers(&list);
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].0, "singapore");
+    }
+}
+
+#[tauri::command]
+pub async fn server_refresh(state: State<'_, AppState>, app: AppHandle) -> Result<String, String> {
+    let data = swifttunnel_core::vpn::servers::fetch_server_list().await?;
+    let (servers, regions, source) = (
+        data.servers,
+        data.regions,
+        swifttunnel_core::vpn::servers::ServerListSource::Api,
+    );
+
+    let available_servers = {
+        let mut sl = state.server_list.lock();
+        sl.update(servers, regions, source.clone());
+        build_available_servers(&sl)
+    };
+    sync_auto_router_available_servers(&state.vpn_connection, available_servers);
+
+    let _ = app.emit(SERVER_LIST_UPDATED, source.to_string());
+
+    Ok(source.to_string())
+}
+
+#[tauri::command]
+pub fn server_smart_select(state: State<'_, AppState>, region_id: String) -> Option<String> {
+    let sl = state.server_list.lock();
+    select_best_server_in_region(&sl, &region_id)
+}

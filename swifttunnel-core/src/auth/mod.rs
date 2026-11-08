@@ -1,0 +1,19 @@
+//! Authentication module for SwiftTunnel Desktop
+//!
+//! Handles authentication via Supabase:
+//! - Direct email/password sign-in
+//! - Google OAuth via localhost callback server
+//! - Secure token storage via Keychain
+//! - Token refresh management
+
+mod device_identity;
+pub(crate) mod http_client;
+mod manager;
+pub mod oauth_server;
+mod storage;
+pub mod types;
+
+pub use http_client::{set_client_version, update_required_message};
+pub use manager::{AuthManager, AuthStateReader};
+pub use oauth_server::{DEFAULT_OAUTH_PORT, OAuthCallbackData, OAuthServer};
+pub use types::*;

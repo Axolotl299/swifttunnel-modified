@@ -1,0 +1,92 @@
+//! Embed the elevation manifest needed to stage a protected installation source.
+//! Product-specific orphan recovery remains inside the MSI. The native launcher
+//! owns maintenance selection and completion reporting.
+
+use std::path::PathBuf;
+
+use embed_manifest::{embed_manifest, manifest::ExecutionLevel, new_manifest};
+
+fn main() {
+    // Setup must start on a clean Windows installation before prerequisites exist.
+    static_vcruntime::metabuild();
+    if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
+        embed_manifest(
+            new_manifest("SwiftTunnel.Setup")
+                .requested_execution_level(ExecutionLevel::RequireAdministrator),
+        )
+        .expect("failed to embed the setup manifest");
+        embed_resource::compile("icon.rc", embed_resource::NONE)
+            .manifest_optional()
+            .expect("failed to embed the setup icon and file description");
+    }
+
+    stage_payload();
+
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=icon.rc");
+    println!("cargo:rerun-if-changed=../swifttunnel-desktop/src-tauri/icons/icon.ico");
+    println!("cargo:rerun-if-env-changed=SWIFTTUNNEL_SETUP_MSI");
+
+    // The filename the payload is written under before msiexec runs. Windows
+    // records that path as the product's installation source, so two products
+    // sharing one name would each claim the other's source and one of them
+    // would be wrong. Defaults to the full app's, since that is the launcher
+    // this crate was written for.
+    let name = std::env::var("SWIFTTUNNEL_SETUP_NAME")
+        .unwrap_or_else(|_| "SwiftTunnel-Installer.msi".to_string());
+    if std::env::var("PROFILE").as_deref() == Ok("release") && name == "SwiftTunnel-Installer.msi" {
+        use base64::Engine;
+        let key = std::env::var("SWIFTTUNNEL_UPDATE_MANIFEST_PUBLIC_KEY_B64").unwrap_or_default();
+        assert!(
+            base64::engine::general_purpose::STANDARD
+                .decode(key.trim())
+                .is_ok_and(|value| value.len() == 32),
+            "Desktop Setup requires the release public verification key for Lite downloads"
+        );
+    }
+    println!("cargo:rerun-if-env-changed=SWIFTTUNNEL_UPDATE_MANIFEST_PUBLIC_KEY_B64");
+    println!("cargo:rustc-env=SWIFTTUNNEL_SETUP_NAME={name}");
+    println!("cargo:rerun-if-env-changed=SWIFTTUNNEL_SETUP_NAME");
+}
+
+/// Copy the MSI this launcher wraps into OUT_DIR so `include_bytes!` can find
+/// it at a stable path.
+///
+/// Going through OUT_DIR rather than `include_bytes!(env!(..))` directly keeps
+/// the crate compiling when the variable is absent, which matters because
+/// `cargo test --workspace` and CI's `cargo check` build every member and
+/// neither of them has an MSI to hand. A release build without a payload is a
+/// different matter and is refused outright: shipping a launcher that installs
+/// nothing would be worse than not shipping one.
+fn stage_payload() {
+    let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is always set"));
+    let dest = out.join("payload.msi");
+
+    match std::env::var_os("SWIFTTUNNEL_SETUP_MSI") {
+        Some(src) => {
+            let src = PathBuf::from(src);
+            let bytes = std::fs::read(&src)
+                .unwrap_or_else(|e| panic!("could not read {}: {e}", src.display()));
+            assert!(
+                bytes.len() > 1_000_000,
+                "{} is only {} bytes, which is not a SwiftTunnel MSI",
+                src.display(),
+                bytes.len()
+            );
+            std::fs::write(&dest, bytes).expect("could not stage the MSI payload");
+            println!("cargo:rerun-if-changed={}", src.display());
+        }
+        None if std::env::var("PROFILE").as_deref() == Ok("release") => {
+            panic!(
+                "SWIFTTUNNEL_SETUP_MSI is not set. A release build of the setup launcher must \
+                 point at the MSI it should install, for example \
+                 target/x86_64-pc-windows-msvc/release/bundle/msi/SwiftTunnel_<version>_x64_en-US.msi"
+            );
+        }
+        None => {
+            // Debug or check build: an empty payload keeps the workspace
+            // compiling, and main() refuses to run rather than pretending.
+            std::fs::write(&dest, []).expect("could not write the placeholder payload");
+        }
+    }
+}

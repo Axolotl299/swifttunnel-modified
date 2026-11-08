@@ -1,0 +1,270 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+//! SwiftTunnel Lite.
+//!
+//! The tunnel and Roblox's frame cap, in a 340x480 window with no WebView2.
+//!
+//! # Why not the app with the pages removed
+//!
+//! That was tried, and shipped as a build of the React client behind a flag.
+//! It works and it looks right, because it is the real design system, but a
+//! webview costs about 390MB of process group before a line of UI is drawn
+//! while the whole Rust side is 10MB. A client whose reason to exist is not
+//! taxing your machine cannot be 97% browser, so the interface here is painted
+//! directly: shapes composited in software by `canvas`, text by GDI in the
+//! product's own Geist, no compositor, no GPU process, and nothing repainted
+//! unless something changed.
+//!
+//! # What is not reimplemented
+//!
+//! Everything that has to behave identically. `swifttunnel-core` owns the
+//! account, the relay ticket signing, the tunnel and Roblox's settings file,
+//! and the free-tier limit is enforced server-side on `/api/vpn/relay-ticket`.
+//! Sharing that code path is what keeps the two clients honest with each
+//! other. The settings file is the same file too, so a region picked in one is
+//! picked in both.
+
+mod canvas;
+mod clipboard;
+mod engine;
+mod flag_import;
+mod fonts;
+mod game_location;
+mod gdi;
+mod installer_cli;
+mod operation_gate;
+mod picker;
+mod preview;
+mod roblox_changes;
+mod runtime;
+mod screens;
+mod settings_writer;
+mod single_client;
+mod startup_failure;
+mod state;
+mod surface;
+mod theme;
+mod tray;
+mod ui;
+mod ui_update;
+mod uninstall;
+mod view;
+
+use state::Push;
+use view::Screen;
+
+fn main() {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let previewing = args.iter().any(|a| a == "--preview");
+    if !previewing {
+        init_logging();
+    }
+
+    // Report this build's version, before anything can make a request.
+    //
+    // Core defaults to its own crate version when nobody sets one, and that
+    // number tracks the library rather than the product, so it reads as
+    // ancient next to any release. Only the Tauri shell used to set it, which
+    // left Lite claiming core's version: the server saw 1.0.40 from a 3.1.0
+    // client and answered "no longer supported".
+    swifttunnel_core::auth::set_client_version(env!("CARGO_PKG_VERSION"));
+
+    // --cleanup: undo every system change and exit.
+    //
+    // Run by the standalone installer before it takes the files away. It is
+    // core own uninstall routine, the same one the full app runs, so the
+    // routes, the firewall rules, the hosts entries and both clients Run
+    // entries go with it rather than being left on the machine.
+    if args.iter().any(|a| a == "--cleanup") {
+        installer_cli::finish(
+            "cleanup",
+            swifttunnel_core::network_booster::cleanup_all_system_state()
+                .map_err(|error| error.to_string()),
+        );
+    }
+
+    // --install-driver: put the split tunnel driver in place and exit.
+    //
+    // Run by the standalone installer as a deferred custom action, the same
+    // way the full app does it. Lite ships the driver package beside its own
+    // exe, and core already looks in `exe_dir/drivers` for it, so this needs
+    // no new driver logic. It comes before the single-client lock because it
+    // is not a client: it installs and exits, and refusing to do that because
+    // somebody has the app open would leave the machine without a driver.
+    if args.iter().any(|a| a == "--install-driver") {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let program_files = std::path::PathBuf::from(
+            std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string()),
+        );
+
+        let health = swifttunnel_core::vpn::SplitTunnelDriver::health_check();
+        log::info!(
+            "driver helper: ready={} status={} message={}",
+            health.ready,
+            health.status.as_str(),
+            health.message
+        );
+        if health.ready {
+            log::info!("driver already ready; installer helper exiting");
+            return;
+        }
+
+        // Force the reinstall when the health check asks for one, the same
+        // decision the full app installer makes. A package that is staged but
+        // whose filter is not bound to anything installs cleanly and stays
+        // broken, and only the uninstall-first path clears it.
+        let force = health.recommended_action
+            == swifttunnel_core::vpn::DriverRecommendedAction::Reinstall
+            || args.iter().any(|a| a == "--force");
+        log::info!("driver helper: force={force}");
+
+        let result = swifttunnel_core::vpn::SplitTunnelDriver::install_driver_from_bundled_package(
+            None,
+            exe_dir.as_deref(),
+            &program_files,
+            force,
+        );
+        installer_cli::finish("Lite installer driver install", result);
+    }
+
+    // Before the engine, which starts threads and opens the settings file:
+    // if the full app is already up, this process should do nothing but
+    // bring it to the front and leave.
+    //
+    // The preview switch is exempt. It paints one frame offscreen and
+    // exits, touching no driver and no network, and refusing to render a
+    // screenshot because the app happens to be open would make the only
+    // feedback loop this UI has depend on it being closed.
+    if !previewing && !single_client::acquire() {
+        return;
+    }
+    fonts::install();
+
+    // Developer switch: paint one frame to a file and exit.
+    //
+    // Lite runs elevated, and Windows will not let an unelevated tool capture
+    // an elevated window, which left visual work with no feedback loop and is
+    // a large part of why several attempts at this interface shipped wrong.
+    if let Some(i) = args.iter().position(|a| a == "--preview") {
+        let path = args
+            .get(i + 1)
+            .map(std::ffi::OsString::as_os_str)
+            .unwrap_or_else(|| std::ffi::OsStr::new("preview.bmp"));
+        let Some(path) = path.to_str() else {
+            eprintln!("Preview path contains unsupported text. Choose another path.");
+            return;
+        };
+        let connected = args.iter().any(|a| a == "--connected");
+        let named = |flag: &str| {
+            args.iter()
+                .position(|a| a == flag)
+                .and_then(|i| args.get(i + 1))
+                .and_then(|value| value.to_str())
+        };
+        let screen = match named("--screen") {
+            Some("roblox") => Screen::Roblox,
+            Some("settings") => Screen::Settings,
+            _ => Screen::Connect,
+        };
+        let push = match named("--push") {
+            Some("regions") => Push::Regions,
+            Some("adapters") => Push::Adapters,
+            _ => Push::None,
+        };
+        let bench = args.iter().any(|a| a == "--bench");
+        let lockout = match named("--lockout") {
+            Some("signed-out") => Some(state::Lockout::SignedOut),
+            Some("banned") => Some(state::Lockout::Banned(String::new())),
+            Some("update") => Some(state::Lockout::UpdateRequired(String::new())),
+            _ => None,
+        };
+        let login_text = named("--login-text").map(str::to_string);
+        match ui::render_preview(&path, screen, push, connected, lockout, login_text, bench) {
+            Ok(()) => println!("wrote {path}"),
+            Err(error) => eprintln!("preview failed: {error}"),
+        }
+        return;
+    }
+
+    start_maintenance();
+    let engine = match engine::Engine::new() {
+        Ok(engine) => engine,
+        Err(error) => startup_failure::abort(startup_failure::Stage::Engine, error),
+    };
+    if let Err(error) = ui::run(engine) {
+        startup_failure::abort(startup_failure::Stage::Window, error);
+    }
+}
+
+fn start_maintenance() {
+    swifttunnel_core::lite_update::clear_install_attempt();
+    // Only the normal client repairs/preserves its installer registration.
+    // Never run this concurrently with an install/uninstall helper, or while
+    // rendering a preview that is supposed to leave the machine untouched.
+    if let Err(error) = std::thread::Builder::new()
+        .name("lite-installer-cache".into())
+        .spawn(|| {
+            if let Ok(cleared) = swifttunnel_msi_repair::repair()
+                && !cleared.is_empty()
+            {
+                log::warn!("cleared {} orphaned registration(s)", cleared.len());
+            }
+            match swifttunnel_msi_repair::preserve_installer_sources() {
+                Ok(kept) if !kept.is_empty() => {
+                    log::info!("installer source preserved for: {}", kept.join(", "))
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("could not preserve the installer source: {error}"),
+            }
+        })
+    {
+        log::warn!("could not start installer cache maintenance: {error}");
+    }
+}
+
+/// Where Lite's log lives.
+///
+/// Beside the full app's own, under the shared SwiftTunnel data directory, so
+/// a support request can be answered from one place. Public because Settings
+/// offers to open it and there should be one definition of the path.
+pub fn log_path() -> Option<std::path::PathBuf> {
+    dirs::data_dir().map(|d| {
+        d.join("SwiftTunnel")
+            .join("logs")
+            .join("swifttunnel-lite.log")
+    })
+}
+
+fn init_logging() {
+    let Some(path) = log_path() else {
+        return;
+    };
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+
+    // Bound long-running sessions as well as files left by previous versions.
+    let Ok(file) = swifttunnel_core::rolling_log::RollingLog::open(
+        &path,
+        &path.with_extension("log.old"),
+        8 * 1024 * 1024,
+    ) else {
+        return;
+    };
+
+    let _ = simplelog::WriteLogger::init(
+        simplelog::LevelFilter::Info,
+        simplelog::ConfigBuilder::new()
+            .set_time_format_rfc3339()
+            .set_target_level(simplelog::LevelFilter::Error)
+            .set_location_level(simplelog::LevelFilter::Off)
+            .build(),
+        // Publish complete lines immediately, coalescing formatting fragments.
+        std::io::LineWriter::new(file),
+    );
+}

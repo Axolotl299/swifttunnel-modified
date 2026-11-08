@@ -1,0 +1,52 @@
+use serde::Serialize;
+
+// Event name constants
+pub const VPN_STATE_CHANGED: &str = "vpn-state-changed";
+pub const AUTH_STATE_CHANGED: &str = "auth-state-changed";
+pub const SERVER_LIST_UPDATED: &str = "server-list-updated";
+pub const RAM_CLEAN_PROGRESS: &str = "ram-clean-progress";
+pub const COUNTRY_BAN_BYPASS_UNAVAILABLE: &str = "country-ban-bypass-unavailable";
+/// Fired once the startup network self-heal (stale-state recovery) has finished,
+/// so the UI can drop its "preparing your connection" screen.
+pub const STARTUP_RECOVERY_COMPLETE: &str = "startup-recovery-complete";
+/// Fired with a stage name while the startup self-heal does something slow, so
+/// the loading screen can say what it is waiting for. "driver_repair" means the
+/// network driver is being reinstalled, which takes up to a minute.
+pub const STARTUP_RECOVERY_STAGE: &str = "startup-recovery-stage";
+
+/// VPN state change event payload
+#[derive(Clone, Serialize)]
+pub struct VpnStateEvent {
+    pub state: String,
+    pub region: Option<String>,
+    pub server_endpoint: Option<String>,
+    pub assigned_ip: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Auth state change event payload
+#[derive(Clone, Serialize)]
+pub struct AuthStateEvent {
+    pub state: String,
+    pub email: Option<String>,
+    pub user_id: Option<String>,
+    pub is_tester: bool,
+    pub is_banned: bool,
+    pub banned_reason: Option<String>,
+    pub banned_at: Option<String>,
+}
+
+/// RAM cleaner progress event payload
+#[derive(Clone, Serialize)]
+pub struct RamCleanProgressEvent {
+    pub stage: String,
+    pub total_mb: u64,
+    pub used_mb: u64,
+    pub available_mb: u64,
+    pub load_pct: u8,
+    pub standby_mb: Option<u64>,
+    pub modified_mb: Option<u64>,
+    pub trimmed_count: u32,
+    pub current_process: Option<String>,
+    pub warning: Option<String>,
+}

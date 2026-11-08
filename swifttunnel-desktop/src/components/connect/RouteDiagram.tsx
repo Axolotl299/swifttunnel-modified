@@ -1,0 +1,284 @@
+import type { ReactNode } from "react";
+import { Icon } from "../ui/Icon";
+import { Flag } from "../ui/Flag";
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Game route diagram, lives inside the connect deck, under the status row.
+
+   Shows the path traffic actually takes: you → relay → game. Three nodes and
+   one number, because that is all we genuinely measure. The relay is
+   packet-NAT, so there are no intermediate hostnames to probe and no honest
+   way to attribute latency to the relay→game leg; that leg draws dashed and
+   says so rather than showing a plausible-looking number.
+   ────────────────────────────────────────────────────────────────────────── */
+
+interface RouteDiagramProps {
+  regionName: string | null;
+  countryCode: string | null;
+  /** Measured RTT to the relay, in ms. */
+  ping: number | null;
+  connected: boolean;
+  /** Specific relay node when resolved (e.g. "singapore-02"); falls back to the
+   *  region name. Auto-fills once the server reports which node was picked. */
+  relayName?: string | null;
+  gameName?: string;
+  onRefresh?: () => void;
+}
+
+export function RouteDiagram({
+  regionName,
+  countryCode,
+  ping,
+  connected,
+  relayName,
+  gameName = "Roblox",
+  onRefresh,
+}: RouteDiagramProps) {
+  const tone = ping !== null ? "var(--color-text-primary)" : "var(--color-text-muted)";
+
+  return (
+    /* Full width on purpose: the deck footer's stat strip spans the whole
+       panel, so a capped diagram reads as misaligned against it. */
+    <div className="relative px-4 pb-5">
+      {/* No estimated-ping box here: the leg chip and the LATENCY stat in the
+          deck footer already show this number. Three copies of one value is
+          what left an orphaned box floating mid-panel. */}
+      <div className="mb-4 flex items-center gap-2.5">
+        <h3 className="text-[13.5px] font-semibold text-text-primary">
+          Game route
+        </h3>
+        {onRefresh && (
+          <button
+            type="button"
+            onClick={onRefresh}
+            aria-label="Refresh route"
+            className="flex h-7 w-7 items-center justify-center rounded-[7px] transition-colors hover:bg-[color:var(--color-bg-hover)]"
+            style={{
+              border: "1px solid var(--color-border-subtle)",
+              color: "var(--color-text-muted)",
+            }}
+          >
+            <Icon name="refresh" size={13} strokeWidth={2} />
+          </button>
+        )}
+      </div>
+
+      <div className="flex items-center overflow-x-auto pb-1">
+        <Endpoint label="You" active={connected} icon={<UserIcon />} />
+
+        <Leg value={ping !== null ? `${ping} ms` : null} tone={tone} />
+
+        <NodeCard
+          title={relayName || regionName || "No relay"}
+          tag={countryCode ? countryCode.toUpperCase() : undefined}
+          sub="IPv4 route"
+          active={connected}
+          badge={
+            countryCode ? (
+              <Flag code={countryCode} size={14} />
+            ) : undefined
+          }
+        />
+
+        {/* Relay → game carries no honest latency figure, so when the tunnel is
+            live this leg shows the traffic flowing through it instead. Falls
+            back to a plain dashed rule when disconnected, where there is
+            nothing being boosted. */}
+        <Leg
+          value={null}
+          tone={tone}
+          dashed={!connected}
+          boosted={connected}
+          label="Boosted"
+        />
+
+        <Endpoint label={gameName} icon={<RobloxIcon />} tile />
+      </div>
+
+      <p className="mt-3 text-[10.5px] leading-snug text-text-dimmed">
+        The {ping !== null ? `${ping} ms` : "relay"} figure is your ping to the
+        relay, not your final in-game ping.
+      </p>
+    </div>
+  );
+}
+
+/** Round avatar (you) or squared app tile (destination). */
+function Endpoint({
+  label,
+  icon,
+  active,
+  tile,
+}: {
+  label: string;
+  icon: ReactNode;
+  active?: boolean;
+  tile?: boolean;
+}) {
+  return (
+    <div className="flex shrink-0 flex-col items-center gap-1.5">
+      <div
+        className={`flex h-12 w-12 items-center justify-center ${
+          tile ? "rounded-[11px] neon-edge" : "icon-orb"
+        }`}
+        style={{
+          backgroundColor: tile ? "var(--color-bg-elevated)" : undefined,
+          border: tile ? "1px solid var(--color-border-default)" : undefined,
+          color: active
+            ? "var(--color-text-primary)"
+            : "var(--color-text-secondary)",
+        }}
+      >
+        {icon}
+      </div>
+      <span className="max-w-[76px] truncate text-[10px] font-medium text-text-muted">
+        {label}
+      </span>
+    </div>
+  );
+}
+
+/** Two-row relay card: identity on top, transport underneath. */
+function NodeCard({
+  title,
+  tag,
+  sub,
+  active,
+  badge,
+}: {
+  title: string;
+  tag?: string;
+  sub: string;
+  active?: boolean;
+  badge?: ReactNode;
+}) {
+  return (
+    <div
+      className="neon-edge shrink-0 overflow-hidden rounded-[10px]"
+      style={{
+        minWidth: 158,
+        backgroundColor: "var(--color-bg-elevated)",
+        border: `1px solid ${
+          active
+            ? "var(--color-border-strong)"
+            : "var(--color-border-default)"
+        }`,
+      }}
+    >
+      <div className="flex items-center justify-between gap-3 px-3 py-2">
+        <span className="flex min-w-0 items-center gap-1.5">
+          {badge}
+          <span className="truncate text-[12px] font-semibold text-text-primary">
+            {title}
+          </span>
+        </span>
+        {tag && (
+          <span className="shrink-0 text-[9px] font-semibold uppercase tracking-[0.1em] text-text-dimmed">
+            {tag}
+          </span>
+        )}
+      </div>
+      <div
+        className="flex items-center justify-between gap-3 px-3 py-1.5"
+        style={{
+          borderTop: "1px solid var(--color-border-subtle)",
+          backgroundColor: "var(--color-bg-base)",
+        }}
+      >
+        <span className="truncate font-mono text-[10px] text-text-muted">
+          {sub}
+        </span>
+        <span
+          style={{
+            color: active
+              ? "var(--color-text-secondary)"
+              : "var(--color-text-dimmed)",
+          }}
+        >
+          <RouteIcon />
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/** A leg of the route, with its chip sitting on the line.
+ *
+ *  `boosted` draws a solid line instead of a latency figure. The
+ *  relay→game hop has no honest number to show (Roblox drops ICMP, and the
+ *  relay is packet-NAT so there is no hop to attribute time to), but the
+ *  traffic genuinely is being relayed, so the line says that rather than
+ *  sitting blank or claiming a measurement. */
+function Leg({
+  value,
+  tone,
+  dashed,
+  boosted,
+  label,
+}: {
+  value: string | null;
+  tone: string;
+  dashed?: boolean;
+  boosted?: boolean;
+  label?: string;
+}) {
+  return (
+    <div className="relative flex min-w-[84px] flex-1 items-center justify-center">
+      <div
+        className={`absolute inset-x-0 ${boosted ? "route-leg-boosted" : ""}`}
+        style={
+          boosted
+            ? { height: 2, borderRadius: 2 }
+            : dashed
+              ? { borderTop: "1px dashed var(--color-border-default)" }
+              : {
+                  height: 1,
+                  background:
+                    "linear-gradient(90deg, transparent, var(--color-border-strong) 22%, var(--color-border-strong) 78%, transparent)",
+                }
+        }
+      />
+      {boosted && label && (
+        <span
+          className="lcd-readout relative rounded-[6px] px-2 py-1 text-[9.5px] font-semibold uppercase leading-none tracking-[0.12em]"
+          style={{
+            backgroundColor: "var(--color-bg-elevated)",
+            border: "1px solid var(--color-border-default)",
+            color: "var(--color-text-secondary)",
+          }}
+        >
+          {label}
+        </span>
+      )}
+      {/* No chip on an unmeasured leg. A "not measured" pill drew the eye to
+          the one thing we cannot report and made the route look broken; the
+          dashed line already says the leg is unquantified. */}
+      {value !== null && (
+        <span
+          className="lcd-readout relative rounded-[6px] px-2 py-1 text-[10px] font-semibold leading-none"
+          style={{
+            backgroundColor: "var(--color-bg-elevated)",
+            border: "1px solid var(--color-border-subtle)",
+            color: tone,
+          }}
+        >
+          {value}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function UserIcon() {
+  return <Icon name="user" size={18} />;
+}
+
+/** Roblox mark from the shared icon set; currentColor keeps the node's
+ *  connected/idle tint. */
+function RobloxIcon() {
+  return <Icon name="roblox" size={18} />;
+}
+
+function RouteIcon() {
+  return <Icon name="route" size={12} strokeWidth={2} />;
+}

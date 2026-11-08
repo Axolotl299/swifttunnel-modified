@@ -1,0 +1,1282 @@
+//! Server list and latency measurement
+//!
+//! Fetches the server list dynamically from the SwiftTunnel API.
+//! No hardcoded server data - the app MUST fetch from API or use cached data.
+//!
+//! Server list is cached locally and refreshed periodically.
+//! If API is unavailable and no cache exists, the app shows an error.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// Path of the server list endpoint. The host comes from `API_HOSTS`.
+const SERVERS_API_PATH: &str = "/api/vpn/servers";
+const SERVER_RESPONSE_LIMIT: usize = 1024 * 1024;
+const SERVER_CACHE_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Cache TTL in seconds (1 hour)
+const CACHE_TTL_SECONDS: i64 = 3600;
+/// Hard max stale cache age (24h). Past this the entries are old enough that
+/// some may name relays which have left the fleet, so a refresh is strongly
+/// preferred. It is not a hard refusal: see `load_server_list` for why serving
+/// an expired cache beats showing no regions at all when the API is
+/// unreachable.
+const MAX_STALE_CACHE_AGE_SECONDS: i64 = 24 * 3600;
+
+/// Logged when an expired cache is served because the refresh failed.
+///
+/// Deliberately a different token from the `ST_STALE_CACHE_REJECTED` this
+/// replaced. Support logs from before this change say "rejected" and mean the
+/// app showed nothing; logs after it say "served" and mean the app carried on
+/// with old entries. Reusing one token would have made those two behaviours
+/// indistinguishable in exactly the reports where the difference matters.
+const STALE_CACHE_SERVED_EXPIRED_REASON: &str = "ST_STALE_CACHE_SERVED_EXPIRED";
+
+fn build_server_http_client(use_system_proxy: bool) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent("SwiftTunnel-Desktop/0.1.0")
+        .timeout(Duration::from_secs(10))
+        .use_native_tls();
+
+    if !use_system_proxy {
+        builder = builder.no_proxy();
+    }
+
+    builder.build()
+}
+
+/// Measured latency for a server
+#[derive(Debug, Clone)]
+pub struct ServerLatency {
+    pub region: String,
+    pub latency_ms: Option<u32>,
+    pub last_measured: Instant,
+}
+
+/// Measure latency to a relay using ICMP ping. The V3 relay protocol won't
+/// echo unauthenticated UDP probes, so this is the only signal we have.
+///
+/// Uses the native `IcmpSendEcho` API instead of spawning `ping.exe`:
+/// `ping` output is localized ("time=" is "Zeit="/"temps="/"tiempo=" on
+/// non-English Windows), which made text parsing silently return `None` for
+/// every probe outside English locales — disabling the ping test and
+/// auto-routing latency data for those users. The API also avoids one
+/// process spawn per probe.
+///
+/// Blocking (up to the 2s timeout) — call from `spawn_blocking` in async
+/// contexts.
+#[cfg(windows)]
+pub fn measure_latency_icmp(ip: &str) -> Option<u32> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        ICMP_ECHO_REPLY, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho,
+    };
+
+    const ICMP_TIMEOUT_MS: u32 = 2000;
+    const PAYLOAD_LEN: usize = 32;
+
+    let target: std::net::Ipv4Addr = ip.parse().ok()?;
+    // IcmpSendEcho takes the destination as an in_addr-style u32: the four
+    // octets in memory order, not host byte order.
+    let dest = u32::from_ne_bytes(target.octets());
+
+    let handle = unsafe { IcmpCreateFile() }.ok()?;
+
+    let payload = [0u8; PAYLOAD_LEN];
+    // Reply buffer must hold ICMP_ECHO_REPLY + payload + 8 bytes for an
+    // ICMP error message, per the IcmpSendEcho documentation.
+    let mut reply_buf = vec![0u8; std::mem::size_of::<ICMP_ECHO_REPLY>() + PAYLOAD_LEN + 8];
+
+    let reply_count = unsafe {
+        IcmpSendEcho(
+            handle,
+            dest,
+            payload.as_ptr() as *const core::ffi::c_void,
+            payload.len() as u16,
+            None,
+            reply_buf.as_mut_ptr() as *mut core::ffi::c_void,
+            reply_buf.len() as u32,
+            ICMP_TIMEOUT_MS,
+        )
+    };
+
+    let latency = crate::network_analyzer::icmp::echo_reply_rtt(reply_count, &reply_buf);
+
+    unsafe {
+        let _ = IcmpCloseHandle(handle);
+    }
+
+    latency
+}
+
+/// Non-Windows stub: latency probing is Windows-only (the app's only
+/// supported platform); development builds on other hosts report no data.
+#[cfg(not(windows))]
+pub fn measure_latency_icmp(_ip: &str) -> Option<u32> {
+    None
+}
+
+// No hardcoded server data - everything is fetched from the API
+// See: https://www.swifttunnel.net/api/vpn/servers
+
+// =============================================================================
+// DYNAMIC SERVER LIST (Fetched from API)
+// =============================================================================
+
+/// Dynamic server info with owned strings (for API deserialization)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicServerInfo {
+    pub region: String,
+    pub name: String,
+    pub country_code: String,
+    pub ip: String,
+    pub port: u16,
+    pub phantun_available: bool,
+    pub phantun_port: Option<u16>,
+    #[serde(default = "default_relay_available")]
+    pub relay_available: bool,
+    #[serde(default)]
+    pub relay_port: Option<u16>,
+    /// Concurrent users the relay last reported, or `None` when it has not
+    /// checked in recently.
+    ///
+    /// `None` deliberately does not mean "empty": a relay that has gone quiet
+    /// must not look like the most attractive box in the fleet. Selection
+    /// treats unknown load as full.
+    #[serde(default)]
+    pub active_users: Option<u32>,
+    /// Past its comfortable concurrent-user mark. Still connectable, just no
+    /// longer preferred when something equally fast is quieter.
+    #[serde(default)]
+    pub busy: bool,
+    /// Too crowded to take anyone new while its location has a relay with
+    /// room. Absent from older server lists, which reads as not full.
+    #[serde(default)]
+    pub full: bool,
+    /// Egress is billed per gigabyte on this host. Only ever used to break a
+    /// tie between relays a player cannot tell apart.
+    #[serde(default)]
+    pub metered: bool,
+}
+
+fn default_relay_available() -> bool {
+    true
+}
+
+impl DynamicServerInfo {
+    pub fn effective_relay_port(&self) -> u16 {
+        self.relay_port.unwrap_or(self.port)
+    }
+}
+
+/// Dynamic gaming region with owned strings (for API deserialization)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicGamingRegion {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub country_code: String,
+    pub servers: Vec<String>,
+}
+
+/// API response structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerListResponse {
+    pub servers: Vec<DynamicServerInfo>,
+    pub regions: Vec<DynamicGamingRegion>,
+    pub version: String,
+}
+
+/// Cached server list with timestamp
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedServerList {
+    pub data: ServerListResponse,
+    pub cached_at: DateTime<Utc>,
+}
+
+impl CachedServerList {
+    /// Check if the cache is still fresh
+    pub fn is_fresh(&self) -> bool {
+        let age = Utc::now().signed_duration_since(self.cached_at);
+        age.num_seconds() < CACHE_TTL_SECONDS
+    }
+
+    pub fn age_seconds(&self) -> i64 {
+        Utc::now()
+            .signed_duration_since(self.cached_at)
+            .num_seconds()
+    }
+
+    pub fn exceeds_hard_stale_limit(&self) -> bool {
+        self.age_seconds() > MAX_STALE_CACHE_AGE_SECONDS
+    }
+}
+
+/// Get the cache file path
+fn get_cache_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("SwiftTunnel").join("servers.json"))
+}
+
+/// Load cached server list from disk
+pub fn load_cached_servers() -> Option<CachedServerList> {
+    let cache_path = get_cache_path()?;
+
+    if !cache_path.exists() {
+        log::debug!("Server cache file does not exist: {:?}", cache_path);
+        return None;
+    }
+
+    match crate::utils::read_text_file_bounded(&cache_path, SERVER_CACHE_LIMIT, "Server cache") {
+        Ok(content) => match serde_json::from_str::<CachedServerList>(&content) {
+            Ok(cached) => {
+                log::info!(
+                    "Loaded server cache from {:?}, age: {} seconds",
+                    cache_path,
+                    Utc::now()
+                        .signed_duration_since(cached.cached_at)
+                        .num_seconds()
+                );
+                Some(cached)
+            }
+            Err(e) => {
+                log::warn!("Failed to parse server cache: {}", e);
+                None
+            }
+        },
+        Err(e) => {
+            log::warn!("Failed to read server cache file: {}", e);
+            None
+        }
+    }
+}
+
+/// Save server list to disk cache
+pub fn save_servers_to_cache(data: &ServerListResponse) -> Result<(), std::io::Error> {
+    let cache_path = match get_cache_path() {
+        Some(p) => p,
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Could not determine cache directory",
+            ));
+        }
+    };
+
+    save_servers_to_cache_at(data, &cache_path)
+}
+
+fn save_servers_to_cache_at(
+    data: &ServerListResponse,
+    cache_path: &Path,
+) -> Result<(), std::io::Error> {
+    // Create directory if it doesn't exist
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let cached = CachedServerList {
+        data: data.clone(),
+        cached_at: Utc::now(),
+    };
+
+    let content = serde_json::to_string_pretty(&cached)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    if content.len() > SERVER_CACHE_LIMIT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Server cache is too large",
+        ));
+    }
+    crate::atomic_file::replace(cache_path, content.as_bytes())?;
+    log::info!("Saved server list to cache: {:?}", cache_path);
+
+    Ok(())
+}
+
+/// Fetch server list from API
+pub async fn fetch_server_list() -> Result<ServerListResponse, String> {
+    let client = build_server_http_client(true)
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let direct_client = build_server_http_client(false)
+        .map_err(|e| format!("Failed to create direct HTTP client: {}", e))?;
+
+    // Every host, not just the first. This is the request that decides whether
+    // the app has anything to show at all, so it gets the same treatment as the
+    // auth client: a hostname a filter objects to must not be the only one we
+    // know. See `API_HOSTS` in `auth::http_client`.
+    let mut failures: Vec<String> = Vec::new();
+    let mut response = None;
+
+    for base in crate::auth::http_client::api_hosts_in_order() {
+        let url = format!("{base}{SERVERS_API_PATH}");
+        log::info!("Fetching server list from API: {url}");
+
+        let attempt = match client.get(&url).send().await {
+            Ok(response) => Ok(response),
+            Err(primary_error) => {
+                // The whole chain. This is the single most reported failure in
+                // the product and its log line used to say only that a request
+                // to a URL failed, which is the part the user could already see
+                // on screen.
+                log::warn!(
+                    "Server list fetch failed through the system network path: {}. Retrying direct.",
+                    crate::utils::describe_error_chain(&primary_error)
+                );
+                direct_client
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|direct_error| {
+                        format!(
+                            "{}. Direct retry also failed: {}",
+                            crate::utils::describe_error_chain(&primary_error),
+                            crate::utils::describe_error_chain(&direct_error)
+                        )
+                    })
+            }
+        };
+
+        match attempt {
+            Ok(ok) => {
+                crate::auth::http_client::note_api_host_worked(base);
+                response = Some(ok);
+                break;
+            }
+            Err(error) => failures.push(format!("{base}: {error}")),
+        }
+    }
+
+    let Some(response) = response else {
+        return Err(format!(
+            "Failed to fetch server list: {}",
+            failures.join(" | ")
+        ));
+    };
+
+    if !response.status().is_success() {
+        return Err(format!("API returned error status: {}", response.status()));
+    }
+
+    let data: ServerListResponse =
+        crate::http_body::read_json_bounded(response, SERVER_RESPONSE_LIMIT, "server list").await?;
+
+    log::info!(
+        "Fetched {} servers and {} regions from API (version: {})",
+        data.servers.len(),
+        data.regions.len(),
+        data.version
+    );
+
+    record_relay_load(&data.servers);
+
+    // Save to cache
+    if let Err(e) = save_servers_to_cache(&data) {
+        log::warn!("Failed to save server list to cache: {}", e);
+    }
+
+    Ok(data)
+}
+
+/// Bound the entire refresh, including alternate hosts, before a connection.
+/// Callers keep their last usable list if the website cannot be reached.
+pub async fn fetch_server_list_for_connect() -> Result<ServerListResponse, String> {
+    tokio::time::timeout(Duration::from_secs(5), fetch_server_list())
+        .await
+        .map_err(|_| "Server list refresh timed out".to_string())?
+}
+
+/// Live occupancy per relay, refreshed whenever the server list is fetched.
+///
+/// Kept beside the list rather than threaded through the candidate tuples,
+/// which are `(region, addr, latency)` and passed through a dozen call sites.
+/// Selection only needs to look a region up, so a small registry is far less
+/// invasive than widening that tuple everywhere.
+///
+/// Deliberately NOT populated from the on-disk cache: a cached list can be
+/// hours old, and stale occupancy is worse than none — it would confidently
+/// steer everyone toward whichever relay happened to be quiet last session.
+static RELAY_LOAD: std::sync::RwLock<Option<HashMap<String, RelayLoad>>> =
+    std::sync::RwLock::new(None);
+
+#[derive(Debug, Clone, Copy)]
+pub struct RelayLoad {
+    pub active_users: Option<u32>,
+    pub busy: bool,
+    pub full: bool,
+    pub metered: bool,
+}
+
+fn record_relay_load(servers: &[DynamicServerInfo]) {
+    let map: HashMap<String, RelayLoad> = servers
+        .iter()
+        .map(|s| {
+            (
+                s.region.clone(),
+                RelayLoad {
+                    active_users: s.active_users,
+                    busy: s.busy,
+                    full: s.full,
+                    metered: s.metered,
+                },
+            )
+        })
+        .collect();
+
+    if let Ok(mut guard) = RELAY_LOAD.write() {
+        *guard = Some(map);
+    }
+}
+
+/// Occupancy for a region, or `None` when the fleet has not been polled yet.
+pub fn relay_load(region: &str) -> Option<RelayLoad> {
+    RELAY_LOAD
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().and_then(|m| m.get(region).copied()))
+}
+
+/// Seed occupancy directly, for tests that need a known fleet state.
+///
+/// Entries are `(region, active_users, metered)`. `busy` is left false because
+/// ranking never reads it, so modelling it here would only invite the question
+/// of what it should be.
+///
+/// This writes a process-wide static, so callers must hold
+/// [`RELAY_LOAD_TEST_LOCK`] and clear up after themselves.
+#[cfg(test)]
+pub(crate) fn set_relay_load_for_test(entries: &[(&str, Option<u32>, bool)]) {
+    let fleet: Vec<(&str, Option<u32>, bool, bool)> = entries
+        .iter()
+        .map(|(region, active_users, metered)| (*region, *active_users, *metered, false))
+        .collect();
+    set_relay_fleet_for_test(&fleet);
+}
+
+/// Like [`set_relay_load_for_test`], with each relay's `full` flag as well.
+/// Entries are `(region, active_users, metered, full)`.
+#[cfg(test)]
+pub(crate) fn set_relay_fleet_for_test(entries: &[(&str, Option<u32>, bool, bool)]) {
+    let map: HashMap<String, RelayLoad> = entries
+        .iter()
+        .map(|(region, active_users, metered, full)| {
+            (
+                (*region).to_string(),
+                RelayLoad {
+                    active_users: *active_users,
+                    busy: false,
+                    full: *full,
+                    metered: *metered,
+                },
+            )
+        })
+        .collect();
+
+    if let Ok(mut guard) = RELAY_LOAD.write() {
+        *guard = Some(map);
+    }
+}
+
+/// Put the registry back to "nothing fetched yet" so a later test is not
+/// steered by occupancy an earlier one seeded.
+#[cfg(test)]
+pub(crate) fn clear_relay_load_for_test() {
+    if let Ok(mut guard) = RELAY_LOAD.write() {
+        *guard = None;
+    }
+}
+
+/// Serialises the tests that write the shared occupancy registry. Rust runs
+/// tests in one process across several threads, so without this they would
+/// overwrite one another's fleet state at random.
+#[cfg(test)]
+pub(crate) static RELAY_LOAD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Which relays make up each location, as the server list names them.
+///
+/// The list is the authority. A relay used to belong to whatever location its
+/// id named once the trailing number was dropped, and one misnamed relay
+/// (america-01, listed under "us-east") left a whole location with nothing to
+/// connect to. Unlike occupancy this is fine to take from the on-disk cache:
+/// membership changes when relays are added or removed, not minute to minute.
+static REGION_MEMBERS: std::sync::RwLock<Option<HashMap<String, Vec<String>>>> =
+    std::sync::RwLock::new(None);
+
+fn record_region_members(regions: &[DynamicGamingRegion]) {
+    let map: HashMap<String, Vec<String>> = regions
+        .iter()
+        .map(|region| (region.id.clone(), region.servers.clone()))
+        .collect();
+    if let Ok(mut guard) = REGION_MEMBERS.write() {
+        *guard = Some(map);
+    }
+}
+
+/// The relays the server list puts in a location, or `None` when no list has
+/// been loaded or the location is not in it.
+pub fn region_members(region_id: &str) -> Option<Vec<String>> {
+    REGION_MEMBERS
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().and_then(|m| m.get(region_id).cloned()))
+}
+
+/// Seed location membership directly. Callers must hold
+/// [`RELAY_LOAD_TEST_LOCK`] and clear up with [`clear_region_members_for_test`].
+#[cfg(test)]
+pub(crate) fn set_region_members_for_test(entries: &[(&str, &[&str])]) {
+    let map: HashMap<String, Vec<String>> = entries
+        .iter()
+        .map(|(region, servers)| {
+            (
+                (*region).to_string(),
+                servers.iter().map(|s| (*s).to_string()).collect(),
+            )
+        })
+        .collect();
+    if let Ok(mut guard) = REGION_MEMBERS.write() {
+        *guard = Some(map);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn clear_region_members_for_test() {
+    if let Ok(mut guard) = REGION_MEMBERS.write() {
+        *guard = None;
+    }
+}
+
+/// How long a relay that stopped returning traffic is kept out of the way.
+pub const RELAY_AVOID_FOR: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Relays that just stopped returning traffic, and when they did.
+///
+/// A dead relay used to be sidestepped by pinning its location to the next
+/// relay, which then stayed as a setting nobody chose. Now it is avoided for a
+/// while instead: long enough to reconnect somewhere that works, short enough
+/// that a relay back from a restart is used again.
+static AVOIDED_RELAYS: std::sync::Mutex<Option<HashMap<String, std::time::Instant>>> =
+    std::sync::Mutex::new(None);
+
+/// Keep `region` out of new connections for [`RELAY_AVOID_FOR`].
+pub fn avoid_relay_for_a_while(region: &str) {
+    if let Ok(mut guard) = AVOIDED_RELAYS.lock() {
+        guard
+            .get_or_insert_with(HashMap::new)
+            .insert(region.to_string(), std::time::Instant::now());
+    }
+}
+
+/// Whether `region` stopped returning traffic within [`RELAY_AVOID_FOR`].
+pub fn relay_is_avoided(region: &str) -> bool {
+    AVOIDED_RELAYS
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().and_then(|m| m.get(region).copied()))
+        .is_some_and(|since| since.elapsed() < RELAY_AVOID_FOR)
+}
+
+#[cfg(test)]
+pub(crate) fn clear_avoided_relays_for_test() {
+    if let Ok(mut guard) = AVOIDED_RELAYS.lock() {
+        *guard = None;
+    }
+}
+
+/// Load server list from API or cache.
+///
+/// Strategy:
+/// 1. Try to load fresh cache
+/// 2. If cache is stale or missing, fetch from API
+/// 3. If API fails and cache exists (even stale), use cache
+/// 4. If all else fails, return Error - no hardcoded fallback!
+pub async fn load_server_list() -> Result<
+    (
+        Vec<DynamicServerInfo>,
+        Vec<DynamicGamingRegion>,
+        ServerListSource,
+    ),
+    String,
+> {
+    // Try to load from cache first
+    if let Some(cached) = load_cached_servers() {
+        if cached.is_fresh() {
+            log::info!("Using fresh cached server list");
+            return Ok((
+                cached.data.servers,
+                cached.data.regions,
+                ServerListSource::Cache,
+            ));
+        }
+
+        // Cache is stale, try to refresh from API
+        log::info!("Cache is stale, attempting to refresh from API");
+        match fetch_server_list().await {
+            Ok(data) => {
+                return Ok((data.servers, data.regions, ServerListSource::Api));
+            }
+            Err(e) => {
+                if cached.exceeds_hard_stale_limit() {
+                    // Past the hard limit, but the refresh failed, so there is
+                    // nothing newer to serve. Returning an error here left the
+                    // app with no regions at all and no route out of it: a user
+                    // whose network could not reach the API for a day was locked
+                    // out permanently from then on, holding a cached list that
+                    // would almost certainly still have worked. In the field it
+                    // presented as "it worked before and died after an update",
+                    // because nothing had changed except the cache ageing past
+                    // a day while the API stayed unreachable.
+                    //
+                    // The limit is not paranoia. An endpoint that has left the
+                    // fleet can have its address reassigned, and five GCP
+                    // addresses were released on 2026-09-04. But the exposure is
+                    // bounded: the relay handshake is cryptographically
+                    // authenticated, so whoever holds a recycled address cannot
+                    // answer for the relay. A stale entry fails to connect. It
+                    // does not connect to the wrong party.
+                    //
+                    // A bounded risk of a failed connection beats a certain
+                    // outage, so serve it and say so loudly.
+                    log::warn!(
+                        "{}: cache age {}s exceeds hard limit {}s and API refresh failed ({}). \
+                         Serving the expired cache: some entries may name relays that have left the fleet.",
+                        STALE_CACHE_SERVED_EXPIRED_REASON,
+                        cached.age_seconds(),
+                        MAX_STALE_CACHE_AGE_SECONDS,
+                        e
+                    );
+                } else {
+                    log::warn!("Failed to fetch from API, using stale cache: {}", e);
+                }
+                return Ok((
+                    cached.data.servers,
+                    cached.data.regions,
+                    ServerListSource::StaleCache,
+                ));
+            }
+        }
+    }
+
+    // No cache, try API
+    log::info!("No cache found, fetching from API");
+    match fetch_server_list().await {
+        Ok(data) => Ok((data.servers, data.regions, ServerListSource::Api)),
+        Err(e) => {
+            log::error!("Failed to fetch server list from API: {}", e);
+            Err(format!(
+                "Could not load server list: {}. Please check your internet connection.",
+                e
+            ))
+        }
+    }
+}
+
+/// Source of the server list data
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerListSource {
+    /// Still loading from API
+    Loading,
+    /// Fetched from API
+    Api,
+    /// Loaded from fresh local cache
+    Cache,
+    /// Loaded from stale cache (API failed)
+    StaleCache,
+    /// Failed to load (no cache, API failed)
+    Error(String),
+}
+
+impl std::fmt::Display for ServerListSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerListSource::Loading => write!(f, "Loading..."),
+            ServerListSource::Api => write!(f, "API"),
+            ServerListSource::Cache => write!(f, "Cache"),
+            ServerListSource::StaleCache => write!(f, "Stale Cache"),
+            ServerListSource::Error(msg) => write!(f, "Error: {}", msg),
+        }
+    }
+}
+
+/// Dynamic server list manager for GUI usage
+pub struct DynamicServerList {
+    pub servers: Vec<DynamicServerInfo>,
+    pub regions: Vec<DynamicGamingRegion>,
+    pub source: ServerListSource,
+    latencies: HashMap<String, ServerLatency>,
+}
+
+impl DynamicServerList {
+    /// Create a new empty server list (loading state).
+    /// The list will be populated when data is fetched from the API.
+    pub fn new_empty() -> Self {
+        Self {
+            servers: Vec::new(),
+            regions: Vec::new(),
+            source: ServerListSource::Loading,
+            latencies: HashMap::new(),
+        }
+    }
+
+    /// Create a new server list with error state
+    pub fn new_error(error: String) -> Self {
+        Self {
+            servers: Vec::new(),
+            regions: Vec::new(),
+            source: ServerListSource::Error(error),
+            latencies: HashMap::new(),
+        }
+    }
+
+    /// Check if the server list is empty (still loading or error)
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
+
+    /// Check if there was an error loading
+    pub fn has_error(&self) -> bool {
+        matches!(self.source, ServerListSource::Error(_))
+    }
+
+    /// Get the error message if any
+    pub fn error_message(&self) -> Option<&str> {
+        match &self.source {
+            ServerListSource::Error(msg) => Some(msg),
+            _ => None,
+        }
+    }
+
+    /// Update with fetched data
+    pub fn update(
+        &mut self,
+        servers: Vec<DynamicServerInfo>,
+        regions: Vec<DynamicGamingRegion>,
+        source: ServerListSource,
+    ) {
+        record_region_members(&regions);
+        // A relay id can be reused during a fleet rebuild. Measurements belong
+        // to its endpoint, not to whichever box later receives that id.
+        let unchanged: std::collections::HashSet<_> = servers
+            .iter()
+            .filter(|new| {
+                self.get_server(&new.region).is_some_and(|old| {
+                    old.ip == new.ip && old.effective_relay_port() == new.effective_relay_port()
+                })
+            })
+            .map(|server| server.region.clone())
+            .collect();
+        self.latencies.retain(|id, _| unchanged.contains(id));
+        if let Ok(mut guard) = AVOIDED_RELAYS.lock() {
+            if let Some(avoided) = guard.as_mut() {
+                avoided.retain(|id, _| self.get_server(id).is_none() || unchanged.contains(id));
+            }
+        }
+        self.servers = servers;
+        self.regions = regions;
+        self.source = source;
+    }
+
+    /// Get all servers
+    pub fn servers(&self) -> &[DynamicServerInfo] {
+        &self.servers
+    }
+
+    /// Get all regions
+    pub fn regions(&self) -> &[DynamicGamingRegion] {
+        &self.regions
+    }
+
+    /// Get server by region ID
+    pub fn get_server(&self, region: &str) -> Option<&DynamicServerInfo> {
+        self.servers.iter().find(|s| s.region == region)
+    }
+
+    /// Get region by ID
+    pub fn get_region(&self, id: &str) -> Option<&DynamicGamingRegion> {
+        self.regions.iter().find(|r| r.id == id)
+    }
+
+    /// Get a recent latency for route selection. Display-only callers use
+    /// get_display_latency while game-time polling is paused.
+    pub fn get_latency(&self, region: &str) -> Option<u32> {
+        self.get_recent_latency(region)
+    }
+
+    pub fn get_recent_latency(&self, region: &str) -> Option<u32> {
+        self.latencies
+            .get(region)
+            .filter(|sample| sample.last_measured.elapsed() <= std::time::Duration::from_secs(60))
+            .and_then(|sample| sample.latency_ms)
+    }
+
+    /// Last completed reading for display while fleet probing is paused.
+    /// Route selection must continue to use get_recent_latency/get_latency.
+    pub fn get_display_latency(&self, region: &str) -> Option<u32> {
+        self.latencies
+            .get(region)
+            .and_then(|sample| sample.latency_ms)
+    }
+
+    /// Set latency for a server
+    pub fn set_latency(&mut self, region: &str, latency_ms: Option<u32>) {
+        self.latencies.insert(
+            region.to_string(),
+            ServerLatency {
+                region: region.to_string(),
+                latency_ms,
+                last_measured: Instant::now(),
+            },
+        );
+    }
+
+    /// Ignore probes that finished after their endpoint was replaced or removed.
+    pub fn set_endpoint_latency(
+        &mut self,
+        region: &str,
+        ip: &str,
+        port: u16,
+        latency_ms: Option<u32>,
+    ) {
+        if self.get_server(region).is_some_and(|server| {
+            server.relay_available && server.ip == ip && server.effective_relay_port() == port
+        }) {
+            self.set_latency(region, latency_ms);
+        }
+    }
+
+    /// Get servers in a gaming region
+    pub fn servers_in_region(&self, region_id: &str) -> Vec<&DynamicServerInfo> {
+        if let Some(region) = self.get_region(region_id) {
+            region
+                .servers
+                .iter()
+                .filter_map(|server_id| self.get_server(server_id))
+                .filter(|server| server.relay_available)
+                .collect()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Get best latency for a gaming region
+    pub fn get_region_best_latency(&self, region_id: &str) -> Option<u32> {
+        if let Some(region) = self.get_region(region_id) {
+            region
+                .servers
+                .iter()
+                .filter_map(|server_id| {
+                    self.get_server(server_id)
+                        .filter(|server| server.relay_available)
+                        .and_then(|_| self.get_latency(server_id))
+                })
+                .min()
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_cache_replacement_preserves_the_last_usable_list() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("swift-server-cache-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("servers.json");
+        let data = ServerListResponse {
+            servers: vec![make_server("owned-01", "192.0.2.1")],
+            regions: vec![make_region("owned", vec!["owned-01"])],
+            version: "test".into(),
+        };
+        save_servers_to_cache_at(&data, &path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let guard = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        let mut next = data.clone();
+        next.version = "new".into();
+        assert!(save_servers_to_cache_at(&next, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        drop(guard);
+        save_servers_to_cache_at(&next, &path).unwrap();
+        let cached: CachedServerList =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(cached.data.version, "new");
+        next.version = "x".repeat(SERVER_CACHE_LIMIT + 1);
+        assert!(save_servers_to_cache_at(&next, &path).is_err());
+        let cached: CachedServerList =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(cached.data.version, "new");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fleet_replacement_invalidates_old_endpoints_and_late_probes() {
+        let _guard = RELAY_LOAD_TEST_LOCK.lock().unwrap();
+        let mut list = DynamicServerList::new_empty();
+        let old = make_server("reused-01", "192.0.2.1");
+        let kept = make_server("kept-01", "192.0.2.2");
+        list.update(
+            vec![
+                old.clone(),
+                kept.clone(),
+                make_server("removed-01", "192.0.2.3"),
+            ],
+            vec![],
+            ServerListSource::Api,
+        );
+        for id in ["reused-01", "kept-01", "removed-01"] {
+            list.set_latency(id, Some(10));
+        }
+        avoid_relay_for_a_while("reused-01");
+        let new = make_server("reused-01", "192.0.2.4");
+        list.update(vec![new.clone(), kept], vec![], ServerListSource::Api);
+        assert_eq!(list.get_latency("kept-01"), Some(10));
+        assert_eq!(list.get_latency("reused-01"), None);
+        assert_eq!(list.get_latency("removed-01"), None);
+        assert!(!relay_is_avoided("reused-01"));
+        list.set_endpoint_latency("reused-01", &old.ip, old.effective_relay_port(), Some(1));
+        list.set_endpoint_latency("removed-01", "192.0.2.3", 51820, Some(1));
+        list.set_endpoint_latency("reused-01", &new.ip, 1234, Some(1));
+        assert_eq!(list.get_latency("reused-01"), None);
+        assert_eq!(list.get_latency("removed-01"), None);
+        list.set_endpoint_latency("reused-01", &new.ip, new.effective_relay_port(), Some(30));
+        assert_eq!(list.get_latency("reused-01"), Some(30));
+        let mut moved_port = new;
+        moved_port.relay_port = Some(1234);
+        list.update(vec![moved_port], vec![], ServerListSource::Api);
+        assert_eq!(list.get_latency("reused-01"), None);
+        clear_avoided_relays_for_test();
+    }
+
+    fn make_server(region: &str, ip: &str) -> DynamicServerInfo {
+        DynamicServerInfo {
+            region: region.to_string(),
+            name: format!("{} Server", region),
+            country_code: "US".to_string(),
+            ip: ip.to_string(),
+            port: 51820,
+            phantun_available: false,
+            phantun_port: None,
+            relay_available: true,
+            relay_port: Some(51820),
+            active_users: None,
+            busy: false,
+            full: false,
+            metered: false,
+        }
+    }
+
+    fn make_region(id: &str, servers: Vec<&str>) -> DynamicGamingRegion {
+        DynamicGamingRegion {
+            id: id.to_string(),
+            name: format!("{} Region", id),
+            description: format!("Gaming region {}", id),
+            country_code: "US".to_string(),
+            servers: servers.into_iter().map(String::from).collect(),
+        }
+    }
+
+    // --- DynamicServerList ---
+
+    #[test]
+    fn expired_latency_cannot_win_region_selection_but_remains_a_display_reading() {
+        let _guard = RELAY_LOAD_TEST_LOCK.lock().unwrap();
+        let mut list = DynamicServerList::new_empty();
+        list.update(
+            vec![
+                make_server("fast-old", "192.0.2.1"),
+                make_server("fresh", "192.0.2.2"),
+            ],
+            vec![make_region("region", vec!["fast-old", "fresh"])],
+            ServerListSource::Api,
+        );
+        list.set_latency("fast-old", Some(1));
+        list.set_latency("fresh", Some(30));
+        list.latencies.get_mut("fast-old").unwrap().last_measured =
+            Instant::now() - Duration::from_secs(61);
+
+        assert_eq!(list.get_latency("fast-old"), None);
+        assert_eq!(list.get_recent_latency("fast-old"), None);
+        assert_eq!(list.get_display_latency("fast-old"), Some(1));
+        assert_eq!(list.get_region_best_latency("region"), Some(30));
+        assert_eq!(
+            crate::vpn::connect_policy::select_best_region_by_latency(&list).as_deref(),
+            Some("region")
+        );
+
+        list.latencies.get_mut("fresh").unwrap().last_measured =
+            Instant::now() - Duration::from_secs(61);
+        assert_eq!(list.get_region_best_latency("region"), None);
+        assert_eq!(
+            crate::vpn::connect_policy::select_best_region_by_latency(&list),
+            None
+        );
+        list.set_latency("fast-old", Some(12));
+        assert_eq!(list.get_region_best_latency("region"), Some(12));
+    }
+
+    #[test]
+    fn test_new_empty() {
+        let list = DynamicServerList::new_empty();
+        assert!(list.is_empty());
+        assert!(!list.has_error());
+        assert_eq!(list.error_message(), None);
+        assert_eq!(list.source, ServerListSource::Loading);
+    }
+
+    #[test]
+    fn test_new_error() {
+        let list = DynamicServerList::new_error("network down".to_string());
+        assert!(list.is_empty());
+        assert!(list.has_error());
+        assert_eq!(list.error_message(), Some("network down"));
+    }
+
+    #[test]
+    fn test_update() {
+        let mut list = DynamicServerList::new_empty();
+        let servers = vec![make_server("us-east", "1.2.3.4")];
+        let regions = vec![make_region("na-east", vec!["us-east"])];
+
+        list.update(servers.clone(), regions.clone(), ServerListSource::Api);
+
+        assert!(!list.is_empty());
+        assert_eq!(list.source, ServerListSource::Api);
+        assert_eq!(list.servers().len(), 1);
+        assert_eq!(list.regions().len(), 1);
+    }
+
+    #[test]
+    fn test_get_server() {
+        let mut list = DynamicServerList::new_empty();
+        list.update(
+            vec![
+                make_server("us-east", "1.2.3.4"),
+                make_server("eu-west", "5.6.7.8"),
+            ],
+            vec![],
+            ServerListSource::Api,
+        );
+
+        let server = list.get_server("us-east");
+        assert!(server.is_some());
+        assert_eq!(server.unwrap().ip, "1.2.3.4");
+
+        assert!(list.get_server("us-west").is_none());
+    }
+
+    #[test]
+    fn test_get_region() {
+        let mut list = DynamicServerList::new_empty();
+        list.update(
+            vec![],
+            vec![make_region("na-east", vec!["us-east"])],
+            ServerListSource::Cache,
+        );
+
+        let region = list.get_region("na-east");
+        assert!(region.is_some());
+        assert_eq!(region.unwrap().name, "na-east Region");
+
+        assert!(list.get_region("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_latency_get_set() {
+        let mut list = DynamicServerList::new_empty();
+
+        // No latency initially
+        assert_eq!(list.get_latency("us-east"), None);
+
+        // Set latency
+        list.set_latency("us-east", Some(25));
+        assert_eq!(list.get_latency("us-east"), Some(25));
+
+        // Set None latency
+        list.set_latency("eu-west", None);
+        assert_eq!(list.get_latency("eu-west"), None);
+
+        // Overwrite
+        list.set_latency("us-east", Some(30));
+        assert_eq!(list.get_latency("us-east"), Some(30));
+    }
+
+    #[test]
+    fn test_servers_in_region() {
+        let mut list = DynamicServerList::new_empty();
+        list.update(
+            vec![
+                make_server("us-east-1", "1.2.3.4"),
+                make_server("us-east-2", "1.2.3.5"),
+                make_server("eu-west-1", "5.6.7.8"),
+            ],
+            vec![make_region("na-east", vec!["us-east-1", "us-east-2"])],
+            ServerListSource::Api,
+        );
+
+        let servers = list.servers_in_region("na-east");
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].region, "us-east-1");
+        assert_eq!(servers[1].region, "us-east-2");
+
+        // Nonexistent region returns empty
+        assert!(list.servers_in_region("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn test_servers_in_region_with_missing_server() {
+        let mut list = DynamicServerList::new_empty();
+        list.update(
+            vec![make_server("us-east-1", "1.2.3.4")],
+            vec![make_region("na-east", vec!["us-east-1", "us-east-missing"])],
+            ServerListSource::Api,
+        );
+
+        // Only returns servers that actually exist
+        let servers = list.servers_in_region("na-east");
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].region, "us-east-1");
+    }
+
+    #[test]
+    fn test_get_region_best_latency() {
+        let mut list = DynamicServerList::new_empty();
+        list.update(
+            vec![
+                make_server("us-east-1", "1.2.3.4"),
+                make_server("us-east-2", "1.2.3.5"),
+            ],
+            vec![make_region("na-east", vec!["us-east-1", "us-east-2"])],
+            ServerListSource::Api,
+        );
+
+        // No latencies yet
+        assert_eq!(list.get_region_best_latency("na-east"), None);
+
+        // Set latencies
+        list.set_latency("us-east-1", Some(50));
+        list.set_latency("us-east-2", Some(25));
+
+        assert_eq!(list.get_region_best_latency("na-east"), Some(25));
+
+        // Nonexistent region
+        assert_eq!(list.get_region_best_latency("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_get_region_best_latency_with_none_latency() {
+        let mut list = DynamicServerList::new_empty();
+        list.update(
+            vec![
+                make_server("us-east-1", "1.2.3.4"),
+                make_server("us-east-2", "1.2.3.5"),
+            ],
+            vec![make_region("na-east", vec!["us-east-1", "us-east-2"])],
+            ServerListSource::Api,
+        );
+
+        // One server has latency, one has None
+        list.set_latency("us-east-1", Some(40));
+        list.set_latency("us-east-2", None);
+
+        // Should return the one with actual latency
+        assert_eq!(list.get_region_best_latency("na-east"), Some(40));
+    }
+
+    // --- CachedServerList ---
+
+    #[test]
+    fn test_cached_server_list_is_fresh_when_recent() {
+        let cached = CachedServerList {
+            data: ServerListResponse {
+                servers: vec![],
+                regions: vec![],
+                version: "1.0".to_string(),
+            },
+            cached_at: Utc::now(),
+        };
+        assert!(cached.is_fresh());
+    }
+
+    #[test]
+    fn test_cached_server_list_is_stale_when_old() {
+        let cached = CachedServerList {
+            data: ServerListResponse {
+                servers: vec![],
+                regions: vec![],
+                version: "1.0".to_string(),
+            },
+            cached_at: Utc::now() - chrono::Duration::seconds(CACHE_TTL_SECONDS + 1),
+        };
+        assert!(!cached.is_fresh());
+    }
+
+    #[test]
+    fn test_cached_server_list_exceeds_hard_stale_limit() {
+        let cached = CachedServerList {
+            data: ServerListResponse {
+                servers: vec![],
+                regions: vec![],
+                version: "1.0".to_string(),
+            },
+            cached_at: Utc::now() - chrono::Duration::seconds(MAX_STALE_CACHE_AGE_SECONDS + 1),
+        };
+        assert!(cached.exceeds_hard_stale_limit());
+    }
+
+    // --- ServerListSource Display ---
+
+    #[test]
+    fn test_server_list_source_display_loading() {
+        assert_eq!(ServerListSource::Loading.to_string(), "Loading...");
+    }
+
+    #[test]
+    fn test_server_list_source_display_api() {
+        assert_eq!(ServerListSource::Api.to_string(), "API");
+    }
+
+    #[test]
+    fn test_server_list_source_display_cache() {
+        assert_eq!(ServerListSource::Cache.to_string(), "Cache");
+    }
+
+    #[test]
+    fn test_server_list_source_display_stale_cache() {
+        assert_eq!(ServerListSource::StaleCache.to_string(), "Stale Cache");
+    }
+
+    #[test]
+    fn test_server_list_source_display_error() {
+        let src = ServerListSource::Error("network timeout".to_string());
+        assert_eq!(src.to_string(), "Error: network timeout");
+    }
+
+    // --- ServerListSource PartialEq ---
+
+    #[test]
+    fn test_server_list_source_eq() {
+        assert_eq!(ServerListSource::Loading, ServerListSource::Loading);
+        assert_eq!(ServerListSource::Api, ServerListSource::Api);
+        assert_ne!(ServerListSource::Loading, ServerListSource::Api);
+        assert_eq!(
+            ServerListSource::Error("x".to_string()),
+            ServerListSource::Error("x".to_string())
+        );
+        assert_ne!(
+            ServerListSource::Error("x".to_string()),
+            ServerListSource::Error("y".to_string())
+        );
+    }
+}

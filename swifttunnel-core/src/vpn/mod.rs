@@ -1,0 +1,242 @@
+//! VPN Module for SwiftTunnel
+//!
+//! This module provides V3 UDP relay tunneling with process-based split tunneling.
+//!
+//! ## Split Tunnel
+//!
+//! Uses ndisapi for packet interception at NDIS level. Routes traffic by process
+//! ownership - only specified game processes use the VPN tunnel, everything else
+//! bypasses. This matches ExitLag's behavior.
+//!
+//! ## Architecture
+//!
+//! - process_tracker.rs: Connection-tracking key/stat types shared by process_cache
+//! - process_cache.rs: Immutable snapshots of process and endpoint ownership
+//! - parallel_interceptor.rs: Per-CPU parallel packet processing
+//! - split_tunnel.rs: Per-process routing coordination
+//! - connection.rs: Connection state machine and lifecycle management
+//! - servers.rs: Server list and latency measurement
+
+pub mod auto_routing;
+pub mod bypass_diag;
+mod cloud_game_routes;
+pub mod connect_policy;
+pub mod connection;
+pub(crate) mod diskless_passthrough;
+pub mod error_messages;
+pub mod game_destination;
+pub mod ipv6_recovery;
+pub mod local_connectivity;
+pub mod parallel_interceptor;
+pub mod process_cache;
+pub mod process_performance;
+pub mod process_tracker;
+pub mod process_watcher;
+mod quota_notice;
+mod relay_support;
+pub(crate) mod route_measurements;
+pub mod route_preview;
+pub mod servers;
+pub mod split_tunnel;
+pub mod tso_recovery;
+pub mod tunnel_mode_recovery;
+pub mod udp_relay;
+pub mod wfp_block;
+pub mod winpkfilter;
+
+pub use auto_routing::{AutoRouter, AutoRoutingAction, AutoRoutingEvent};
+pub use connect_policy::{
+    build_available_servers, current_binding_preference, manual_adapter_label,
+    manual_adapter_unusable_reason, resolve_initial_connect_region, select_best_region_by_latency,
+    validate_manual_adapter_selection,
+};
+pub use connection::{ConnectionState, VpnConnection};
+pub use error_messages::{short_error, user_friendly_error};
+pub use ipv6_recovery::recover_ipv6_on_startup;
+pub use parallel_interceptor::{
+    AdapterBindingPreference, BindingCandidateInfo, BindingPreferenceSource, BindingPreflightInfo,
+    NetworkAdapterInfo, ParallelInterceptor, SplitTunnelDiagnostics, ThroughputStats,
+    list_network_adapters, preflight_binding, preflight_binding_for_connect,
+};
+pub use process_cache::{LockFreeProcessCache, ProcessSnapshot};
+pub use process_watcher::{ProcessStartEvent, ProcessWatcher};
+pub use servers::{
+    DynamicGamingRegion, DynamicServerInfo, DynamicServerList, ServerListSource, load_server_list,
+};
+pub use split_tunnel::{
+    DriverHealthStatus, DriverRecommendedAction, GamePreset, SplitTunnelConfig, SplitTunnelDriver,
+    SplitTunnelDriverHealth, StaleCleanupReport, get_apps_for_preset_set, get_apps_for_presets,
+    get_tunnel_apps_for_presets,
+};
+pub use tso_recovery::{emergency_tso_restore, recover_tso_on_startup};
+pub use tunnel_mode_recovery::recover_tunnel_mode_on_startup;
+pub use udp_relay::{RelayAuthAckStatus, RelayContext, RelayPingSnapshot, UdpRelay};
+
+/// VPN-related errors
+#[derive(Debug, thiserror::Error)]
+pub enum VpnError {
+    #[error("Failed to fetch VPN config: {0}")]
+    ConfigFetch(String),
+
+    #[error("Split tunnel driver error: {0}")]
+    SplitTunnel(String),
+
+    #[error("Split tunnel driver not available - please install Windows Packet Filter driver")]
+    SplitTunnelNotAvailable,
+
+    #[error("Split tunnel setup failed: {0}")]
+    SplitTunnelSetupFailed(String),
+
+    #[error("Split tunnel driver not open")]
+    DriverNotOpen,
+
+    #[error("Split tunnel driver not initialized - call initialize() first")]
+    DriverNotInitialized,
+
+    #[error("Connection error: {0}")]
+    Connection(String),
+
+    #[error("Network error: {0}")]
+    Network(String),
+
+    #[error("Route error: {0}")]
+    Route(String),
+
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+
+    #[error("Not authenticated")]
+    NotAuthenticated,
+
+    #[error("Account banned{0}")]
+    UserBanned(String),
+
+    /// Free-tier allowance spent. Carries the API's own wording so the hour
+    /// limit only has to be changed server-side.
+    #[error("{0}")]
+    FreeTierLimitReached(String),
+
+    /// The API rejected the stored session, so no relay will issue a ticket.
+    /// Distinct from a generic connection failure because retrying cannot help:
+    /// the app has to end the session and let the user sign in again.
+    #[error("Session expired, please sign in again")]
+    SessionExpired,
+
+    /// The build is below `MIN_CLIENT_VERSION`, so the ticket endpoint answers
+    /// 426 and no relay will ever authenticate this session.
+    ///
+    /// Must abort the connect. Treating it as just another failed candidate let
+    /// the client exhaust every relay, fall through to legacy mode and report
+    /// "Connected" while the relay silently dropped every packet — an old build
+    /// looked online to its user and to anyone they screen-shared with.
+    #[error("{0}")]
+    UpdateRequired(String),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+pub type VpnResult<T> = Result<T, VpnError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vpn_error_display_config_fetch() {
+        let err = VpnError::ConfigFetch("timeout".to_string());
+        assert_eq!(err.to_string(), "Failed to fetch VPN config: timeout");
+    }
+
+    #[test]
+    fn test_vpn_error_display_split_tunnel() {
+        let err = VpnError::SplitTunnel("driver error".to_string());
+        assert_eq!(err.to_string(), "Split tunnel driver error: driver error");
+    }
+
+    #[test]
+    fn test_vpn_error_display_split_tunnel_not_available() {
+        let err = VpnError::SplitTunnelNotAvailable;
+        assert_eq!(
+            err.to_string(),
+            "Split tunnel driver not available - please install Windows Packet Filter driver"
+        );
+    }
+
+    #[test]
+    fn test_vpn_error_display_split_tunnel_setup_failed() {
+        let err = VpnError::SplitTunnelSetupFailed("no interface".to_string());
+        assert_eq!(err.to_string(), "Split tunnel setup failed: no interface");
+    }
+
+    #[test]
+    fn test_vpn_error_display_driver_not_open() {
+        let err = VpnError::DriverNotOpen;
+        assert_eq!(err.to_string(), "Split tunnel driver not open");
+    }
+
+    #[test]
+    fn test_vpn_error_display_driver_not_initialized() {
+        let err = VpnError::DriverNotInitialized;
+        assert_eq!(
+            err.to_string(),
+            "Split tunnel driver not initialized - call initialize() first"
+        );
+    }
+
+    #[test]
+    fn test_vpn_error_display_connection() {
+        let err = VpnError::Connection("already connected".to_string());
+        assert_eq!(err.to_string(), "Connection error: already connected");
+    }
+
+    #[test]
+    fn test_vpn_error_display_network() {
+        let err = VpnError::Network("socket bind failed".to_string());
+        assert_eq!(err.to_string(), "Network error: socket bind failed");
+    }
+
+    #[test]
+    fn test_vpn_error_display_route() {
+        let err = VpnError::Route("add route failed".to_string());
+        assert_eq!(err.to_string(), "Route error: add route failed");
+    }
+
+    #[test]
+    fn test_vpn_error_display_invalid_config() {
+        let err = VpnError::InvalidConfig("missing key".to_string());
+        assert_eq!(err.to_string(), "Invalid configuration: missing key");
+    }
+
+    #[test]
+    fn test_vpn_error_display_not_authenticated() {
+        let err = VpnError::NotAuthenticated;
+        assert_eq!(err.to_string(), "Not authenticated");
+    }
+
+    #[test]
+    fn test_vpn_error_display_user_banned() {
+        let err = VpnError::UserBanned(": chargeback".to_string());
+        assert_eq!(err.to_string(), "Account banned: chargeback");
+    }
+
+    #[test]
+    fn test_vpn_error_display_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let err = VpnError::Io(io_err);
+        assert_eq!(err.to_string(), "IO error: file not found");
+    }
+
+    #[test]
+    fn test_vpn_error_from_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
+        let vpn_err: VpnError = io_err.into();
+        match vpn_err {
+            VpnError::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+                assert_eq!(e.to_string(), "access denied");
+            }
+            other => panic!("Expected VpnError::Io, got {:?}", other),
+        }
+    }
+}

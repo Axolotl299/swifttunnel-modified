@@ -1,0 +1,903 @@
+//! Scoped GoodbyeDPI launcher for Roblox country-ban traffic.
+//!
+//! The helper is launched only with SwiftTunnel's generated Roblox hostlist so
+//! it applies to Roblox browser/login/bootstrap traffic without taking
+//! ownership of Route Assist or relay routing.
+
+use crate::utils::blocking_step;
+use log::{debug, info, warn};
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Stdio};
+use std::time::{Duration, Instant};
+
+const GOODBYEDPI_ENV_PATH: &str = "SWIFTTUNNEL_GOODBYEDPI_PATH";
+const GOODBYEDPI_EXE_NAME: &str = "goodbyedpi.exe";
+/// HTTPS endpoint used to confirm a GoodbyeDPI mode actually defeats the DPI.
+/// This must be a real TLS request: a bare TCP connect to :443 succeeds even
+/// where the censor RST-injects *after* the TLS ClientHello (Egypt-style SNI
+/// block), so the old TCP-connect probe reported success on a dead path.
+const ROBLOX_REACHABILITY_URL: &str = "https://www.roblox.com/";
+
+/// A second probe target on the asset CDN.
+///
+/// The website and the asset CDN are separate domains and get blocked
+/// separately, so proving one reachable says nothing about the other. That
+/// mattered the moment Country Ban started routing on this answer: confirming
+/// on `www.roblox.com` alone sent assets direct on evidence that never touched
+/// an asset host, and users reported assets still failing to load. Both must
+/// pass before we take traffic off the relay.
+const ROBLOX_ASSET_REACHABILITY_URL: &str = "https://assetdelivery.roblox.com/v1/assetId/1818";
+/// Per-mode wait for GoodbyeDPI/WinDivert to attach before probing.
+const GOODBYEDPI_MODE_STARTUP_WAIT: Duration = Duration::from_secs(2);
+/// One async startup budget, including download, launch and mode probes. The
+/// relay is the primary bypass path, so a slow optional download must not
+/// consume the connection's deadline before relay fallback can proceed.
+const GOODBYEDPI_TOTAL_BUDGET: Duration = Duration::from_secs(8);
+const COMPONENT_RETRY_DELAY: Duration = Duration::from_secs(60);
+const ROBLOX_REACHABILITY_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoodbyeDpiNativeArch {
+    X86,
+    X64,
+    Arm64,
+}
+
+#[derive(Debug)]
+#[must_use = "dropping GoodbyeDpiGuard stops the GoodbyeDPI subprocess"]
+pub struct GoodbyeDpiGuard {
+    child: Child,
+    // Keep verified executable, DLL and driver files immutable until shutdown.
+    _verified_files: Vec<fs::File>,
+    exe_path: PathBuf,
+    hostlist_path: PathBuf,
+    stopped: bool,
+}
+
+impl GoodbyeDpiGuard {
+    pub fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                info!(
+                    "GoodbyeDPI already exited before cleanup (status: {}, exe: {})",
+                    status,
+                    self.exe_path.display()
+                );
+            }
+            Ok(None) => stop_child_process(&mut self.child, &self.exe_path),
+            Err(e) => {
+                warn!(
+                    "Failed to inspect GoodbyeDPI process {} during cleanup: {}",
+                    self.child.id(),
+                    e
+                );
+            }
+        }
+
+        if let Err(e) = remove_hostlist_file(&self.hostlist_path) {
+            warn!(
+                "Failed to remove GoodbyeDPI Roblox hostlist {}: {}",
+                self.hostlist_path.display(),
+                e
+            );
+        }
+    }
+}
+
+impl Drop for GoodbyeDpiGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+// A connect timeout can drop this future during startup or an HTTPS probe.
+// std::process::Child does not stop on drop, so own it before the first await.
+struct PendingHelper {
+    child: Option<Child>,
+    exe_path: PathBuf,
+}
+impl Drop for PendingHelper {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            stop_child_process(child, &self.exe_path);
+        }
+    }
+}
+struct PendingHostlist(Option<PathBuf>);
+impl Drop for PendingHostlist {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.as_ref() {
+            let _ = remove_hostlist_file(path);
+        }
+    }
+}
+
+pub async fn start_for_roblox() -> Result<Option<GoodbyeDpiGuard>, String> {
+    startup_with_budget(GOODBYEDPI_TOTAL_BUDGET, start_for_roblox_inner()).await
+}
+
+async fn startup_with_budget<T>(
+    budget: Duration,
+    startup: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    // PendingHelper and PendingHostlist own cleanup before any await. Dropping
+    // startup on timeout stops its child and removes its temporary hostlist;
+    // a successful result transfers those resources to GoodbyeDpiGuard.
+    tokio::time::timeout(budget, startup).await.map_err(|_| {
+        format!(
+            "GoodbyeDPI startup exceeded its {} ms budget (download, launch or reachability check)",
+            budget.as_millis()
+        )
+    })?
+}
+
+async fn start_for_roblox_inner() -> Result<Option<GoodbyeDpiGuard>, String> {
+    if !cfg!(windows) {
+        debug!("GoodbyeDPI helper skipped: supported only on Windows");
+        return Ok(None);
+    }
+
+    let native_arch = current_goodbyedpi_native_arch();
+    if !bundled_goodbyedpi_supports_arch(native_arch) {
+        warn!(
+            "GoodbyeDPI helper skipped: bundled WinDivert payload is not compatible with {:?}",
+            native_arch
+        );
+        return Ok(None);
+    }
+
+    let (exe_path, verified_files) = match blocking_step(|| {
+        locate_goodbyedpi_executable(native_arch)
+    }) {
+        Some(found) => found,
+        None => {
+            // Not shipped in the installer any more, so the first user to turn
+            // this on fetches it. Every failure here is survivable: the relay
+            // already carries this traffic and needs none of it.
+            match ensure_goodbyedpi_component(native_arch).await {
+                Ok(()) => match blocking_step(|| locate_goodbyedpi_executable(native_arch)) {
+                    Some(found) => found,
+                    None => {
+                        warn!(
+                            "GoodbyeDPI component installed but no executable found; staying on the relay"
+                        );
+                        return Ok(None);
+                    }
+                },
+                Err(reason) => {
+                    warn!("GoodbyeDPI helper unavailable ({reason}); staying on the relay");
+                    return Ok(None);
+                }
+            }
+        }
+    };
+
+    let hostlist_path = blocking_step(write_roblox_hostlist)?;
+    let mut pending_hostlist = PendingHostlist(Some(hostlist_path.clone()));
+    let mut failures = Vec::new();
+    let escalation_start = Instant::now();
+
+    for mode in 1..=9 {
+        // The relay is the primary bypass now; GoodbyeDPI is a best-effort
+        // fallback and must not stall connect cycling through all 9 modes.
+        if escalation_start.elapsed() >= GOODBYEDPI_TOTAL_BUDGET {
+            failures.push(format!(
+                "mode escalation stopped after exceeding the {}s budget",
+                GOODBYEDPI_TOTAL_BUDGET.as_secs()
+            ));
+            break;
+        }
+        let args = build_goodbyedpi_args(mode, &hostlist_path);
+        let child = match blocking_step(|| spawn_goodbyedpi(&exe_path, &args)) {
+            Ok(child) => child,
+            Err(e) => {
+                failures.push(format!("-{mode}: {e}"));
+                continue;
+            }
+        };
+        let mut pending = PendingHelper {
+            child: Some(child),
+            exe_path: exe_path.clone(),
+        };
+
+        info!(
+            "Started GoodbyeDPI helper pid={} mode=-{} exe={} hostlist={}",
+            pending.child.as_ref().unwrap().id(),
+            mode,
+            exe_path.display(),
+            hostlist_path.display()
+        );
+
+        tokio::time::sleep(GOODBYEDPI_MODE_STARTUP_WAIT).await;
+
+        match pending.child.as_mut().unwrap().try_wait() {
+            Ok(Some(status)) => {
+                failures.push(format!("-{mode}: exited early with {status}"));
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                failures.push(format!("-{mode}: failed to inspect process: {e}"));
+                continue;
+            }
+        }
+
+        if roblox_https_reachable().await {
+            info!("GoodbyeDPI mode -{} made Roblox HTTPS reachable", mode);
+            return Ok(Some(GoodbyeDpiGuard {
+                child: pending.child.take().unwrap(),
+                _verified_files: verified_files,
+                exe_path,
+                hostlist_path: pending_hostlist.0.take().unwrap(),
+                stopped: false,
+            }));
+        }
+
+        failures.push(format!(
+            "-{mode}: {} was not reachable over HTTPS",
+            ROBLOX_REACHABILITY_URL
+        ));
+    }
+
+    if let Err(cleanup_err) = remove_hostlist_file(&hostlist_path) {
+        warn!(
+            "Failed to remove GoodbyeDPI hostlist after escalation failure {}: {}",
+            hostlist_path.display(),
+            cleanup_err
+        );
+    }
+
+    Err(format!(
+        "GoodbyeDPI could not confirm a working mode within {}s ({})",
+        GOODBYEDPI_TOTAL_BUDGET.as_secs(),
+        failures.join("; ")
+    ))
+}
+
+fn current_goodbyedpi_native_arch() -> GoodbyeDpiNativeArch {
+    match crate::vpn::winpkfilter::detect_native_arch() {
+        crate::vpn::winpkfilter::WinpkFilterMsiArch::X64 => {
+            if cfg!(all(windows, target_arch = "x86")) {
+                GoodbyeDpiNativeArch::X86
+            } else {
+                GoodbyeDpiNativeArch::X64
+            }
+        }
+        crate::vpn::winpkfilter::WinpkFilterMsiArch::Arm64 => GoodbyeDpiNativeArch::Arm64,
+    }
+}
+
+pub(crate) fn bundled_goodbyedpi_supports_arch(arch: GoodbyeDpiNativeArch) -> bool {
+    matches!(arch, GoodbyeDpiNativeArch::X86 | GoodbyeDpiNativeArch::X64)
+}
+
+/// Fetch the DPI helper for this machine if it is not already installed.
+///
+/// Separate from the installer on purpose: the files are unsigned and Defender
+/// carries HackTool signatures for them, so bundling them got the whole
+/// SwiftTunnel download quarantined for people who never used this feature.
+/// See [`crate::optional_components`].
+async fn ensure_goodbyedpi_component(arch: GoodbyeDpiNativeArch) -> Result<(), String> {
+    use crate::optional_components::{ComponentArch, ensure_installed, goodbyedpi_component};
+
+    let component_arch = match arch {
+        GoodbyeDpiNativeArch::X86 => ComponentArch::X86,
+        GoodbyeDpiNativeArch::X64 => ComponentArch::X64,
+        // Guarded earlier by bundled_goodbyedpi_supports_arch, but a wrong
+        // answer here would mean downloading a payload that cannot run.
+        GoodbyeDpiNativeArch::Arm64 => return Err("no GoodbyeDPI build for ARM64".to_string()),
+    };
+
+    let component = goodbyedpi_component(component_arch);
+    static RETRY: parking_lot::Mutex<Option<Instant>> = parking_lot::Mutex::new(None);
+    component_download_with_backoff(&RETRY, Instant::now(), async {
+        log::info!(
+            "Fetching the GoodbyeDPI helper ({} {}) for Bypass country bans",
+            component.id,
+            component.version
+        );
+        ensure_installed(&component)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+async fn component_download_with_backoff<T>(
+    retry: &parking_lot::Mutex<Option<Instant>>,
+    now: Instant,
+    download: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    let next = now + COMPONENT_RETRY_DELAY;
+    {
+        let mut retry = retry.lock();
+        if let Some(previous) = *retry
+            && previous > now
+        {
+            let seconds = (previous - now).as_secs().max(1);
+            return Err(format!(
+                "Optional bypass helper download paused for {seconds}s after its last attempt"
+            ));
+        }
+        // Reserve before awaiting: the outer connect budget can cancel a slow
+        // download. Retain this delay on cancellation as well as failure.
+        *retry = Some(next);
+    }
+    let result = download.await;
+    if result.is_ok() {
+        let mut retry = retry.lock();
+        if *retry == Some(next) {
+            *retry = None;
+        }
+    }
+    result
+}
+
+/// Developer override for the helper path. Debug builds only.
+///
+/// This binary runs elevated, and whatever it finds here is launched with that
+/// token. `candidate_executable_paths` puts the override ahead of every
+/// verified location, and `start_for_roblox` skips the install check once any
+/// candidate exists, so the pinned download hashes never come into it. Anything
+/// able to set one environment variable on our process therefore chooses what
+/// runs as administrator.
+///
+/// That is a fine trade while developing against a locally built GoodbyeDPI and
+/// a bad one to ship, so it compiles out of release builds entirely rather than
+/// being guarded at runtime.
+#[cfg(debug_assertions)]
+fn goodbyedpi_path_override() -> Option<PathBuf> {
+    std::env::var_os(GOODBYEDPI_ENV_PATH)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+#[cfg(not(debug_assertions))]
+fn goodbyedpi_path_override() -> Option<PathBuf> {
+    None
+}
+
+fn locate_goodbyedpi_executable(arch: GoodbyeDpiNativeArch) -> Option<(PathBuf, Vec<fs::File>)> {
+    let current_exe = std::env::current_exe().ok();
+    let override_path = goodbyedpi_path_override();
+    let component = crate::optional_components::goodbyedpi_component(match arch {
+        GoodbyeDpiNativeArch::X86 => crate::optional_components::ComponentArch::X86,
+        GoodbyeDpiNativeArch::X64 => crate::optional_components::ComponentArch::X64,
+        GoodbyeDpiNativeArch::Arm64 => return None,
+    });
+    candidate_executable_paths(current_exe.as_deref(), override_path.clone())
+        .into_iter()
+        .find_map(|path| {
+            if override_path.as_ref() == Some(&path) && path.is_file() {
+                return Some((path, vec![])); // Explicit debug-only developer opt-in.
+            }
+            let files =
+                crate::optional_components::verified_flat_directory(&component, path.parent()?)?;
+            Some((path, files))
+        })
+}
+
+fn write_roblox_hostlist() -> Result<PathBuf, String> {
+    let dir = goodbyedpi_data_dir();
+    write_roblox_hostlist_in(&dir)
+}
+
+fn write_roblox_hostlist_in(dir: &Path) -> Result<PathBuf, String> {
+    use std::io::Write;
+    crate::roblox_native_launch::safe_path(dir).map_err(|_| {
+        "The bypass helper folder is redirected. Repair SwiftTunnel and retry.".to_string()
+    })?;
+    fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "Failed to create GoodbyeDPI data directory {}: {e}",
+            dir.display()
+        )
+    })?;
+
+    // Never truncate the old fixed name or share cleanup with another startup.
+    // create_new also refuses an already-existing hard link or redirected file.
+    for _ in 0..8 {
+        let path = dir.join(format!(
+            "roblox-hostlist.{}.{:016x}.txt",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Could not prepare the bypass hostlist: {error}")),
+        };
+        let written = file.write_all(roblox_hostlist_contents().as_bytes());
+        drop(file);
+        if let Err(error) = written {
+            let _ = remove_hostlist_file(&path);
+            return Err(format!("Could not save the bypass hostlist: {error}"));
+        }
+        return Ok(path);
+    }
+    Err("Could not prepare a new bypass hostlist. Retry the connection.".into())
+}
+
+fn goodbyedpi_data_dir() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("SwiftTunnel")
+        .join("goodbyedpi")
+}
+
+fn remove_hostlist_file(path: &Path) -> Result<(), std::io::Error> {
+    blocking_step(|| {
+        crate::roblox_native_launch::safe_path(path).map_err(std::io::Error::other)?;
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    })
+}
+
+fn spawn_goodbyedpi(exe_path: &Path, args: &[String]) -> Result<Child, String> {
+    let program = exe_path.to_string_lossy();
+    let mut command = crate::hidden_command(&program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(dir) = exe_path.parent() {
+        command.current_dir(dir);
+    }
+
+    command.spawn().map_err(|e| {
+        format!(
+            "failed to start {} with args {:?}: {e}",
+            exe_path.display(),
+            args
+        )
+    })
+}
+
+fn stop_child_process(child: &mut Child, exe_path: &Path) {
+    blocking_step(|| {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                debug!(
+                    "GoodbyeDPI helper already stopped (status: {}, exe: {})",
+                    status,
+                    exe_path.display()
+                );
+            }
+            Ok(None) => {
+                if let Err(e) = child.kill() {
+                    warn!(
+                        "Failed to stop GoodbyeDPI helper pid={} exe={}: {}",
+                        child.id(),
+                        exe_path.display(),
+                        e
+                    );
+                    // Waiting after a failed termination could block shutdown forever.
+                    return;
+                }
+                let deadline = Instant::now() + Duration::from_secs(1);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        result => {
+                            warn!(
+                                "GoodbyeDPI termination could not be confirmed within one second: pid={} exe={} result={result:?}",
+                                child.id(),
+                                exe_path.display()
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to inspect GoodbyeDPI helper pid={} exe={}: {}",
+                    child.id(),
+                    exe_path.display(),
+                    e
+                );
+            }
+        }
+    });
+}
+
+async fn roblox_https_reachable() -> bool {
+    let client = match reqwest::Client::builder()
+        .timeout(ROBLOX_REACHABILITY_TIMEOUT)
+        .no_proxy()
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            warn!("GoodbyeDPI reachability probe could not build HTTP client: {e}");
+            return false;
+        }
+    };
+
+    // Any HTTP response (even an error status) means the TLS handshake completed
+    // through the DPI. An RST or timeout, which is what SNI blocking does after
+    // the ClientHello, surfaces here as a transport error rather than a status.
+    if client.get(ROBLOX_REACHABILITY_URL).send().await.is_err() {
+        return false;
+    }
+
+    // Assets are the bulk of the bytes and the thing users actually notice
+    // missing, so the CDN gets its own check. Confirming without it is what
+    // sent asset traffic direct into a block it could not get through.
+    if client
+        .get(ROBLOX_ASSET_REACHABILITY_URL)
+        .send()
+        .await
+        .is_err()
+    {
+        warn!(
+            "GoodbyeDPI got the site through but not the asset CDN; leaving Roblox traffic on the relay"
+        );
+        return false;
+    }
+
+    true
+}
+
+pub(crate) fn build_goodbyedpi_args(mode: u8, hostlist_path: &Path) -> Vec<String> {
+    vec![
+        format!("-{mode}"),
+        "--blacklist".to_string(),
+        hostlist_path.to_string_lossy().to_string(),
+    ]
+}
+
+pub(crate) fn roblox_hostlist_contents() -> String {
+    let mut out = String::new();
+    for domain in super::hosts::ROBLOX_BOOTSTRAP_DOMAINS {
+        out.push_str(domain);
+        out.push('\n');
+    }
+    out
+}
+
+pub(crate) fn candidate_executable_paths(
+    current_exe: Option<&Path>,
+    env_path: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(path) = env_path {
+        paths.push(path);
+    }
+
+    // Where the on-demand component installs. Checked ahead of the bundled
+    // locations because installers from before the split still carry a copy,
+    // and the fetched one is the version whose hashes we pin and test.
+    add_goodbyedpi_candidates(
+        &mut paths,
+        &crate::optional_components::goodbyedpi_install_dir(),
+    );
+
+    if let Some(base) = current_exe.and_then(Path::parent) {
+        add_goodbyedpi_candidates(&mut paths, &base.join("tools").join("goodbyedpi"));
+        add_goodbyedpi_candidates(
+            &mut paths,
+            &base.join("resources").join("tools").join("goodbyedpi"),
+        );
+        add_goodbyedpi_candidates(&mut paths, &base.join("goodbyedpi"));
+    }
+
+    if let Some(program_files) = std::env::var_os("ProgramFiles").map(PathBuf::from) {
+        add_goodbyedpi_candidates(
+            &mut paths,
+            &program_files
+                .join("SwiftTunnel")
+                .join("tools")
+                .join("goodbyedpi"),
+        );
+        add_goodbyedpi_candidates(
+            &mut paths,
+            &program_files
+                .join("SwiftTunnel")
+                .join("resources")
+                .join("tools")
+                .join("goodbyedpi"),
+        );
+    }
+
+    dedupe_paths(paths)
+}
+
+fn add_goodbyedpi_candidates(paths: &mut Vec<PathBuf>, root: &Path) {
+    paths.push(root.join(GOODBYEDPI_EXE_NAME));
+    paths.push(root.join("x86_64").join(GOODBYEDPI_EXE_NAME));
+    paths.push(root.join("x86").join(GOODBYEDPI_EXE_NAME));
+}
+
+fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for path in paths {
+        if seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unavailable_components_do_not_restart_downloads_on_every_connection() {
+        let retry = parking_lot::Mutex::new(None);
+        let now = Instant::now();
+        let calls = std::cell::Cell::new(0);
+        let request = || async {
+            calls.set(calls.get() + 1);
+            Err::<(), _>("fixture HTTP 404".to_string())
+        };
+        assert_eq!(
+            component_download_with_backoff(&retry, now, request()).await,
+            Err("fixture HTTP 404".into())
+        );
+        let next =
+            component_download_with_backoff(&retry, now + Duration::from_secs(2), request()).await;
+        assert!(next.unwrap_err().contains("paused"));
+        assert_eq!(
+            calls.get(),
+            1,
+            "a failed optional helper must not delay each connection"
+        );
+        assert!(
+            component_download_with_backoff(&retry, now + COMPONENT_RETRY_DELAY, async { Ok(()) })
+                .await
+                .is_ok()
+        );
+        // Success clears the cooldown, so a later missing helper can be repaired.
+        assert!(
+            component_download_with_backoff(&retry, now + COMPONENT_RETRY_DELAY, async { Ok(()) })
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_component_downloads_keep_their_retry_delay_and_do_not_poll_retries() {
+        use std::future::Future;
+        let retry = parking_lot::Mutex::new(None);
+        let now = Instant::now();
+        let calls = std::cell::Cell::new(0);
+        let mut first = Box::pin(component_download_with_backoff(&retry, now, async {
+            calls.set(calls.get() + 1);
+            std::future::pending::<Result<(), String>>().await
+        }));
+        std::future::poll_fn(|context| {
+            assert!(first.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(first); // Models the outer startup deadline cancelling the download.
+        let result = component_download_with_backoff(&retry, now + Duration::from_secs(8), async {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+        .await;
+        assert!(result.unwrap_err().contains("paused"));
+        assert_eq!(
+            calls.get(),
+            1,
+            "cooldown must refuse the future before network work starts"
+        );
+        assert!(
+            component_download_with_backoff(&retry, now + COMPONENT_RETRY_DELAY, async { Ok(()) })
+                .await
+                .is_ok()
+        );
+    }
+
+    struct HostlistFixture(PathBuf);
+    impl Drop for HostlistFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn hostlists_never_overwrite_existing_files_or_share_cleanup() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-hostlist-owner-{:016x}",
+            rand::random::<u64>()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let _fixture = HostlistFixture(dir.clone());
+        let preserved = dir.join("keep.txt");
+        fs::write(&preserved, b"unrelated contents").unwrap();
+        let old_name = dir.join("roblox-hostlist.txt");
+        fs::hard_link(&preserved, &old_name).unwrap();
+
+        let first = write_roblox_hostlist_in(&dir).unwrap();
+        assert_eq!(fs::read(&preserved).unwrap(), b"unrelated contents");
+        let second = write_roblox_hostlist_in(&dir).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            fs::read_to_string(&second).unwrap(),
+            roblox_hostlist_contents()
+        );
+        drop(PendingHostlist(Some(first.clone())));
+        assert!(!first.exists());
+        assert!(second.exists());
+        assert_eq!(fs::read(&old_name).unwrap(), b"unrelated contents");
+    }
+
+    #[tokio::test]
+    async fn stalled_optional_startup_times_out_and_cleans_owned_files() {
+        let path = std::env::temp_dir().join(format!(
+            "swift-startup-budget-{:016x}.txt",
+            rand::random::<u64>()
+        ));
+        fs::write(&path, b"test only").unwrap();
+        let result = startup_with_budget(Duration::from_millis(20), async {
+            let _hostlist = PendingHostlist(Some(path.clone()));
+            // The same deadline applies while acquiring/downloading the helper
+            // and while checking its mode, not only between mode attempts.
+            std::future::pending::<Result<(), String>>().await
+        })
+        .await;
+        assert!(result.unwrap_err().contains("startup exceeded"));
+        assert!(!path.exists(), "timeout must drop startup-owned resources");
+    }
+
+    #[tokio::test]
+    async fn startup_deadline_preserves_successful_handover_and_original_errors() {
+        let path = std::env::temp_dir().join(format!(
+            "swift-startup-handover-{:016x}.txt",
+            rand::random::<u64>()
+        ));
+        fs::write(&path, b"test only").unwrap();
+        let owned = startup_with_budget(Duration::from_secs(1), async {
+            Ok(PendingHostlist(Some(path.clone())))
+        })
+        .await
+        .unwrap();
+        assert!(
+            path.exists(),
+            "success must retain the running helper's files"
+        );
+        drop(owned);
+        assert!(!path.exists());
+        assert_eq!(
+            startup_with_budget(Duration::from_secs(1), async {
+                Err::<(), _>("Pinned component verification failed".into())
+            })
+            .await,
+            Err("Pinned component verification failed".into())
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancelling_helper_startup_stops_the_owned_child() {
+        use windows::Win32::{
+            Foundation::{CloseHandle, WAIT_OBJECT_0},
+            System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+        };
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let child = crate::hidden_command("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Start-Sleep -Seconds 8",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let pending = PendingHelper {
+                exe_path: PathBuf::from("owned-test-process"),
+                child: Some(child),
+            };
+            ready.send(pending.child.as_ref().unwrap().id()).unwrap();
+            std::future::pending::<()>().await;
+            drop(pending);
+        });
+        let pid = started.await.unwrap();
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.unwrap();
+        task.abort();
+        let _ = task.await;
+        let stopped = unsafe { WaitForSingleObject(handle, 2000) };
+        unsafe {
+            CloseHandle(handle).unwrap();
+        }
+        assert_eq!(stopped, WAIT_OBJECT_0);
+    }
+
+    #[test]
+    fn pending_hostlist_cleanup_keeps_a_successful_handover() {
+        let path =
+            std::env::temp_dir().join(format!("swift-hostlist-{:016x}.txt", rand::random::<u64>()));
+        fs::write(&path, b"test only").unwrap();
+        drop(PendingHostlist(Some(path.clone())));
+        assert!(!path.exists());
+        fs::write(&path, b"test only").unwrap();
+        let mut pending = PendingHostlist(Some(path.clone()));
+        let owned = pending.0.take().unwrap();
+        drop(pending);
+        assert!(owned.exists());
+        fs::remove_file(owned).unwrap();
+    }
+
+    #[test]
+    fn goodbyedpi_args_use_requested_mode_and_blacklist() {
+        let path = PathBuf::from(r"C:\ProgramData\SwiftTunnel\goodbyedpi\roblox-hostlist.txt");
+
+        let args = build_goodbyedpi_args(1, &path);
+
+        assert_eq!(args[0], "-1");
+        assert_eq!(args[1], "--blacklist");
+        assert_eq!(args[2], path.to_string_lossy());
+    }
+
+    #[test]
+    fn roblox_hostlist_is_exact_bootstrap_allowlist() {
+        let contents = roblox_hostlist_contents();
+        let domains: Vec<&str> = contents.lines().collect();
+
+        assert_eq!(
+            domains.as_slice(),
+            super::super::hosts::ROBLOX_BOOTSTRAP_DOMAINS
+        );
+        assert!(domains.contains(&"www.roblox.com"));
+        assert!(domains.contains(&"auth.roblox.com"));
+        assert!(!domains.contains(&"roblox.com"));
+        assert!(contents.ends_with('\n'));
+    }
+
+    #[test]
+    fn candidate_paths_prioritize_env_then_staged_tools() {
+        let exe = PathBuf::from("C:/Program Files/SwiftTunnel/SwiftTunnel.exe");
+        let env = PathBuf::from("D:/tools/goodbyedpi.exe");
+
+        let paths = candidate_executable_paths(Some(&exe), Some(env.clone()));
+
+        assert_eq!(paths.first(), Some(&env));
+        assert!(paths.contains(&PathBuf::from(
+            "C:/Program Files/SwiftTunnel/tools/goodbyedpi/goodbyedpi.exe"
+        )));
+        assert!(paths.contains(&PathBuf::from(
+            "C:/Program Files/SwiftTunnel/tools/goodbyedpi/x86_64/goodbyedpi.exe"
+        )));
+    }
+
+    #[test]
+    fn bundled_goodbyedpi_supports_x86_and_x64_payloads() {
+        assert!(bundled_goodbyedpi_supports_arch(GoodbyeDpiNativeArch::X86));
+        assert!(bundled_goodbyedpi_supports_arch(GoodbyeDpiNativeArch::X64));
+    }
+
+    #[test]
+    fn bundled_goodbyedpi_rejects_arm64_payloads() {
+        assert!(!bundled_goodbyedpi_supports_arch(
+            GoodbyeDpiNativeArch::Arm64
+        ));
+    }
+}

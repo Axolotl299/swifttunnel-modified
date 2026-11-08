@@ -1,0 +1,588 @@
+//! The decisions taken between "the user clicked Connect" and `VpnConnection`.
+//!
+//! Which physical adapter to bind, which region to actually connect to when
+//! auto-routing is on, and which relays to offer as candidates. None of it is
+//! transport: it is policy, and it is the part a second client is most likely
+//! to get subtly wrong.
+//!
+//! # Why this lives in core
+//!
+//! It used to live in the desktop app's Tauri command layer, where SwiftTunnel
+//! Lite could not reach it. Lite therefore connected with `binding_preference:
+//! None`, no latency on any candidate and the raw saved region, which meant
+//! the adapter you picked was ignored, auto-routing
+//! had nothing to sort by, and the two clients could disagree about where they
+//! were sending your traffic on the same machine.
+//!
+//! There is one implementation now and both clients call it. Anything that
+//! should be true of a SwiftTunnel connection is true of both, which is the
+//! only way that claim survives contact with a second client.
+
+use std::net::SocketAddr;
+
+use crate::settings::{AdapterBindingMode, AppSettings};
+use crate::vpn::parallel_interceptor::{
+    AdapterBindingPreference, BindingPreferenceSource, NetworkAdapterInfo, list_network_adapters,
+    preflight_binding,
+};
+use crate::vpn::servers::DynamicServerList;
+
+/// Wait for startup network recovery before starting another driver operation.
+pub async fn wait_for_startup_recovery(
+    mut done: tokio::sync::watch::Receiver<bool>,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    if *done.borrow() {
+        return Ok(());
+    }
+    log::info!("Connect requested before startup network recovery finished; waiting");
+    match tokio::time::timeout(timeout, done.wait_for(|ready| *ready)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(_)) => Err(
+            "Startup network recovery stopped before completion. Restart SwiftTunnel and try again."
+                .into(),
+        ),
+        Err(_) => Err(
+            "Startup network recovery is still running. Wait a moment and try connecting again."
+                .into(),
+        ),
+    }
+}
+
+// ── Adapter binding ─────────────────────────────────────────────────────────
+
+/// Why an adapter cannot carry game traffic, or `None` when it can.
+pub fn manual_adapter_unusable_reason(adapter: &NetworkAdapterInfo) -> Option<&'static str> {
+    if !adapter.is_up {
+        return Some("adapter is down");
+    }
+
+    match adapter.kind.as_str() {
+        "loopback" => Some("loopback adapters cannot carry game traffic"),
+        "tunnel" => Some("VPN/tunnel adapters cannot be used as the physical adapter"),
+        _ => None,
+    }
+}
+
+/// The best name to show a person for an adapter.
+pub fn manual_adapter_label(adapter: &NetworkAdapterInfo) -> &str {
+    if !adapter.friendly_name.trim().is_empty() {
+        adapter.friendly_name.as_str()
+    } else if !adapter.description.trim().is_empty() {
+        adapter.description.as_str()
+    } else {
+        adapter.guid.as_str()
+    }
+}
+
+/// Refuse a saved adapter that cannot work, before the tunnel is attempted.
+pub fn validate_manual_adapter_selection(guid: &str) -> Result<(), String> {
+    let normalized_guid = guid.trim().to_ascii_lowercase();
+    if normalized_guid.is_empty() {
+        return Ok(());
+    }
+
+    let adapters = list_network_adapters()
+        .map_err(|e| format!("Failed to validate manual adapter selection: {}", e))?;
+
+    let Some(adapter) = adapters
+        .iter()
+        .find(|adapter| adapter.guid.eq_ignore_ascii_case(&normalized_guid))
+    else {
+        // Missing saved adapters are still allowed to fall back later. This
+        // can happen after a driver reinstall, or when Windows recreates an
+        // adapter GUID.
+        return Ok(());
+    };
+
+    if let Some(reason) = manual_adapter_unusable_reason(adapter) {
+        return Err(format!(
+            "Selected adapter is not usable for SwiftTunnel ({}: {}). Choose an [OK] adapter or switch to Smart Auto.",
+            manual_adapter_label(adapter),
+            reason
+        ));
+    }
+
+    Ok(())
+}
+
+/// Which adapter this connection should bind to, from the saved settings.
+///
+/// `None` means "let the driver pick", which is the right answer both when the
+/// user asked for Smart Auto with nothing remembered for this network, and
+/// when Manual is set but the saved adapter has gone.
+pub fn current_binding_preference(
+    settings: &mut AppSettings,
+) -> Result<Option<AdapterBindingPreference>, String> {
+    match settings.adapter_binding_mode {
+        AdapterBindingMode::Manual => {
+            let Some(guid) = settings.preferred_physical_adapter_guid.clone() else {
+                log::warn!(
+                    "Adapter binding mode is Manual but no adapter GUID is selected; using Smart Auto selection."
+                );
+                return Ok(None);
+            };
+
+            validate_manual_adapter_selection(&guid)?;
+
+            Ok(Some(AdapterBindingPreference {
+                guid,
+                source: BindingPreferenceSource::Manual,
+                network_signature: None,
+            }))
+        }
+        AdapterBindingMode::SmartAuto => {
+            let base = preflight_binding(None).map_err(|e| e.to_string())?;
+            let Some(guid) = settings
+                .network_binding_overrides
+                .get(&base.network_signature)
+                .cloned()
+            else {
+                return Ok(None);
+            };
+
+            Ok(Some(AdapterBindingPreference {
+                guid,
+                source: BindingPreferenceSource::RememberedAuto,
+                network_signature: Some(base.network_signature),
+            }))
+        }
+    }
+}
+
+/// Keep regional Auto opt-in per connection, without overriding manual or TCP routes.
+pub fn regional_auto_scope(settings: &AppSettings, region: &str) -> Option<String> {
+    (settings.manual_relay.is_none()
+        && settings.custom_relay_server.is_empty()
+        && !settings.enable_api_tunneling
+        && !settings.enable_country_ban)
+        .then(|| region.to_string())
+}
+
+// ── Region and candidate selection ──────────────────────────────────────────
+
+/// The region with the lowest measured round trip.
+pub fn select_best_region_by_latency(sl: &DynamicServerList) -> Option<String> {
+    sl.regions()
+        .iter()
+        .filter_map(|region| {
+            sl.get_region_best_latency(&region.id)
+                .map(|latency| (region.id.clone(), latency))
+        })
+        .min_by(|(region_a, latency_a), (region_b, latency_b)| {
+            latency_a
+                .cmp(latency_b)
+                .then_with(|| region_a.cmp(region_b))
+        })
+        .map(|(region_id, _)| region_id)
+}
+
+/// Where to connect, given what the user picked and whether auto-routing is on.
+pub fn resolve_initial_connect_region(
+    sl: &DynamicServerList,
+    requested_region: &str,
+    auto_routing: bool,
+) -> String {
+    let requested_available = !sl.servers_in_region(requested_region).is_empty();
+    if !auto_routing && requested_available {
+        return requested_region.to_string();
+    }
+
+    select_best_region_by_latency(sl).unwrap_or_else(|| {
+        if requested_available {
+            return requested_region.to_string();
+        }
+        sl.regions()
+            .iter()
+            .find(|region| !sl.servers_in_region(&region.id).is_empty())
+            .map(|region| region.id.clone())
+            .unwrap_or_else(|| requested_region.to_string())
+    })
+}
+
+/// Resolve Automatic or validate an explicit choice against the refreshed fleet.
+pub fn connect_candidates(
+    sl: &DynamicServerList,
+    requested_region: &str,
+    auto_routing: bool,
+    manual: Option<&crate::settings::ManualRelay>,
+) -> Result<(String, Vec<(String, SocketAddr, Option<u32>)>), String> {
+    let mut available = build_available_servers(sl);
+    if let Some(manual) = manual.filter(|_| !auto_routing) {
+        let valid = manual.region == requested_region
+            && sl.servers_in_region(requested_region).iter().any(|server| {
+                server.region == manual.server_id
+                    && server.ip == manual.ip
+                    && server.effective_relay_port() == manual.port
+                    && server.relay_available
+            });
+        if !valid {
+            return Err("Your selected relay is unavailable or has changed. Choose another relay or Automatic, then connect again.".into());
+        }
+        available.retain(|(id, _, _)| id == &manual.server_id);
+        if available.is_empty() {
+            return Err(
+                "Your selected relay has an invalid address. Choose another relay or Automatic."
+                    .into(),
+            );
+        }
+        return Ok((requested_region.to_string(), available));
+    }
+    Ok((
+        resolve_initial_connect_region(sl, requested_region, auto_routing),
+        available,
+    ))
+}
+
+/// The relays a connection may use, with their measured round trips.
+///
+/// The latency matters: auto-routing sorts by it mid-session, so handing this
+/// over without it leaves the router unable to tell one relay from another.
+pub fn build_available_servers(sl: &DynamicServerList) -> Vec<(String, SocketAddr, Option<u32>)> {
+    sl.servers()
+        .iter()
+        .filter(|s| s.relay_available)
+        .filter_map(|s| {
+            let addr: SocketAddr = format!("{}:{}", s.ip, s.effective_relay_port())
+                .parse()
+                .ok()?;
+            let latency = sl.get_recent_latency(&s.region);
+            Some((s.region.clone(), addr, latency))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regional_auto_never_overrides_a_pin_custom_relay_or_tcp_assist() {
+        let mut settings = AppSettings {
+            manual_relay: None,
+            enable_api_tunneling: false,
+            enable_country_ban: false,
+            custom_relay_server: String::new(),
+            ..AppSettings::default()
+        };
+        assert_eq!(
+            regional_auto_scope(&settings, "mumbai"),
+            Some("mumbai".into())
+        );
+        settings.manual_relay = Some(manual_choice());
+        assert_eq!(regional_auto_scope(&settings, "mumbai"), None);
+        settings.manual_relay = None;
+        settings.enable_api_tunneling = true;
+        assert_eq!(regional_auto_scope(&settings, "mumbai"), None);
+        settings.enable_api_tunneling = false;
+        settings.enable_country_ban = true;
+        assert_eq!(regional_auto_scope(&settings, "mumbai"), None);
+        settings.enable_country_ban = false;
+        settings.custom_relay_server = "192.0.2.1:51821".into();
+        assert_eq!(regional_auto_scope(&settings, "mumbai"), None);
+    }
+
+    fn manual_choice() -> crate::settings::ManualRelay {
+        crate::settings::ManualRelay {
+            region: "singapore".into(),
+            server_id: "singapore-02".into(),
+            ip: "1.1.1.2".into(),
+            port: 8443,
+        }
+    }
+
+    #[test]
+    fn manual_relay_excludes_faster_alternatives_and_preserves_auth_id() {
+        let mut list = make_dynamic_server_list();
+        list.set_latency("singapore", Some(1));
+        list.set_latency("singapore-02", Some(90));
+        let (region, candidates) =
+            connect_candidates(&list, "singapore", false, Some(&manual_choice())).unwrap();
+        assert_eq!(region, "singapore");
+        assert_eq!(
+            candidates,
+            vec![(
+                "singapore-02".into(),
+                "1.1.1.2:8443".parse().unwrap(),
+                Some(90)
+            )]
+        );
+        assert_eq!(
+            super::super::connection::relay_candidates_for_region(&region, &candidates),
+            candidates
+        );
+    }
+
+    #[test]
+    fn manual_relay_rejects_removed_reused_moved_and_unavailable_choices() {
+        let list = make_dynamic_server_list();
+        for choice in [
+            crate::settings::ManualRelay {
+                server_id: "removed".into(),
+                ..manual_choice()
+            },
+            crate::settings::ManualRelay {
+                ip: "1.1.1.3".into(),
+                ..manual_choice()
+            },
+            crate::settings::ManualRelay {
+                port: 51821,
+                ..manual_choice()
+            },
+            crate::settings::ManualRelay {
+                region: "tokyo".into(),
+                ..manual_choice()
+            },
+        ] {
+            assert!(connect_candidates(&list, "singapore", false, Some(&choice)).is_err());
+        }
+        let mut list = make_dynamic_server_list();
+        let mut servers = list.servers().to_vec();
+        servers[1].relay_available = false;
+        list.update(servers, list.regions().to_vec(), ServerListSource::Api);
+        assert!(connect_candidates(&list, "singapore", false, Some(&manual_choice())).is_err());
+    }
+
+    #[test]
+    fn automatic_keeps_all_candidates_and_ignores_inactive_manual_choice() {
+        let list = make_dynamic_server_list();
+        assert_eq!(
+            connect_candidates(&list, "singapore", false, None)
+                .unwrap()
+                .1
+                .len(),
+            3
+        );
+        assert_eq!(
+            connect_candidates(&list, "singapore", true, Some(&manual_choice()))
+                .unwrap()
+                .1
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn legacy_settings_do_not_restore_old_pins_and_new_choices_round_trip() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("manual_relay");
+        value["forced_servers"] = serde_json::json!({"singapore": "singapore-02"});
+        let mut settings: AppSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.manual_relay, None);
+        settings.manual_relay = Some(manual_choice());
+        let restored: AppSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored.manual_relay, settings.manual_relay);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_timeout_must_not_allow_connect() {
+        let (_sender, receiver) = tokio::sync::watch::channel(false);
+        assert!(
+            wait_for_startup_recovery(receiver, std::time::Duration::ZERO)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_closed_signal_must_not_allow_connect() {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        drop(sender);
+        assert!(
+            wait_for_startup_recovery(receiver, std::time::Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_completed_signal_allows_connect() {
+        let (sender, receiver) = tokio::sync::watch::channel(true);
+        drop(sender);
+        assert!(
+            wait_for_startup_recovery(receiver, std::time::Duration::ZERO)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_waits_for_actual_completion_and_allows_retry() {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        assert!(
+            wait_for_startup_recovery(receiver.clone(), std::time::Duration::ZERO)
+                .await
+                .is_err()
+        );
+        let waiting = wait_for_startup_recovery(receiver, std::time::Duration::from_secs(2));
+        tokio::pin!(waiting);
+        tokio::select! {
+            result = &mut waiting => panic!("connect proceeded before recovery: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+        sender.send(true).unwrap();
+        assert!(waiting.await.is_ok());
+    }
+    use crate::vpn::servers::{DynamicGamingRegion, DynamicServerInfo, ServerListSource};
+
+    fn make_server(region: &str, ip: &str) -> DynamicServerInfo {
+        DynamicServerInfo {
+            region: region.to_string(),
+            name: region.to_string(),
+            country_code: "sg".to_string(),
+            ip: ip.to_string(),
+            port: 51820,
+            phantun_available: false,
+            phantun_port: None,
+            relay_available: true,
+            relay_port: Some(8443),
+            active_users: None,
+            busy: false,
+            full: false,
+            metered: false,
+        }
+    }
+
+    fn make_region(id: &str, servers: &[&str]) -> DynamicGamingRegion {
+        DynamicGamingRegion {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: String::new(),
+            country_code: "sg".to_string(),
+            servers: servers.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn make_dynamic_server_list() -> DynamicServerList {
+        let mut list = DynamicServerList::new_empty();
+        list.update(
+            vec![
+                make_server("singapore", "1.1.1.1"),
+                make_server("singapore-02", "1.1.1.2"),
+                make_server("tokyo-01", "2.2.2.1"),
+            ],
+            vec![
+                make_region("singapore", &["singapore", "singapore-02"]),
+                make_region("tokyo", &["tokyo-01"]),
+            ],
+            ServerListSource::Api,
+        );
+        list
+    }
+
+    fn make_network_adapter(kind: &str, is_up: bool) -> NetworkAdapterInfo {
+        NetworkAdapterInfo {
+            guid: format!("{kind}-guid"),
+            friendly_name: kind.to_string(),
+            description: kind.to_string(),
+            if_index: 10,
+            is_up,
+            is_default_route: false,
+            kind: kind.to_string(),
+        }
+    }
+
+    #[test]
+    fn manual_adapter_validation_rejects_unusable_adapter_kinds() {
+        assert_eq!(
+            manual_adapter_unusable_reason(&make_network_adapter("loopback", true)),
+            Some("loopback adapters cannot carry game traffic")
+        );
+        assert_eq!(
+            manual_adapter_unusable_reason(&make_network_adapter("tunnel", true)),
+            Some("VPN/tunnel adapters cannot be used as the physical adapter")
+        );
+        assert_eq!(
+            manual_adapter_unusable_reason(&make_network_adapter("wifi", false)),
+            Some("adapter is down")
+        );
+        assert_eq!(
+            manual_adapter_unusable_reason(&make_network_adapter("ethernet", true)),
+            None
+        );
+    }
+
+    #[test]
+    fn select_best_region_by_latency_uses_ping_test_region_best() {
+        let mut list = make_dynamic_server_list();
+        list.set_latency("singapore", Some(28));
+        list.set_latency("tokyo-01", Some(90));
+
+        assert_eq!(
+            select_best_region_by_latency(&list),
+            Some("singapore".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_initial_connect_region_keeps_manual_region() {
+        let mut list = make_dynamic_server_list();
+        list.set_latency("singapore", Some(12));
+        list.set_latency("tokyo-01", Some(90));
+
+        assert_eq!(
+            resolve_initial_connect_region(&list, "tokyo", false),
+            "tokyo"
+        );
+    }
+
+    #[test]
+    fn resolve_initial_connect_region_uses_ping_test_best_for_auto_routing() {
+        let mut list = make_dynamic_server_list();
+        list.set_latency("singapore", Some(12));
+        list.set_latency("tokyo-01", Some(90));
+
+        assert_eq!(
+            resolve_initial_connect_region(&list, "tokyo", true),
+            "singapore"
+        );
+    }
+
+    #[test]
+    fn resolve_initial_connect_region_falls_back_without_ping_results() {
+        let list = make_dynamic_server_list();
+        assert_eq!(
+            resolve_initial_connect_region(&list, "tokyo", true),
+            "tokyo"
+        );
+    }
+
+    #[test]
+    fn removed_location_uses_a_current_location_without_hardcoded_fleet_ids() {
+        let mut list = make_dynamic_server_list();
+        list.set_latency("tokyo-01", Some(20));
+        for auto in [false, true] {
+            assert_eq!(
+                resolve_initial_connect_region(&list, "retired-location", auto),
+                "tokyo"
+            );
+        }
+        let mut unavailable = list.servers.clone();
+        unavailable
+            .iter_mut()
+            .for_each(|server| server.relay_available = false);
+        list.update(unavailable, list.regions.clone(), ServerListSource::Api);
+        // No invented endpoint when the whole fleet is unavailable.
+        assert_eq!(
+            resolve_initial_connect_region(&list, "retired-location", false),
+            "retired-location"
+        );
+    }
+
+    #[test]
+    fn available_servers_carry_their_latency() {
+        // The bug this guards: handing the candidates over without latency
+        // leaves auto-routing unable to sort them, which is how Lite was
+        // connecting before this module existed.
+        let mut list = make_dynamic_server_list();
+        list.set_latency("singapore", Some(28));
+
+        let available = build_available_servers(&list);
+        let singapore = available
+            .iter()
+            .find(|(region, _, _)| region == "singapore")
+            .expect("singapore should be a candidate");
+        assert_eq!(singapore.2, Some(28));
+    }
+}

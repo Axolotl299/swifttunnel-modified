@@ -1,0 +1,78 @@
+[package]
+name = "swifttunnel-desktop"
+version = "3.9.7"
+default-run = "swifttunnel-desktop"
+edition = "2024"
+authors = ["SwiftTunnel <support@swifttunnel.net>"]
+description = "SwiftTunnel desktop app - Tauri v2 frontend"
+
+[dependencies]
+swifttunnel-installer-cache = { path = "../../swifttunnel-installer-cache" }
+swifttunnel-core = { path = "../../swifttunnel-core" }
+# Clears an orphaned registration before an upgrade runs. Same crate the
+# standalone Setup launcher uses, so both paths heal identically.
+swifttunnel-msi-repair = { path = "../../swifttunnel-msi-repair" }
+# `default-features = false` drops the non-Windows defaults (`dbus`, `x11`,
+# `webkit2gtk`) and the rarely-used `dynamic-acl` capability codegen. We
+# re-enable only what this Windows-only app actually links against.
+# Includes the Windows local-origin fix (GHSA-7gmj-67g7-phm9) and matches
+# the support/runtime versions resolved in Cargo.lock.
+tauri = { version = "2.12.5", default-features = false, features = [
+    "wry",
+    "tauri-runtime-wry",
+    "common-controls-v6",
+    "compression",
+    "tray-icon",
+] }
+tauri-plugin-single-instance = "2"
+# Metadata parser only. This crate still needs TLS to compile, but our verified
+# MSI updater does not need its optional archive extraction support.
+tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+parking_lot = "0.12"
+log = "0.4"
+env_logger = "0.11"
+simplelog = "0.12"
+dirs = "5"
+# See swifttunnel-core/Cargo.toml: native roots trust the Windows cert store so
+# antivirus/proxy TLS inspection doesn't break the app's HTTPS (login exchange).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots", "system-proxy"] }
+semver = "1.0"
+sha2 = "0.10"
+base64 = "0.22"
+minisign-verify = "0.2.5"
+ring = "0.17"
+url = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+sysinfo = { version = "0.32", default-features = false, features = ["system", "windows"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+# This package must contain exactly one binary.
+#
+# Tauri's WiX bundler installs every bin target of the package it bundles, so
+# the testbench harness that used to live in `src/bin/` was being shipped to
+# users as C:\Program Files\SwiftTunnel\desktop_testbench_harness.exe. Cargo's
+# `required-features` is no defence: the bundler takes the target list from
+# cargo metadata and ignores it, so gating the binary just made bundling fail
+# on a file that was no longer built.
+#
+# The harness now lives in the `swifttunnel-testbench` crate, which depends on
+# this one as a library. Do not add a `[[bin]]` or a `src/bin/` entry here.
+[[bin]]
+name = "swifttunnel-desktop"
+path = "src/main.rs"

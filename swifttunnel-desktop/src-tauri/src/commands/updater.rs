@@ -1,0 +1,872 @@
+use super::update_download::Package;
+use base64::Engine as _;
+use reqwest::header::{ACCEPT, USER_AGENT};
+use semver::Version;
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter};
+
+const UPDATER_PROGRESS_EVENT: &str = "updater://progress";
+const UPDATER_DONE_EVENT: &str = "updater://done";
+
+// A webview guard is not sufficient: overlapping IPC callers must not stage
+// or launch competing installers. Keep this permit through the blocking work,
+// even if the caller stops waiting for its result.
+static INSTALL_OPERATION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+fn begin_install() -> Result<tokio::sync::SemaphorePermit<'static>, String> {
+    INSTALL_OPERATION
+        .try_acquire()
+        .map_err(|_| "An update is already in progress. Wait for it to finish.".to_string())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UpdaterProgressPayload {
+    downloaded: u64,
+    total: Option<u64>,
+}
+
+use swifttunnel_core::updater::UpdateChannel;
+
+const GITHUB_RELEASES_API_URL: &str =
+    "https://api.github.com/repos/Swift-tunnel/swifttunnel-app/releases";
+const GITHUB_RELEASES_DOWNLOAD_BASE_URL: &str =
+    "https://github.com/Swift-tunnel/swifttunnel-app/releases/download";
+const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
+const GITHUB_API_USER_AGENT: &str = "SwiftTunnel-Updater";
+const UPDATE_MANIFEST_FILE_NAME: &str = "swifttunnel-update-manifest.json";
+const UPDATE_MANIFEST_SIGNATURE_FILE_NAME: &str = "swifttunnel-update-manifest.sig";
+const UPDATE_MANIFEST_PUBLIC_KEY_PLACEHOLDER: &str =
+    "REPLACE_WITH_SWIFTTUNNEL_UPDATE_MANIFEST_PUBLIC_KEY_B64";
+const LEGACY_TAURI_UPDATER_PUBLIC_KEY_PLACEHOLDER: &str =
+    "REPLACE_WITH_LEGACY_TAURI_UPDATER_PUBLIC_KEY";
+
+#[derive(Debug, Serialize)]
+pub struct UpdaterCheckResponse {
+    pub current_version: String,
+    pub available_version: Option<String>,
+    pub release_tag: Option<String>,
+    pub release_notes: Option<String>,
+    pub channel: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdaterInstallResponse {
+    pub installed_version: String,
+    pub reboot_required: bool,
+    pub release_tag: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SignedUpdateManifest {
+    version: String,
+    tag: String,
+    channel_class: String,
+    latest_json_url: String,
+    latest_json_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedRelease {
+    tag_name: String,
+    version: Version,
+    prerelease: bool,
+    release_notes: Option<String>,
+}
+
+#[derive(Debug)]
+struct PreparedUpdate {
+    selected_release: SelectedRelease,
+    package: Package,
+}
+
+/// Runtime override of the manifest verification key. Debug builds only.
+///
+/// This key is the whole of the updater's trust: the manifest it validates
+/// names the installer we download and run elevated. Letting an environment
+/// variable replace it means anything able to set one variable on our process
+/// can sign its own manifest and have us accept it, which turns the update path
+/// into a code execution path.
+///
+/// Useful when testing against a staging signing key, so it stays in debug and
+/// compiles out of release rather than being a runtime check somebody could
+/// later relax.
+#[cfg(debug_assertions)]
+fn update_manifest_key_override() -> Option<String> {
+    std::env::var("SWIFTTUNNEL_UPDATE_MANIFEST_PUBLIC_KEY_B64")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(not(debug_assertions))]
+fn update_manifest_key_override() -> Option<String> {
+    None
+}
+
+fn update_manifest_public_key_b64() -> Result<String, String> {
+    // The compile-time key is baked in at build time and is not attacker
+    // controlled; only the runtime lookup above is.
+    let key = update_manifest_key_override().unwrap_or_else(|| {
+        option_env!("SWIFTTUNNEL_UPDATE_MANIFEST_PUBLIC_KEY_B64")
+            .unwrap_or(UPDATE_MANIFEST_PUBLIC_KEY_PLACEHOLDER)
+            .trim()
+            .to_string()
+    });
+    if key.is_empty() || key == UPDATE_MANIFEST_PUBLIC_KEY_PLACEHOLDER {
+        return Err("Updater manifest public key is not configured".to_string());
+    }
+    Ok(key)
+}
+
+fn legacy_tauri_updater_public_key() -> Option<String> {
+    #[cfg(debug_assertions)]
+    let runtime_key = std::env::var("TAURI_UPDATER_LEGACY_PUBLIC_KEY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    #[cfg(not(debug_assertions))]
+    let runtime_key: Option<String> = None;
+
+    let key = runtime_key.unwrap_or_else(|| {
+        option_env!("TAURI_UPDATER_LEGACY_PUBLIC_KEY")
+            .unwrap_or(LEGACY_TAURI_UPDATER_PUBLIC_KEY_PLACEHOLDER)
+            .trim()
+            .to_string()
+    });
+
+    if key.is_empty() || key == LEGACY_TAURI_UPDATER_PUBLIC_KEY_PLACEHOLDER {
+        None
+    } else {
+        Some(key)
+    }
+}
+
+fn channel_name(channel: UpdateChannel) -> &'static str {
+    match channel {
+        UpdateChannel::Live => "Live",
+        UpdateChannel::Stable => "Stable",
+    }
+}
+
+fn release_class(prerelease: bool) -> &'static str {
+    if prerelease { "live" } else { "stable" }
+}
+
+fn normalize_tag_version(tag_name: &str) -> Option<Version> {
+    let trimmed = tag_name.trim();
+    let candidate = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    Version::parse(candidate).ok()
+}
+
+fn latest_json_url_for_tag(tag_name: &str) -> String {
+    format!("{GITHUB_RELEASES_DOWNLOAD_BASE_URL}/{tag_name}/latest.json")
+}
+
+fn manifest_url_for_tag(tag_name: &str) -> String {
+    format!("{GITHUB_RELEASES_DOWNLOAD_BASE_URL}/{tag_name}/{UPDATE_MANIFEST_FILE_NAME}")
+}
+
+fn manifest_signature_url_for_tag(tag_name: &str) -> String {
+    format!("{GITHUB_RELEASES_DOWNLOAD_BASE_URL}/{tag_name}/{UPDATE_MANIFEST_SIGNATURE_FILE_NAME}")
+}
+
+fn select_release_for_channel(
+    releases: Vec<GithubRelease>,
+    channel: UpdateChannel,
+    current_version: &Version,
+) -> Option<SelectedRelease> {
+    releases
+        .into_iter()
+        .filter(|release| !release.draft)
+        .filter(|release| channel == UpdateChannel::Live || !release.prerelease)
+        .filter_map(|release| {
+            let version = normalize_tag_version(&release.tag_name)?;
+            Some(SelectedRelease {
+                tag_name: release.tag_name,
+                version,
+                prerelease: release.prerelease,
+                release_notes: release.body,
+            })
+        })
+        .filter(|release| release.version > *current_version)
+        .max_by(|left, right| left.version.cmp(&right.version))
+}
+
+fn verify_manifest_signature(manifest_bytes: &[u8], signature_b64: &str) -> Result<(), String> {
+    let public_key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(update_manifest_public_key_b64()?)
+        .map_err(|e| format!("Invalid updater manifest public key encoding: {}", e))?;
+    verify_manifest_signature_with_public_key(manifest_bytes, signature_b64, &public_key_bytes)
+}
+
+/// Delegates to core so both clients check signatures with one
+/// implementation. Lite needs the same check, and a second copy of security
+/// code is how two copies drift until only one of them is right.
+fn verify_manifest_signature_with_public_key(
+    manifest_bytes: &[u8],
+    signature_b64: &str,
+    public_key_bytes: &[u8],
+) -> Result<(), String> {
+    swifttunnel_core::update_verify::verify_manifest_signature_with_public_key(
+        manifest_bytes,
+        signature_b64,
+        public_key_bytes,
+    )
+}
+
+fn verify_bytes_sha256(bytes: &[u8], expected_sha256: &str) -> Result<(), String> {
+    swifttunnel_core::update_verify::verify_bytes_sha256(bytes, expected_sha256, "latest.json")
+}
+
+fn verify_manifest_payload(
+    manifest: &SignedUpdateManifest,
+    selected_release: &SelectedRelease,
+    expected_latest_json_url: &str,
+) -> Result<(), String> {
+    if manifest.tag != selected_release.tag_name {
+        return Err(format!(
+            "Manifest tag mismatch: expected '{}', got '{}'",
+            selected_release.tag_name, manifest.tag
+        ));
+    }
+
+    let manifest_version = Version::parse(&manifest.version).map_err(|e| {
+        format!(
+            "Manifest contains invalid version '{}': {}",
+            manifest.version, e
+        )
+    })?;
+    if manifest_version != selected_release.version {
+        return Err(format!(
+            "Manifest version mismatch: expected '{}', got '{}'",
+            selected_release.version, manifest.version
+        ));
+    }
+
+    if !manifest
+        .channel_class
+        .eq_ignore_ascii_case(release_class(selected_release.prerelease))
+    {
+        return Err(format!(
+            "Manifest channel mismatch: expected '{}', got '{}'",
+            release_class(selected_release.prerelease),
+            manifest.channel_class
+        ));
+    }
+
+    if manifest.latest_json_url != expected_latest_json_url {
+        return Err(format!(
+            "Manifest latest.json URL mismatch: expected '{}', got '{}'",
+            expected_latest_json_url, manifest.latest_json_url
+        ));
+    }
+
+    Ok(())
+}
+
+async fn github_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("Failed to create updater HTTP client: {}", e))
+}
+
+async fn fetch_releases(client: &reqwest::Client) -> Result<Vec<GithubRelease>, String> {
+    let response = client
+        .get(GITHUB_RELEASES_API_URL)
+        .header(USER_AGENT, GITHUB_API_USER_AGENT)
+        .header(ACCEPT, GITHUB_API_ACCEPT)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch GitHub releases: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "GitHub releases API returned status {}",
+            response.status()
+        ));
+    }
+
+    let bytes =
+        swifttunnel_core::http_body::read_bounded(response, 4 * 1024 * 1024, "release list")
+            .await?;
+    serde_json::from_slice::<Vec<GithubRelease>>(&bytes)
+        .map_err(|e| format!("Failed to parse GitHub releases: {}", e))
+}
+
+async fn fetch_manifest_with_verification(
+    client: &reqwest::Client,
+    selected_release: &SelectedRelease,
+) -> Result<SignedUpdateManifest, String> {
+    let latest_json_url = latest_json_url_for_tag(&selected_release.tag_name);
+    let manifest_url = manifest_url_for_tag(&selected_release.tag_name);
+    let signature_url = manifest_signature_url_for_tag(&selected_release.tag_name);
+
+    let manifest_response = client
+        .get(&manifest_url)
+        .header(USER_AGENT, GITHUB_API_USER_AGENT)
+        .header(ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch updater manifest: {}", e))?;
+
+    if !manifest_response.status().is_success() {
+        return Err(format!(
+            "Updater manifest endpoint returned status {}",
+            manifest_response.status()
+        ));
+    }
+
+    let manifest_bytes = swifttunnel_core::http_body::read_bounded(
+        manifest_response,
+        1024 * 1024,
+        "update manifest",
+    )
+    .await?;
+
+    let signature_response = client
+        .get(&signature_url)
+        .header(USER_AGENT, GITHUB_API_USER_AGENT)
+        .header(ACCEPT, "text/plain")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch updater manifest signature: {}", e))?;
+
+    if !signature_response.status().is_success() {
+        return Err(format!(
+            "Updater manifest signature endpoint returned status {}",
+            signature_response.status()
+        ));
+    }
+
+    let signature_b64 = String::from_utf8(
+        swifttunnel_core::http_body::read_bounded(signature_response, 4096, "manifest signature")
+            .await?,
+    )
+    .map_err(|_| "The update manifest signature is not valid text.".to_string())?;
+
+    verify_manifest_signature(&manifest_bytes, &signature_b64)?;
+
+    let manifest: SignedUpdateManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| format!("Failed to parse updater manifest JSON: {}", e))?;
+
+    verify_manifest_payload(&manifest, selected_release, &latest_json_url)?;
+
+    Ok(manifest)
+}
+
+async fn fetch_verified_latest_json(
+    client: &reqwest::Client,
+    manifest: &SignedUpdateManifest,
+) -> Result<Vec<u8>, String> {
+    let latest_response = client
+        .get(&manifest.latest_json_url)
+        .header(USER_AGENT, GITHUB_API_USER_AGENT)
+        .header(ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch release latest.json: {}", e))?;
+
+    if !latest_response.status().is_success() {
+        return Err(format!(
+            "latest.json endpoint returned status {}",
+            latest_response.status()
+        ));
+    }
+
+    let latest_json_bytes =
+        swifttunnel_core::http_body::read_bounded(latest_response, 1024 * 1024, "latest.json")
+            .await?;
+
+    verify_bytes_sha256(&latest_json_bytes, &manifest.latest_json_sha256)?;
+    Ok(latest_json_bytes)
+}
+
+async fn prepare_channel_update(
+    channel: UpdateChannel,
+    current_version: &Version,
+) -> Result<Option<PreparedUpdate>, String> {
+    let client = github_client().await?;
+    let releases = fetch_releases(&client).await?;
+
+    let Some(selected_release) = select_release_for_channel(releases, channel, current_version)
+    else {
+        return Ok(None);
+    };
+
+    let manifest = fetch_manifest_with_verification(&client, &selected_release).await?;
+    let latest_json = fetch_verified_latest_json(&client, &manifest).await?;
+    let package = Package::from_metadata(
+        &latest_json,
+        &selected_release.version,
+        &selected_release.tag_name,
+        std::env::consts::ARCH,
+    )?;
+
+    Ok(Some(PreparedUpdate {
+        selected_release,
+        package,
+    }))
+}
+
+#[tauri::command]
+pub async fn updater_check_channel(
+    app: AppHandle,
+    channel: UpdateChannel,
+) -> Result<UpdaterCheckResponse, String> {
+    let current_version = Version::parse(&app.package_info().version.to_string())
+        .map_err(|e| format!("Current app version is invalid semver: {}", e))?;
+
+    let Some(prepared) = prepare_channel_update(channel, &current_version).await? else {
+        return Ok(UpdaterCheckResponse {
+            current_version: current_version.to_string(),
+            available_version: None,
+            release_tag: None,
+            release_notes: None,
+            channel: channel_name(channel).to_string(),
+        });
+    };
+
+    Ok(UpdaterCheckResponse {
+        current_version: current_version.to_string(),
+        available_version: Some(prepared.selected_release.version.to_string()),
+        release_tag: Some(prepared.selected_release.tag_name),
+        release_notes: prepared.selected_release.release_notes,
+        channel: channel_name(channel).to_string(),
+    })
+}
+
+/// Keep every registered source immutable until a reference-aware collector exists.
+fn stage_installer(
+    version: &str,
+    package: &[u8],
+) -> Result<swifttunnel_installer_cache::ProtectedInstaller, String> {
+    swifttunnel_installer_cache::InstallerCache::open()
+        .and_then(|cache| cache.stage(&format!("SwiftTunnel-{version}.msi"), package))
+        .map_err(|error| format!("Could not prepare the protected installer cache: {error}. If Retry fails, use the signed MSI from the official GitHub release or contact support@swifttunnel.net."))
+}
+/// Run msiexec against a staged installer.
+///
+/// Mirrors what tauri-plugin-updater passes, so the install behaves exactly as
+/// it did before: /passive for a progress bar only, /promptrestart, and
+/// AUTOLAUNCHAPP so the app comes back up afterwards. The app already runs
+/// elevated, so the child process inherits that and no extra prompt appears.
+fn installer_exit_result(code: Option<i32>) -> Result<bool, String> {
+    match code {
+        Some(0) => Ok(false),
+        Some(3010 | 1641) => Ok(true),
+        Some(1602) => Err("Update installation was cancelled.".to_string()),
+        Some(code) => Err(format!(
+            "Windows Installer did not complete the update (code {code}). Please retry or use the downloaded installer."
+        )),
+        None => {
+            Err("Windows Installer ended without a completion result. Please retry.".to_string())
+        }
+    }
+}
+
+fn launch_msi_installer(
+    installer: &swifttunnel_installer_cache::ProtectedInstaller,
+) -> Result<bool, String> {
+    use std::os::windows::process::CommandExt;
+    let msiexec =
+        swifttunnel_installer_cache::windows_installer_path().map_err(|e| e.to_string())?;
+
+    let status = std::process::Command::new(msiexec)
+        .arg("/i")
+        .arg(installer.path())
+        .arg("/passive")
+        .arg("/promptrestart")
+        .arg("AUTOLAUNCHAPP=True")
+        .creation_flags(0x0800_0000)
+        .status()
+        .map_err(|e| format!("Failed to start the installer: {e}"))?;
+
+    installer_exit_result(status.code())
+}
+
+#[tauri::command]
+pub async fn updater_install_channel(
+    app: AppHandle,
+    channel: UpdateChannel,
+    expected_version: String,
+) -> Result<UpdaterInstallResponse, String> {
+    let install_permit = begin_install()?;
+    let current_version = Version::parse(&app.package_info().version.to_string())
+        .map_err(|e| format!("Current app version is invalid semver: {}", e))?;
+    let normalized_expected_version = Version::parse(expected_version.trim()).map_err(|e| {
+        format!(
+            "Expected version '{}' is invalid semver: {}",
+            expected_version, e
+        )
+    })?;
+
+    let Some(prepared) = prepare_channel_update(channel, &current_version).await? else {
+        return Err("No eligible update found for the selected channel".to_string());
+    };
+
+    if prepared.selected_release.version != normalized_expected_version {
+        return Err(format!(
+            "Expected version '{}' does not match selected release '{}'",
+            normalized_expected_version, prepared.selected_release.version
+        ));
+    }
+
+    let primary_key = app
+        .config()
+        .plugins
+        .0
+        .get("updater")
+        .and_then(|config| config.get("pubkey"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            "This app's update key is missing. Download the official installer.".to_string()
+        })?
+        .to_string();
+    let legacy_key = legacy_tauri_updater_public_key();
+    let app_for_progress = app.clone();
+    let package = prepared
+        .package
+        .download(move |downloaded, total| {
+            let _ = app_for_progress.emit(
+                UPDATER_PROGRESS_EVENT,
+                UpdaterProgressPayload { downloaded, total },
+            );
+        })
+        .await?;
+
+    // Install from a directory that survives, not the temp folder the plugin
+    // would otherwise use. Windows records the path msiexec ran from as the
+    // product's installation source, and it wipes %TEMP%. The next upgrade
+    // then cannot find the package it needs to remove the old version and
+    // dies on "the feature you are trying to use is on a network resource
+    // that is unavailable", leaving the machine unable to upgrade or
+    // uninstall. Verify the package before any staging or installer work.
+    let install_version = prepared.selected_release.version.to_string();
+    let reboot_required = tauri::async_runtime::spawn_blocking(move || {
+        let _install_permit = install_permit;
+        prepared
+            .package
+            .verify(&package, &primary_key, legacy_key.as_deref())?;
+        let installer_path = stage_installer(&install_version, &package)?;
+
+        // Clear a registration whose cached package has gone before handing over to
+        // msiexec. A major upgrade uninstalls the old version first, which needs
+        // that package; without it the install dies on "the feature you are trying
+        // to use is on a network resource that is unavailable" and the machine can
+        // neither upgrade nor uninstall. Staging above stops new orphans being
+        // made, but does nothing for a machine already in that state, which is
+        // every install predating it and anyone whose installer cache a cleanup
+        // tool removed.
+        //
+        // Best effort on purpose. It is a no-op when nothing is orphaned, and a
+        // failure here should still let the install be attempted: the worst case is
+        // the same error the user would have had anyway. The app is already
+        // elevated, which is the privilege the equivalent MSI custom action could
+        // never get.
+        match swifttunnel_msi_repair::repair() {
+            Ok(cleared) if !cleared.is_empty() => {
+                log::warn!(
+                    "cleared {} orphaned SwiftTunnel registration(s) before upgrading",
+                    cleared.len()
+                );
+            }
+            Ok(_) => {}
+            Err(error) => log::warn!("could not check for an orphaned registration: {error}"),
+        }
+
+        // Wait outside the async runtime workers. The MSI may close this process
+        // to replace it, in which case the new app's version is the confirmation.
+        // If this process survives, report success only from the installer's exit.
+        launch_msi_installer(&installer_path)
+    })
+    .await
+    .map_err(|error| format!("Could not complete the update installer task: {error}"))??;
+
+    // Download completion alone is not an installed update. Emit `done` only
+    // after signature verification and a successful installer result.
+    let _ = app.emit(UPDATER_DONE_EVENT, ());
+
+    Ok(UpdaterInstallResponse {
+        installed_version: normalized_expected_version.to_string(),
+        reboot_required,
+        release_tag: prepared.selected_release.tag_name,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_install_is_rejected_until_worker_finishes() {
+        let permit = begin_install().unwrap();
+        assert!(begin_install().is_err());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _permit = permit;
+            entered_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            Err::<(), _>("simulated staging failure")
+        });
+        entered_rx.recv().unwrap();
+        // The operation owns the permit, independently of the original caller.
+        assert!(begin_install().is_err());
+        finish_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+        assert!(begin_install().is_ok());
+    }
+
+    #[test]
+    fn only_completed_installs_report_success() {
+        assert_eq!(installer_exit_result(Some(0)), Ok(false));
+        assert_eq!(installer_exit_result(Some(3010)), Ok(true));
+        assert_eq!(installer_exit_result(Some(1641)), Ok(true));
+        for code in [None, Some(1602), Some(1603), Some(1618)] {
+            assert!(installer_exit_result(code).is_err());
+        }
+    }
+    // Hashing here is only to build expected values for the tests below.
+    use ring::rand::SystemRandom;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use sha2::{Digest, Sha256};
+
+    fn release(tag: &str, prerelease: bool) -> GithubRelease {
+        GithubRelease {
+            tag_name: tag.to_string(),
+            draft: false,
+            prerelease,
+            body: None,
+        }
+    }
+
+    fn release_with_draft(tag: &str, prerelease: bool, draft: bool) -> GithubRelease {
+        GithubRelease {
+            tag_name: tag.to_string(),
+            draft,
+            prerelease,
+            body: None,
+        }
+    }
+
+    fn make_selected_release(tag: &str, version: &str, prerelease: bool) -> SelectedRelease {
+        SelectedRelease {
+            tag_name: tag.to_string(),
+            version: Version::parse(version).unwrap(),
+            prerelease,
+            release_notes: None,
+        }
+    }
+
+    fn make_manifest(
+        version: &str,
+        tag: &str,
+        channel_class: &str,
+        latest_json_url: &str,
+        latest_json_sha256: &str,
+    ) -> SignedUpdateManifest {
+        SignedUpdateManifest {
+            version: version.to_string(),
+            tag: tag.to_string(),
+            channel_class: channel_class.to_string(),
+            latest_json_url: latest_json_url.to_string(),
+            latest_json_sha256: latest_json_sha256.to_string(),
+        }
+    }
+
+    fn sign_payload(payload: &[u8]) -> (Vec<u8>, String) {
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let signature = key_pair.sign(payload);
+        let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature.as_ref());
+        let public_key_bytes = key_pair.public_key().as_ref().to_vec();
+        (public_key_bytes, signature_b64)
+    }
+
+    #[test]
+    fn select_release_prefers_stable_for_stable_channel() {
+        let current = Version::parse("1.0.0").unwrap();
+        let selected = select_release_for_channel(
+            vec![
+                release("v1.1.0-beta.1", true),
+                release("v1.1.0", false),
+                release("v1.0.5", false),
+            ],
+            UpdateChannel::Stable,
+            &current,
+        )
+        .unwrap();
+
+        assert_eq!(selected.tag_name, "v1.1.0");
+        assert!(!selected.prerelease);
+    }
+
+    #[test]
+    fn select_release_returns_none_when_stable_has_only_prerelease() {
+        let current = Version::parse("1.0.0").unwrap();
+        let selected = select_release_for_channel(
+            vec![release("v1.1.0-beta.1", true)],
+            UpdateChannel::Stable,
+            &current,
+        );
+
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn select_release_live_picks_newer_prerelease() {
+        let current = Version::parse("1.0.0").unwrap();
+        let selected = select_release_for_channel(
+            vec![release("v1.1.0", false), release("v1.2.0-beta.1", true)],
+            UpdateChannel::Live,
+            &current,
+        )
+        .unwrap();
+
+        assert_eq!(selected.tag_name, "v1.2.0-beta.1");
+        assert!(selected.prerelease);
+    }
+
+    #[test]
+    fn select_release_live_picks_stable_when_latest_is_stable() {
+        let current = Version::parse("1.0.0").unwrap();
+        let selected = select_release_for_channel(
+            vec![release("v1.1.0-beta.2", true), release("v1.1.0", false)],
+            UpdateChannel::Live,
+            &current,
+        )
+        .unwrap();
+
+        assert_eq!(selected.tag_name, "v1.1.0");
+        assert!(!selected.prerelease);
+    }
+
+    #[test]
+    fn select_release_ignores_drafts() {
+        let current = Version::parse("1.0.0").unwrap();
+        let selected = select_release_for_channel(
+            vec![
+                release_with_draft("v1.3.0", false, true),
+                release_with_draft("v1.2.0", false, false),
+            ],
+            UpdateChannel::Stable,
+            &current,
+        )
+        .unwrap();
+
+        assert_eq!(selected.tag_name, "v1.2.0");
+        assert_eq!(selected.version, Version::parse("1.2.0").unwrap());
+    }
+
+    #[test]
+    fn select_release_returns_none_when_not_newer_than_current() {
+        let current = Version::parse("1.2.0").unwrap();
+        let selected = select_release_for_channel(
+            vec![release("v1.2.0", false), release("v1.1.9", false)],
+            UpdateChannel::Stable,
+            &current,
+        );
+
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn verify_bytes_sha256_accepts_valid_hash() {
+        let payload = br#"{"version":"1.2.3"}"#;
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        let expected = format!("SHA256:{:x}", hasher.finalize()).to_uppercase();
+
+        assert!(verify_bytes_sha256(payload, &expected).is_ok());
+    }
+
+    #[test]
+    fn verify_bytes_sha256_rejects_hash_mismatch() {
+        let payload = br#"{"version":"1.2.3"}"#;
+        let result = verify_bytes_sha256(payload, "sha256:deadbeef");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_manifest_payload_accepts_matching_fields() {
+        let selected = make_selected_release("v1.2.3-beta.1", "1.2.3-beta.1", true);
+        let url = latest_json_url_for_tag("v1.2.3-beta.1");
+        let manifest = make_manifest(
+            "1.2.3-beta.1",
+            "v1.2.3-beta.1",
+            "live",
+            &url,
+            "sha256:deadbeef",
+        );
+
+        assert!(verify_manifest_payload(&manifest, &selected, &url).is_ok());
+    }
+
+    #[test]
+    fn verify_manifest_payload_rejects_mismatched_fields() {
+        let selected = make_selected_release("v1.2.3", "1.2.3", false);
+        let expected_url = latest_json_url_for_tag("v1.2.3");
+        let wrong = make_manifest("1.2.4", "v1.2.4", "live", "https://wrong/latest.json", "x");
+
+        assert!(verify_manifest_payload(&wrong, &selected, &expected_url).is_err());
+    }
+
+    #[test]
+    fn verify_manifest_signature_accepts_valid_signature() {
+        let manifest_bytes = br#"{"version":"1.2.3"}"#;
+        let (public_key, signature_b64) = sign_payload(manifest_bytes);
+
+        assert!(
+            verify_manifest_signature_with_public_key(manifest_bytes, &signature_b64, &public_key)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn verify_manifest_signature_rejects_tampered_manifest() {
+        let manifest_bytes = br#"{"version":"1.2.3"}"#;
+        let tampered_bytes = br#"{"version":"9.9.9"}"#;
+        let (public_key, signature_b64) = sign_payload(manifest_bytes);
+
+        assert!(
+            verify_manifest_signature_with_public_key(tampered_bytes, &signature_b64, &public_key)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_manifest_signature_rejects_tampered_signature() {
+        let manifest_bytes = br#"{"version":"1.2.3"}"#;
+        let (public_key, signature_b64) = sign_payload(manifest_bytes);
+
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(signature_b64)
+            .unwrap();
+        bytes[0] ^= 0xAA;
+        let tampered_signature = base64::engine::general_purpose::STANDARD.encode(bytes);
+
+        assert!(
+            verify_manifest_signature_with_public_key(
+                manifest_bytes,
+                &tampered_signature,
+                &public_key
+            )
+            .is_err()
+        );
+    }
+}

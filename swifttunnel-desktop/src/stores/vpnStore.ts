@@ -1,0 +1,1234 @@
+import { create } from "zustand";
+import { repairIsBusy } from "./repairStore";
+import type {
+  VpnState,
+  GameRouteStatus,
+  VpnStateEvent,
+  DiagnosticsResponse,
+  BindingPreflightInfo,
+  DriverCheckResponse,
+} from "../lib/types";
+import {
+  vpnGetState,
+  vpnPreflightBinding,
+  vpnConnect,
+  vpnConnectGame,
+  vpnDisconnect,
+  vpnGetThroughput,
+  vpnGetPing,
+  vpnGetFreeTier,
+  vpnGetDiagnostics,
+  systemCheckDriver,
+  systemRepairDriver,
+  systemRepairWindowsFirewall,
+  systemResetDriver,
+  boostGetMetrics,
+} from "../lib/commands";
+import { reportError, formatErrorMessage as getErrorMessage } from "../lib/errors";
+import { notify } from "../lib/notifications";
+import { useSettingsStore } from "./settingsStore";
+import { useServerStore } from "./serverStore";
+import { relayDisplayLabel } from "../lib/connectedServer";
+import { formatDriverSetupMessage as cleanDriverSetupMessage, isWindowsDriverInstallerFailureMessage } from "../lib/driverMessages";
+
+type DriverSetupState =
+  | "idle"
+  | "checking"
+  | "installing"
+  | "repairing"
+  | "installed"
+  | "error";
+
+const FULL_COUNTRY_BAN_ROBLOX_RUNNING_MESSAGE =
+  "Close Roblox before connecting with Full Country Ban. Then connect SwiftTunnel and reopen Roblox so login and game traffic use the bypass.";
+
+function isRebootRequiredMessage(
+  vpnError: string | null,
+  driverSetupError: string | null,
+): boolean {
+  const haystack = `${vpnError ?? ""}\n${driverSetupError ?? ""}`.toLowerCase();
+  return haystack.includes("reboot required to finish driver installation");
+}
+
+function driverStatusMessage(status: DriverCheckResponse): string {
+  return cleanDriverSetupMessage(
+    status.message || "Split tunnel driver is not ready.",
+  );
+}
+
+function isPendingDriverInstallReboot(status: DriverCheckResponse): boolean {
+  if (!status.reboot_required && status.recommended_action !== "reboot") {
+    return false;
+  }
+
+  // Reboot policy reads diagnostics, never the wording chosen for the UI.
+  const message = status.message.toLowerCase();
+  return (
+    message.includes("reboot required to finish driver installation") ||
+    message.includes("reboot required to finish winpkfilter") ||
+    message.includes("marked for deletion")
+  );
+}
+
+function isRepairableBindingPreflight(preflight: BindingPreflightInfo): boolean {
+  const haystack = `${preflight.reason}\n${preflight.binding_stage ?? ""}`.toLowerCase();
+  return (
+    preflight.status === "unrecoverable" &&
+    (haystack.includes("winpkfilter_binding_missing") ||
+      haystack.includes("winpkfilter binding is missing") ||
+      haystack.includes("nt_ndisrd is not bound") ||
+      haystack.includes("nt_ndisrd is not installed on adapter") ||
+      haystack.includes("binding nt_ndisrd is not installed") ||
+      haystack.includes("winpkfilter-bound network adapters") ||
+      haystack.includes("repair the split tunnel driver"))
+  );
+}
+
+function isBindingMissingMessage(message: string): boolean {
+  const haystack = message.toLowerCase();
+  return (
+    haystack.includes("winpkfilter_binding_missing") ||
+    haystack.includes("split tunnel driver binding is missing") ||
+    haystack.includes("failed to ensure winpkfilter binding") ||
+    haystack.includes("winpkfilter binding validation failed") ||
+    (haystack.includes("nt_ndisrd") &&
+      (haystack.includes("not bound") ||
+        haystack.includes("not installed on adapter") ||
+        haystack.includes("binding is missing")))
+  );
+}
+
+function isPermissionMessage(message: string): boolean {
+  const haystack = message.toLowerCase();
+  return (
+    haystack.includes("administrator privileges required") ||
+    haystack.includes("run swifttunnel as administrator") ||
+    haystack.includes("access is denied") ||
+    haystack.includes("access denied") ||
+    haystack.includes("process is not elevated")
+  );
+}
+
+function isDriverRebootMessage(message: string): boolean {
+  const haystack = message.toLowerCase();
+  return (
+    isRebootRequiredMessage(message, null) ||
+    haystack.includes("marked for deletion") ||
+    (haystack.includes("reboot") && haystack.includes("driver"))
+  );
+}
+
+function isRepairableDriverConnectMessage(message: string): boolean {
+  const haystack = message.toLowerCase();
+  if (haystack.includes("windows blocked swifttunnel's split-tunnel driver access")) {
+    return true;
+  }
+  if (isPermissionMessage(message)) {
+    return false;
+  }
+
+  return (
+    isBindingMissingMessage(message) ||
+    (haystack.includes("split tunnel driver not available") &&
+      haystack.includes("windows packet filter driver")) ||
+    (haystack.includes("failed to open") && haystack.includes("ndisrd")) ||
+    haystack.includes("no tcp/ip-bound network adapters") ||
+    haystack.includes("version query failed") ||
+    haystack.includes("installed but ioctl failed") ||
+    haystack.includes("get_tcpip_bound_adapters_info") ||
+    haystack.includes("windows packet filter driver did not become available") ||
+    haystack.includes("could not attach its network filter") ||
+    haystack.includes("windows packet filter driver for your active network adapter") ||
+    (haystack.includes("driver service") && haystack.includes("reset"))
+  );
+}
+
+function isRepairableWindowsFirewallMessage(message: string): boolean {
+  const haystack = message.toLowerCase();
+  if (isPermissionMessage(message)) {
+    return false;
+  }
+
+  return (
+    haystack.includes("advfirewall") ||
+    haystack.includes("windows firewall") ||
+    haystack.includes("base filtering engine") ||
+    haystack.includes("mpssvc") ||
+    haystack.includes("ipv6 block firewall rule")
+  );
+}
+
+function isAlreadyConnectedMessage(message: string): boolean {
+  return message.trim().toLowerCase().replace(/\.+$/, "") === "already connected";
+}
+
+const VPN_CONNECT_TIMEOUT_MS = 90_000;
+// Adapter preflight can wait on slow Windows networking APIs. Keep its UI
+// timeout aligned with the real connect budget so we do not fail at 20s while
+// the backend is still making progress.
+const VPN_PREFLIGHT_TIMEOUT_MS = VPN_CONNECT_TIMEOUT_MS;
+const VPN_CONNECT_CLEANUP_TIMEOUT_MS = 15_000;
+
+function formatTimeout(timeoutMs: number): string {
+  const seconds = timeoutMs / 1000;
+  return Number.isInteger(seconds) ? `${seconds}s` : `${timeoutMs}ms`;
+}
+
+function withTimeout<T>(
+  promise: Promise<T>,
+  label: string,
+  timeoutMs: number,
+): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(
+        new Error(
+          `${label} timed out after ${formatTimeout(timeoutMs)}. SwiftTunnel stopped this connect attempt so you can retry.`,
+        ),
+      );
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+  });
+}
+
+async function cleanupFailedConnectAttempt(): Promise<string | null> {
+  try {
+    await withTimeout(
+      vpnDisconnect(),
+      "VPN cleanup",
+      VPN_CONNECT_CLEANUP_TIMEOUT_MS,
+    );
+    return null;
+  } catch (error) {
+    const message = getErrorMessage(error);
+    reportError("Failed to clean up VPN after connect failure", error, {
+      dedupeKey: "vpn-connect-cleanup",
+    });
+    return message;
+  }
+}
+
+let connectAttemptSeq = 0;
+let stateReadSeq = 0;
+let stateEventRevision = 0;
+let sessionRevision = 0;
+let quotaDisplaySample: { at: number; revision: number; remaining: number | null; grace: number | null } | null = null;
+
+// The graph, overlay and focus refresh may all request the same counters.
+// Share only within one connection generation, so an old slow read cannot
+// hold up a new session or multiply native work on every timer tick.
+function coalesceSessionRead<T>(read: () => Promise<T>): () => Promise<T> {
+  let pending: { attempt: number; revision: number; promise: Promise<T> } | null = null;
+  return () => {
+    if (pending?.attempt === connectAttemptSeq && pending.revision === sessionRevision) {
+      return pending.promise;
+    }
+    const flight = {
+      attempt: connectAttemptSeq,
+      revision: sessionRevision,
+      promise: read().finally(() => { if (pending === flight) pending = null; }),
+    };
+    pending = flight;
+    return flight.promise;
+  };
+}
+
+const clearedSessionTelemetry = {
+  bytesUp: 0, bytesDown: 0, packetsTunneled: 0, packetsBypassed: 0,
+  ping: null, pingReadings: 0, diagnostics: null,
+};
+const autoRepairedBindingSignatures = new Set<string>();
+const autoRepairedFirewallSignatures = new Set<string>();
+let relayFailoverInFlight = false;
+let lastRelayFailoverAt: number | null = null;
+
+export function cancelPendingConnectForRepair(): void {
+  nextConnectAttempt();
+  useVpnStore.setState({ connectAttemptInFlight: false, pendingConnectIntent: null, bindingPreflight: null });
+}
+
+function nextConnectAttempt(): number {
+  connectAttemptSeq += 1;
+  return connectAttemptSeq;
+}
+
+function isCurrentConnectAttempt(attempt: number): boolean {
+  return attempt === connectAttemptSeq;
+}
+
+/** Bind callers' preparation work to the current Connect/Disconnect intent. */
+export function captureConnectionIntent(): () => boolean {
+  const attempt = connectAttemptSeq;
+  return () => isCurrentConnectAttempt(attempt);
+}
+
+function isRelayStoppedReturningTrafficMessage(message: string | null): boolean {
+  const haystack = (message ?? "").toLowerCase();
+  return (
+    haystack.includes("relay connection failed") &&
+    haystack.includes("relay stopped returning traffic")
+  );
+}
+
+function sameRegionKey(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s_]+/g, "-");
+}
+
+function resolveFailoverRegionId(
+  eventRegion: string | null,
+  selectedRegion: string,
+): string | null {
+  const regions = useServerStore.getState().regions;
+  const candidates = [eventRegion, selectedRegion].filter(
+    (value): value is string => Boolean(value && value.trim()),
+  );
+
+  for (const candidate of candidates) {
+    const normalized = sameRegionKey(candidate);
+    const region = regions.find(
+      (r) =>
+        sameRegionKey(r.id) === normalized ||
+        sameRegionKey(r.name) === normalized,
+    );
+    if (region) return region.id;
+  }
+
+  return null;
+}
+
+/**
+ * The location's name when it has another relay to reconnect to, else null.
+ * Which relay is not decided here: the core keeps the one that went dead out
+ * of the next connection for a few minutes.
+ */
+function locationWithAnotherRelay(regionId: string): string | null {
+  const region = useServerStore
+    .getState()
+    .regions.find((candidate) => candidate.id === regionId);
+  const relays = region?.servers.filter(Boolean) ?? [];
+  return relays.length >= 2 ? (region?.name ?? regionId) : null;
+}
+
+async function failoverRelayAfterDeadSession(
+  event: VpnStateEvent,
+  connect: (region: string, gamePresets: string[]) => Promise<void>,
+): Promise<void> {
+  if (relayFailoverInFlight || repairIsBusy()) return;
+  if (lastRelayFailoverAt !== null && performance.now() - lastRelayFailoverAt < 5_000) return;
+
+  const attempt = connectAttemptSeq;
+  const revision = sessionRevision;
+  const settings = useSettingsStore.getState().settings;
+  let expectedRegion = settings.selected_region;
+  const stillCurrent = () => {
+    const vpn = useVpnStore.getState();
+    const current = useSettingsStore.getState().settings;
+    return isCurrentConnectAttempt(attempt) && revision === sessionRevision &&
+      vpn.state === "error" && vpn.error === event.error && !repairIsBusy() &&
+      current.selected_region === expectedRegion &&
+      current.auto_routing_enabled === settings.auto_routing_enabled &&
+      current.enable_country_ban === settings.enable_country_ban &&
+      current.enable_api_tunneling === settings.enable_api_tunneling &&
+      !(current.manual_relay && !current.auto_routing_enabled);
+  };
+  if (!stillCurrent()) return;
+
+  // Own the guard before fetching the fleet. Duplicate failure events and a
+  // slow notification must not race a manual Disconnect or another connection.
+  relayFailoverInFlight = true;
+  try {
+    if (useServerStore.getState().regions.length === 0) {
+      await useServerStore.getState().fetchList();
+    }
+    if (!stillCurrent()) return;
+    const regionId = resolveFailoverRegionId(event.region, expectedRegion);
+    if (!regionId) return;
+    const locationName = locationWithAnotherRelay(regionId);
+    if (!locationName) return;
+    if (expectedRegion !== regionId) {
+      expectedRegion = regionId;
+      const settingsStore = useSettingsStore.getState();
+      settingsStore.update({ selected_region: regionId });
+      await settingsStore.save(true);
+    }
+    if (!stillCurrent()) return;
+    lastRelayFailoverAt = performance.now();
+    await notify(
+      "SwiftTunnel",
+      `Relay stopped responding. Reconnecting to another ${locationName} relay.`,
+    );
+    if (!stillCurrent()) return;
+    await connect(regionId, useSettingsStore.getState().settings.selected_game_presets);
+  } catch (error) {
+    reportError("Failed to fail over after relay stopped returning traffic", error, {
+      dedupeKey: "vpn-relay-failover",
+    });
+  } finally {
+    relayFailoverInFlight = false;
+  }
+}
+
+function bindingRepairFailedStatus(reason: string): DriverCheckResponse {
+  const message = isWindowsDriverInstallerFailureMessage(reason)
+    ? cleanDriverSetupMessage(reason)
+    : "SwiftTunnel repaired the split-tunnel driver, but Windows still has not attached the network filter to the active adapter. Restart Windows once, then connect again. If it still fails after restarting, contact support with this result.\n\nDetails: " +
+      reason;
+
+  return {
+    installed: true,
+    version: null,
+    ready: false,
+    status: "reboot_required",
+    message,
+    reboot_required: true,
+    recommended_action: "reboot",
+  };
+}
+
+function driverRebootRequiredStatus(reason: string): DriverCheckResponse {
+  const message = isWindowsDriverInstallerFailureMessage(reason)
+    ? cleanDriverSetupMessage(reason)
+    : "Restart Windows once to finish setting up SwiftTunnel's network driver, then connect again. If it still fails after restarting, contact support with this result.\n\nDetails: " +
+      reason;
+
+  return {
+    installed: true,
+    version: null,
+    ready: false,
+    status: "reboot_required",
+    message,
+    reboot_required: true,
+    recommended_action: "reboot",
+  };
+}
+
+interface VpnStore {
+  gameRoute: GameRouteStatus | null;
+  state: VpnState;
+  region: string | null;
+  serverEndpoint: string | null;
+  assignedIp: string | null;
+  splitTunnelActive: boolean;
+  tunneledProcesses: string[];
+  error: string | null;
+  driverSetupState: DriverSetupState;
+  driverSetupError: string | null;
+  driverStatus: DriverCheckResponse | null;
+  /**
+   * Set to true once the user has clicked "Reset driver service" at least
+   * once during the current error lifecycle. Prevents the UI from
+   * offering the same button forever when the actual problem can't be
+   * fixed by a service restart (e.g. another VPN product's older
+   * WinpkFilter is installed). Cleared on a successful connect or
+   * disconnect so the next incident gets a fresh reset attempt.
+   */
+  driverResetAttempted: boolean;
+
+  // Throughput
+  bytesUp: number;
+  bytesDown: number;
+  packetsTunneled: number;
+  packetsBypassed: number;
+
+  // Ping (real-time ICMP to relay)
+  ping: number | null;
+  /** Bumped on every ping reading, even one equal to the last, so a
+   *  subscriber can count readings rather than changes. */
+  pingReadings: number;
+
+  // Temporary free-tier allowance. Both null when no limit applies, either
+  // the backend has it switched off, or it predates the feature.
+  freeTierRemaining: number | null;
+  freeTierLimit: number | null;
+  /**
+   * Seconds of grace left after the allowance ran out, null when not in grace.
+   *
+   * Authoritative — it comes from the backend, which is still issuing relay
+   * leases for this window. The client must not hang up while it is set, or it
+   * would drop the user out of a match the server deliberately let them finish.
+   */
+  freeTierGraceRemaining: number | null;
+
+
+  // Session timer
+  connectedAt: number | null;
+
+  // Diagnostics
+  diagnostics: DiagnosticsResponse | null;
+  bindingPreflight: BindingPreflightInfo | null;
+  pendingConnectIntent: { region: string; gamePresets: string[] } | null;
+  connectAttemptInFlight: boolean;
+
+  // Actions
+  /** False means this read failed or was superseded; it cannot authorize a launch. */
+  fetchState: () => Promise<boolean>;
+  ensureDriverReady: (attempt?: number) => Promise<void>;
+  repairDriver: () => Promise<void>;
+  installDriver: () => Promise<void>;
+  resetDriver: () => Promise<void>;
+  connect: (region: string, gamePresets: string[], gameRegion?: boolean) => Promise<void>;
+  resumeConnectWithAdapter: (guid: string) => Promise<void>;
+  dismissBindingChooser: () => void;
+  disconnect: () => Promise<void>;
+  fetchThroughput: () => Promise<boolean>;
+  fetchPing: () => Promise<void>;
+  fetchFreeTier: () => Promise<void>;
+  tickFreeTier: () => void;
+  fetchDiagnostics: () => Promise<void>;
+  handleStateEvent: (event: VpnStateEvent) => void;
+}
+
+export const useVpnStore = create<VpnStore>((set, get) => ({
+  gameRoute: null,
+  state: "disconnected",
+  region: null,
+  serverEndpoint: null,
+  assignedIp: null,
+  splitTunnelActive: false,
+  tunneledProcesses: [],
+  error: null,
+  driverSetupState: "idle",
+  driverSetupError: null,
+  driverStatus: null,
+  driverResetAttempted: false,
+  bytesUp: 0,
+  bytesDown: 0,
+  packetsTunneled: 0,
+  packetsBypassed: 0,
+  ping: null,
+  pingReadings: 0,
+  freeTierRemaining: null,
+  freeTierLimit: null,
+  freeTierGraceRemaining: null,
+  connectedAt: null,
+  diagnostics: null,
+  bindingPreflight: null,
+  pendingConnectIntent: null,
+  connectAttemptInFlight: false,
+
+  fetchState: async () => {
+    const attempt = connectAttemptSeq;
+    const read = ++stateReadSeq;
+    const eventRevision = stateEventRevision;
+    const currentRead = () => isCurrentConnectAttempt(attempt) && read === stateReadSeq && eventRevision === stateEventRevision;
+    try {
+      const resp = await vpnGetState();
+      if (!currentRead()) return false;
+      let applied = false;
+      set((current) => {
+        const staleReadyPoll =
+          resp.state === "disconnected" &&
+          resp.error === null &&
+          current.state !== "disconnecting" &&
+          (current.connectAttemptInFlight ||
+            (current.state === "error" && current.error !== null));
+
+        if (staleReadyPoll) {
+          return {};
+        }
+
+        applied = true;
+
+        const sessionChanged = current.state !== resp.state || current.region !== resp.region || current.serverEndpoint !== resp.server_endpoint;
+        if (sessionChanged) sessionRevision += 1;
+
+        // Keep the session clock honest about what the backend reports.
+        //
+        // `connectedAt` used to be written only by the connect action and
+        // cleared only by the disconnect action, so any drop the user did not
+        // click through — lease expiry, a network change, the backend tearing
+        // the tunnel down — left the old timestamp in place and the Connect
+        // tab kept counting. That is how a session read 31h when no relay in
+        // the fleet had held a session longer than about 7h, and why the
+        // number disagreed with the recorded usage.
+        const nowConnected = resp.state === "connected";
+        const connectedAt = nowConnected
+          ? (current.connectedAt ?? Date.now())
+          : null;
+
+        return {
+          ...(sessionChanged ? clearedSessionTelemetry : {}),
+          state: resp.state,
+          gameRoute: nowConnected
+            ? (resp.game_route
+              ? (resp.game_route.relay === resp.region ? resp.game_route : null)
+              : null)
+            : null,
+          region: resp.region,
+          serverEndpoint: resp.server_endpoint,
+          assignedIp: resp.assigned_ip,
+          splitTunnelActive: resp.split_tunnel_active,
+          tunneledProcesses: resp.tunneled_processes,
+          error: resp.error,
+          connectedAt,
+        };
+      });
+      return applied;
+    } catch (e) {
+      if (!currentRead()) return false;
+      set({ error: getErrorMessage(e), gameRoute: null });
+      return false;
+    }
+  },
+
+  ensureDriverReady: async (attempt) => {
+    const active = () => attempt === undefined || isCurrentConnectAttempt(attempt);
+    try {
+      set({ driverSetupState: "checking", driverSetupError: null });
+      const check = await systemCheckDriver();
+      if (!active()) return;
+      set({ driverStatus: check });
+      if (check.ready) {
+        set({ driverSetupState: "idle", driverSetupError: null });
+        return;
+      }
+      if (isPendingDriverInstallReboot(check)) {
+        const message = driverStatusMessage(check);
+        set({
+          driverSetupState: "error",
+          driverSetupError: message,
+          driverResetAttempted: true,
+        });
+        throw new Error(message);
+      }
+
+      const repairState: DriverSetupState =
+        check.recommended_action === "install" ||
+        check.recommended_action === "reinstall"
+          ? "installing"
+          : "repairing";
+      set({ driverSetupState: repairState, driverSetupError: null });
+      const repaired = await systemRepairDriver();
+      if (!active()) return;
+      set({ driverStatus: repaired });
+      if (!repaired.ready) {
+        set({ driverResetAttempted: true });
+        throw new Error(driverStatusMessage(repaired));
+      }
+      set({ driverSetupState: "idle", driverSetupError: null });
+    } catch (e) {
+      if (!active()) return;
+      const message = cleanDriverSetupMessage(getErrorMessage(e));
+      set({ driverSetupState: "error", driverSetupError: message });
+      throw new Error(message);
+    }
+  },
+
+  repairDriver: async () => {
+    try {
+      set({ driverSetupState: "repairing", driverSetupError: null });
+      const repaired = await systemRepairDriver();
+      set({ driverStatus: repaired });
+      if (!repaired.ready) {
+        const message = driverStatusMessage(repaired);
+        set({
+          state: "error",
+          error: message,
+          driverSetupState: "error",
+          driverSetupError: message,
+          driverResetAttempted: true,
+        });
+        throw new Error(message);
+      }
+      set({
+        error: null,
+        driverSetupState: "installed",
+        driverSetupError: null,
+        driverResetAttempted: false,
+      });
+    } catch (e) {
+      const raw = cleanDriverSetupMessage(getErrorMessage(e));
+      set({
+        state: "error",
+        error: raw,
+        driverSetupState: "error",
+        driverSetupError: raw,
+        driverResetAttempted: true,
+      });
+      throw new Error(raw);
+    }
+  },
+
+  installDriver: async () => {
+    await get().repairDriver();
+  },
+
+  resetDriver: async () => {
+    // Invoked from the UI when resolveConnectStatus returns
+    // `kind: "driver_outdated"`, clears the "wedged NDIS state" that a full
+    // reinstall won't fix (prior-generation WinpkFilter from another VPN
+    // product being earlier in the service path, in-kernel filter state
+    // left behind by a previous session, etc.). Much cheaper than asking
+    // the user to reboot, which was the only workaround in 1.25.2.
+    //
+    // `driverResetAttempted` is flipped to true in the failure branch so
+    // the UI can stop offering the same button after a reset that didn't
+    // work, it's the UX guardrail against the exact 1.25.2 loop (user
+    // clicks "fix it" → backend says ok → user tries again → same error)
+    // that this PR is trying to close. Cleared on successful connect or
+    // disconnect to give the next incident a fresh attempt.
+    try {
+      set({ driverSetupState: "repairing", driverSetupError: null });
+      await systemResetDriver();
+      set({
+        error: null,
+        driverSetupState: "installed",
+        driverSetupError: null,
+        driverResetAttempted: false,
+      });
+    } catch (e) {
+      const raw = cleanDriverSetupMessage(getErrorMessage(e));
+      set((current) => {
+        const priorRebootRequired = isRebootRequiredMessage(
+          current.error,
+          current.driverSetupError,
+        );
+        const priorMessage = current.driverSetupError || current.error;
+        const message =
+          priorRebootRequired && priorMessage
+            ? `${priorMessage}\n\nReset driver service failed: ${raw}`
+            : raw;
+        return {
+          state: "error",
+          error: message,
+          driverSetupState: "error",
+          driverSetupError: message,
+          driverResetAttempted: true,
+        };
+      });
+      throw new Error(raw);
+    }
+  },
+
+  connect: async (region, gamePresets, gameRegion = false) => {
+    if (repairIsBusy()) {
+      set({ error: "Repair is still running. Wait for it to finish before connecting." });
+      return;
+    }
+    const attempt = nextConnectAttempt();
+    const fullCountryBanEnabled =
+      useSettingsStore.getState().settings.enable_country_ban;
+    set({
+      state: "fetching_config",
+      error: null,
+      driverSetupError: null,
+      bindingPreflight: null,
+      pendingConnectIntent: null,
+      connectAttemptInFlight: true,
+    });
+    try {
+      if (fullCountryBanEnabled) {
+        try {
+          const robloxRunning = (await boostGetMetrics()).roblox_running;
+          if (!isCurrentConnectAttempt(attempt)) return;
+          if (robloxRunning) {
+            set({
+              state: "error",
+              error: FULL_COUNTRY_BAN_ROBLOX_RUNNING_MESSAGE,
+              driverSetupError: null,
+              bindingPreflight: null,
+              pendingConnectIntent: null,
+              connectAttemptInFlight: false,
+            });
+            await notify(
+              "SwiftTunnel",
+              "Close Roblox first, then connect Full Country Ban.",
+            );
+            return;
+          }
+        } catch (e) {
+          if (!isCurrentConnectAttempt(attempt)) return;
+          reportError("Failed to check Roblox before Full Country Ban connect", e, {
+            dedupeKey: "full-country-ban-roblox-running-check",
+          });
+        }
+      }
+      await get().ensureDriverReady(attempt);
+      if (!isCurrentConnectAttempt(attempt)) return;
+      set({
+        state: "fetching_config",
+        error: null,
+        driverSetupState: "idle",
+        driverSetupError: null,
+      });
+      let preflight = await withTimeout(
+        vpnPreflightBinding(region, gamePresets),
+        "Split tunnel preflight",
+        VPN_PREFLIGHT_TIMEOUT_MS,
+      );
+      if (!isCurrentConnectAttempt(attempt)) return;
+      if (
+        isRepairableBindingPreflight(preflight) &&
+        !autoRepairedBindingSignatures.has(preflight.network_signature)
+      ) {
+        autoRepairedBindingSignatures.add(preflight.network_signature);
+        set({
+          state: "configuring_split_tunnel",
+          error: null,
+          driverSetupState: "repairing",
+          driverSetupError: null,
+          bindingPreflight: null,
+          pendingConnectIntent: null,
+        });
+        const repaired = await systemRepairDriver();
+        if (!isCurrentConnectAttempt(attempt)) return;
+        set({ driverStatus: repaired });
+        if (!repaired.ready) {
+          const message = driverStatusMessage(repaired);
+          set({
+            state: "error",
+            error: message,
+            driverSetupState: "error",
+            driverSetupError: message,
+            driverResetAttempted: repaired.reboot_required,
+            connectAttemptInFlight: false,
+          });
+          return;
+        }
+        if (!isCurrentConnectAttempt(attempt)) return;
+        await get().connect(region, gamePresets, gameRegion);
+        return;
+      }
+      if (isRepairableBindingPreflight(preflight)) {
+        const status = bindingRepairFailedStatus(preflight.reason);
+        set({
+          state: "error",
+          error: status.message,
+          driverSetupState: "error",
+          driverSetupError: status.message,
+          driverStatus: status,
+          bindingPreflight: null,
+          pendingConnectIntent: null,
+          connectAttemptInFlight: false,
+        });
+        return;
+      }
+      if (preflight.status === "ambiguous") {
+        set({
+          state: "disconnected",
+          error: preflight.reason,
+          bindingPreflight: preflight,
+          pendingConnectIntent: { region, gamePresets },
+          connectAttemptInFlight: false,
+        });
+        return;
+      }
+      if (preflight.status === "unrecoverable") {
+        if (isRepairableBindingPreflight(preflight)) {
+          const status = bindingRepairFailedStatus(preflight.reason);
+          set({
+            state: "error",
+            error: status.message,
+            driverSetupState: "error",
+            driverSetupError: status.message,
+            driverStatus: status,
+            bindingPreflight: null,
+            pendingConnectIntent: null,
+            connectAttemptInFlight: false,
+          });
+          return;
+        }
+        set({
+          state: "error",
+          error: preflight.reason,
+          bindingPreflight: null,
+          pendingConnectIntent: null,
+          connectAttemptInFlight: false,
+        });
+        return;
+      }
+      try {
+        await withTimeout(
+          (gameRegion ? vpnConnectGame(region, gamePresets) : vpnConnect(region, gamePresets)),
+          "VPN connection",
+          VPN_CONNECT_TIMEOUT_MS,
+        );
+      } catch (e) {
+        // Check before cleanup or repair: those commands can affect the newer
+        // session even if a later state update is correctly discarded.
+        if (!isCurrentConnectAttempt(attempt)) return;
+        const message = getErrorMessage(e);
+        if (isDriverRebootMessage(message)) {
+          const status = driverRebootRequiredStatus(message);
+          set({
+            state: "error",
+            error: status.message,
+            driverSetupState: "error",
+            driverSetupError: status.message,
+            driverStatus: status,
+            bindingPreflight: null,
+            pendingConnectIntent: null,
+            connectAttemptInFlight: false,
+          });
+          return;
+        }
+        if (isRepairableDriverConnectMessage(message)) {
+          const repairAlreadyTried = autoRepairedBindingSignatures.has(
+            preflight.network_signature,
+          );
+          const cleanupError = await cleanupFailedConnectAttempt();
+          if (!isCurrentConnectAttempt(attempt)) return;
+          if (cleanupError) {
+            throw new Error(
+              `${message}\n\nCleanup after failed connect also failed: ${cleanupError}`,
+            );
+          }
+          if (!repairAlreadyTried) {
+            autoRepairedBindingSignatures.add(preflight.network_signature);
+            set({
+              state: "configuring_split_tunnel",
+              error: null,
+              driverSetupState: "repairing",
+              driverSetupError: null,
+            });
+            const repaired = await systemRepairDriver();
+            if (!isCurrentConnectAttempt(attempt)) return;
+            set({ driverStatus: repaired });
+            if (!repaired.ready) {
+              throw new Error(driverStatusMessage(repaired));
+            }
+            if (!isCurrentConnectAttempt(attempt)) return;
+            await get().connect(region, gamePresets, gameRegion);
+            return;
+          }
+          const status = bindingRepairFailedStatus(message);
+          set({
+            state: "error",
+            error: status.message,
+            driverSetupState: "error",
+            driverSetupError: status.message,
+            driverStatus: status,
+            bindingPreflight: null,
+            pendingConnectIntent: null,
+            connectAttemptInFlight: false,
+          });
+          return;
+        }
+        if (isRepairableWindowsFirewallMessage(message)) {
+          const repairAlreadyTried = autoRepairedFirewallSignatures.has(
+            preflight.network_signature,
+          );
+          const cleanupError = await cleanupFailedConnectAttempt();
+          if (!isCurrentConnectAttempt(attempt)) return;
+          if (cleanupError) {
+            throw new Error(
+              `${message}\n\nCleanup after failed connect also failed: ${cleanupError}`,
+            );
+          }
+          if (!repairAlreadyTried) {
+            autoRepairedFirewallSignatures.add(preflight.network_signature);
+            set({
+              state: "configuring_split_tunnel",
+              error: null,
+              driverSetupState: "repairing",
+              driverSetupError: null,
+            });
+            const repaired = await systemRepairWindowsFirewall();
+            if (!isCurrentConnectAttempt(attempt)) return;
+            if (!repaired.after_available) {
+              throw new Error(repaired.message || message);
+            }
+            if (!isCurrentConnectAttempt(attempt)) return;
+            await get().connect(region, gamePresets, gameRegion);
+            return;
+          }
+          throw new Error(
+            "Windows Firewall repair did not finish SwiftTunnel setup. Restart Windows once, then connect again. If it still fails, contact support and include this result.\n\nDetails: " +
+              message,
+          );
+        }
+        if (!isAlreadyConnectedMessage(message)) {
+          const cleanupError = await cleanupFailedConnectAttempt();
+          if (!isCurrentConnectAttempt(attempt)) return;
+          if (cleanupError) {
+            throw new Error(
+              `${message}\n\nCleanup after failed connect also failed: ${cleanupError}`,
+            );
+          }
+          throw new Error(message);
+        }
+      }
+      if (!isCurrentConnectAttempt(attempt)) return;
+      await get().fetchState();
+      if (!isCurrentConnectAttempt(attempt)) return;
+      await get().fetchDiagnostics();
+      if (!isCurrentConnectAttempt(attempt)) return;
+      if (get().state === "connected") {
+        set({ connectedAt: Date.now() });
+        await notify(
+          "SwiftTunnel",
+          fullCountryBanEnabled
+            ? "Connected. Open Roblox now so Full Country Ban uses the tunnel."
+            : `Connected to ${relayDisplayLabel(get().region ?? region)}`,
+        );
+      }
+      // Successful connect clears the reset-attempted one-shot so a future
+      // unrelated incident gets a fresh "Reset driver service" offer.
+      if (!isCurrentConnectAttempt(attempt)) return;
+      set({
+        driverSetupState: "idle",
+        driverSetupError: null,
+        driverStatus: null,
+        driverResetAttempted: false,
+        connectAttemptInFlight: false,
+      });
+      autoRepairedBindingSignatures.clear();
+      autoRepairedFirewallSignatures.clear();
+    } catch (e) {
+      if (!isCurrentConnectAttempt(attempt)) return;
+      const message = cleanDriverSetupMessage(getErrorMessage(e));
+      set((current) => ({
+        state: "error",
+        error: message,
+        connectAttemptInFlight: false,
+        driverSetupState:
+          current.driverSetupState === "error" ? "error" : "idle",
+        driverSetupError:
+          current.driverSetupState === "error"
+            ? current.driverSetupError
+            : null,
+      }));
+    }
+  },
+
+  resumeConnectWithAdapter: async (guid) => {
+    const attempt = connectAttemptSeq;
+    const preflight = get().bindingPreflight;
+    const pending = get().pendingConnectIntent;
+    if (!preflight || !pending) {
+      return;
+    }
+
+    const settingsStore = useSettingsStore.getState();
+    settingsStore.update({
+      network_binding_overrides: {
+        ...settingsStore.settings.network_binding_overrides,
+        [preflight.network_signature]: guid,
+      },
+    });
+    await settingsStore.save();
+    if (!isCurrentConnectAttempt(attempt) || get().pendingConnectIntent !== pending) return;
+
+    set({
+      bindingPreflight: null,
+      pendingConnectIntent: null,
+      error: null,
+    });
+
+    await get().connect(pending.region, pending.gamePresets);
+  },
+
+  dismissBindingChooser: () => {
+    set({
+      bindingPreflight: null,
+      pendingConnectIntent: null,
+    });
+  },
+
+  disconnect: async () => {
+    const attempt = nextConnectAttempt();
+    try {
+      set({ state: "disconnecting" });
+      await vpnDisconnect();
+      if (!isCurrentConnectAttempt(attempt)) return;
+      await get().fetchState();
+      if (!isCurrentConnectAttempt(attempt)) return;
+      if (get().state !== "disconnected" || get().splitTunnelActive || get().error) {
+        throw new Error(`Disconnect was not confirmed. ${get().error ?? "The tunnel is still active or its state is unavailable."} Retry Disconnect before reconnecting or running Repair.`);
+      }
+      set({
+        region: null,
+        serverEndpoint: null,
+        assignedIp: null,
+        splitTunnelActive: false,
+        tunneledProcesses: [],
+        bytesUp: 0,
+        bytesDown: 0,
+        packetsTunneled: 0,
+        packetsBypassed: 0,
+        ping: null,
+        connectedAt: null,
+        diagnostics: null,
+        bindingPreflight: null,
+        pendingConnectIntent: null,
+        connectAttemptInFlight: false,
+        driverSetupState: "idle",
+        driverSetupError: null,
+        driverStatus: null,
+        driverResetAttempted: false,
+      });
+      autoRepairedBindingSignatures.clear();
+      autoRepairedFirewallSignatures.clear();
+      await notify("SwiftTunnel", "VPN disconnected.");
+    } catch (e) {
+      if (!isCurrentConnectAttempt(attempt)) return;
+      set({ state: "error", error: getErrorMessage(e) });
+    }
+  },
+
+  fetchThroughput: coalesceSessionRead(async () => {
+    const attempt = connectAttemptSeq;
+    const revision = sessionRevision;
+    try {
+      const stats = await vpnGetThroughput();
+      if (!isCurrentConnectAttempt(attempt) || revision !== sessionRevision) return false;
+      if (stats) {
+        set({
+          bytesUp: stats.bytes_up,
+          bytesDown: stats.bytes_down,
+          packetsTunneled: stats.packets_tunneled,
+          packetsBypassed: stats.packets_bypassed,
+        });
+        return true;
+      }
+    } catch (error) {
+      reportError("Failed to fetch VPN throughput", error, {
+        dedupeKey: "vpn-fetch-throughput",
+      });
+    }
+    return false;
+  }),
+
+  fetchFreeTier: coalesceSessionRead(async () => {
+    const attempt = connectAttemptSeq;
+    const revision = sessionRevision;
+    try {
+      const quota = await vpnGetFreeTier();
+      if (!isCurrentConnectAttempt(attempt) || revision !== sessionRevision) return;
+      const incoming = quota.remaining_seconds;
+      const grace = quota.grace_seconds ?? null;
+      quotaDisplaySample = { at: performance.now(), revision, remaining: incoming, grace };
+
+      // Successful lease refreshes update this authoritative snapshot. The
+      // one-second local tick only smooths the display between refreshes.
+      set({
+        freeTierRemaining: incoming,
+        freeTierLimit: quota.limit_seconds,
+        // Always taken verbatim: grace is a backend decision about whether the
+        // relay lease is still being renewed. The local countdown has no say.
+        freeTierGraceRemaining: grace,
+      });
+    } catch (error) {
+      reportError("Failed to fetch free tier quota", error, {
+        dedupeKey: "vpn-fetch-free-tier",
+      });
+    }
+  }),
+
+  // Display-only smoothing. Native core owns warnings and enforces the last
+  // server-reported budget even while the WebView is hidden or suspended.
+  tickFreeTier: () => {
+    const { state, freeTierRemaining, freeTierGraceRemaining } = get();
+    const sample = quotaDisplaySample;
+    if (state !== "connected" || !sample || sample.revision !== sessionRevision) return;
+    const elapsed = Math.max(0, Math.floor((performance.now() - sample.at) / 1000));
+    if (sample.grace !== null) {
+      const remaining = Math.max(0, sample.grace - elapsed);
+      if (remaining !== freeTierGraceRemaining) set({ freeTierGraceRemaining: remaining });
+      return;
+    }
+    if (sample.remaining !== null) {
+      const remaining = Math.max(0, sample.remaining - elapsed);
+      if (remaining !== freeTierRemaining) set({ freeTierRemaining: remaining });
+    }
+  },
+
+  fetchPing: coalesceSessionRead(async () => {
+    const attempt = connectAttemptSeq;
+    const revision = sessionRevision;
+    try {
+      const ms = await vpnGetPing();
+      if (!isCurrentConnectAttempt(attempt) || revision !== sessionRevision) return;
+      // null means "no sample this tick", not "no ping". The backend returns
+      // it whenever the split-tunnel driver lock happens to be busy, which is
+      // routine while packets are flowing, and writing it through made the
+      // reading flicker to an em dash mid-session. Disconnecting clears the
+      // value explicitly, so holding the last good one cannot go stale.
+      if (ms !== null && ms !== undefined) {
+        set((s) => ({ ping: ms, pingReadings: s.pingReadings + 1 }));
+      }
+    } catch (error) {
+      reportError("Failed to fetch VPN ping", error, {
+        dedupeKey: "vpn-fetch-ping",
+      });
+    }
+  }),
+
+  fetchDiagnostics: coalesceSessionRead(async () => {
+    const attempt = connectAttemptSeq;
+    const revision = sessionRevision;
+    try {
+      const diag = await vpnGetDiagnostics();
+      if (!isCurrentConnectAttempt(attempt) || revision !== sessionRevision) return;
+      set({ diagnostics: diag });
+    } catch (error) {
+      reportError("Failed to fetch VPN diagnostics", error, {
+        dedupeKey: "vpn-fetch-diagnostics",
+      });
+    }
+  }),
+
+  handleStateEvent: (event) => {
+    // An event observed after a poll started takes precedence over its reply.
+    stateEventRevision += 1;
+    const shouldFailoverRelay =
+      event.state === "error" &&
+      isRelayStoppedReturningTrafficMessage(event.error);
+
+    set((current) => {
+      const staleReadyEvent =
+        event.state === "disconnected" &&
+        event.error === null &&
+        current.state !== "disconnecting" &&
+        (current.connectAttemptInFlight ||
+          (current.state === "error" && current.error !== null));
+
+      if (staleReadyEvent) {
+        return {};
+      }
+
+      const staleTransitionAfterError =
+        current.state === "error" &&
+        current.error !== null &&
+        !current.connectAttemptInFlight &&
+        event.error === null &&
+        event.state !== "connected" &&
+        event.state !== "error" &&
+        event.state !== "disconnected";
+
+      if (staleTransitionAfterError) {
+        return {};
+      }
+
+      const sessionChanged = current.state !== event.state || current.region !== event.region || current.serverEndpoint !== event.server_endpoint;
+      if (sessionChanged) sessionRevision += 1;
+
+      return {
+        ...(sessionChanged ? clearedSessionTelemetry : {}),
+        ...(event.state === "disconnected" ? { splitTunnelActive: false, tunneledProcesses: [] } : {}),
+        connectedAt: event.state === "connected" ? (current.connectedAt ?? Date.now()) : null,
+        state: event.state,
+        gameRoute: event.state === "connected" && current.region === event.region ? current.gameRoute : null,
+        region: event.region,
+        serverEndpoint: event.server_endpoint,
+        assignedIp: event.assigned_ip,
+        error: event.error,
+        connectAttemptInFlight:
+          event.state === "connected" || event.state === "error"
+            ? false
+            : current.connectAttemptInFlight,
+      };
+    });
+
+    if (shouldFailoverRelay) {
+      void failoverRelayAfterDeadSession(event, get().connect);
+    }
+  },
+
+}));

@@ -1,0 +1,496 @@
+//! Temporary native-player flags. Other launchers' files are never changed.
+use crate::utils::{paths_match, same_path_part};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+};
+#[derive(Serialize, Deserialize)]
+struct Entry {
+    path: PathBuf,
+    before: Option<String>,
+    applied: String,
+}
+#[derive(Serialize, Deserialize)]
+struct Journal {
+    entries: Vec<Entry>,
+    flags: HashMap<String, String>,
+}
+const RESTORE_ERROR: &str =
+    "Couldn't restore your Roblox FastFlags. Contact support and include your log.";
+const MAX_JOURNAL_BYTES: usize = 256 * 1024;
+fn journal_path() -> Result<PathBuf, String> {
+    Ok(crate::roblox_library::library_path()?.with_file_name("native-launch-flags.json"))
+}
+pub fn pending() -> bool {
+    journal_path().is_ok_and(|p| p.exists())
+}
+fn read(path: &Path) -> Result<Option<String>, String> {
+    crate::roblox_native_launch::safe_path(path)?;
+    let mut bytes = Vec::new();
+    let limit = if path
+        .file_name()
+        .is_some_and(|name| name == "native-launch-flags.json")
+    {
+        MAX_JOURNAL_BYTES
+    } else {
+        128 * 1024
+    };
+    match fs::File::open(path) {
+        Ok(file) => {
+            file.take(limit as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    }
+    if bytes.len() > limit {
+        log::warn!(
+            "FastFlags file exceeds read limit of {limit} bytes: {}",
+            path.display()
+        );
+        return Err(
+            "Couldn't read your Roblox FastFlags. Contact support and include your log.".into(),
+        );
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    crate::roblox_native_launch::safe_path(path)?;
+    fs::create_dir_all(path.parent().ok_or("Invalid flags path.")?).map_err(|e| e.to_string())?;
+    crate::atomic_file::replace(path, bytes).map_err(|e| e.to_string())
+}
+fn write_journal(path: &Path, journal: &Journal) -> Result<(), String> {
+    let bytes = serde_json::to_vec(journal).map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_JOURNAL_BYTES {
+        log::warn!("Native FastFlags backup would exceed its recovery read limit");
+        return Err(
+            "Your existing Roblox FastFlags could not be backed up safely. Nothing was changed."
+                .into(),
+        );
+    }
+    write(path, &bytes)
+}
+fn hash(raw: &str) -> String {
+    format!("{:x}", Sha256::digest(raw.as_bytes()))
+}
+fn allowed(path: &Path) -> bool {
+    let Some(base) = std::env::var_os("LOCALAPPDATA") else {
+        return false;
+    };
+    allowed_in(&PathBuf::from(base), path)
+}
+fn allowed_in(base: &Path, path: &Path) -> bool {
+    if !base.is_absolute() || !path.is_absolute() {
+        return false;
+    }
+    [
+        crate::roblox_library::RobloxClient::Standard,
+        crate::roblox_library::RobloxClient::Vng,
+    ]
+    .into_iter()
+    .any(|client| {
+        let versions =
+            crate::roblox_native_launch::installation_root(base, client).join("Versions");
+        let mut components = path.components();
+        // Rust's lexical strip_prefix is case-sensitive even on Windows.
+        // Compare complete components so casing cannot reject a valid backup
+        // and a similarly named sibling cannot enter the allowed directory.
+        if !versions.components().all(|expected| {
+            components
+                .next()
+                .is_some_and(|actual| same_path_part(expected.as_os_str(), actual.as_os_str()))
+        }) {
+            return false;
+        }
+        let parts = components.collect::<Vec<_>>();
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+            && parts[0]
+                .as_os_str()
+                .to_str()
+                .and_then(|name| name.get(..8))
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("version-"))
+            && same_path_part(parts[1].as_os_str(), std::ffi::OsStr::new("ClientSettings"))
+            && same_path_part(
+                parts[2].as_os_str(),
+                std::ffi::OsStr::new("ClientAppSettings.json"),
+            )
+    })
+}
+
+pub fn prepare(player: &Path, flags: HashMap<String, String>) -> Result<(), String> {
+    if !crate::roblox_game_profile::player_stopped() {
+        return Err("Close Roblox before preparing launch flags.".into());
+    }
+    restore()?;
+    let path = player
+        .parent()
+        .ok_or("Invalid Roblox installation.")?
+        .join("ClientSettings/ClientAppSettings.json");
+    if !allowed(&path) {
+        return Err("SwiftTunnel only applies launch flags to the official player.".into());
+    }
+    let before = read(&path)?;
+    if before.as_ref().is_some_and(|raw| raw.len() > 64 * 1024) {
+        return Err(
+            "The existing Roblox flags file is too large to back up safely. It was kept.".into(),
+        );
+    }
+    let raw = serde_json::to_string_pretty(&flags).map_err(|e| e.to_string())?;
+    let journal = Journal {
+        entries: vec![Entry {
+            path: path.clone(),
+            before,
+            applied: hash(&raw),
+        }],
+        flags,
+    };
+    write_journal(&journal_path()?, &journal)?;
+    write(&path, raw.as_bytes())
+}
+pub fn restore() -> Result<bool, String> {
+    if !pending() || !crate::roblox_game_profile::player_stopped() {
+        return Ok(false);
+    }
+    restore_from(&journal_path()?, allowed)
+}
+fn restore_from(path: &Path, path_allowed: impl Fn(&Path) -> bool) -> Result<bool, String> {
+    let Some(raw) = read(path)? else {
+        return Ok(false);
+    };
+    let journal: Journal = serde_json::from_str(&raw).map_err(|error| {
+        log::warn!("Native FastFlags recovery record could not be decoded; retained for inspection: {error}");
+        RESTORE_ERROR
+    })?;
+    validate_journal(&journal, path_allowed)?;
+    for e in journal.entries {
+        restore_entry(e)?;
+    }
+    fs::remove_file(path).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+fn restore_entry(e: Entry) -> Result<(), String> {
+    if read(&e.path)?
+        .as_deref()
+        .is_some_and(|raw| hash(raw).eq_ignore_ascii_case(&e.applied))
+    {
+        match e.before {
+            Some(before) => write(&e.path, before.as_bytes())?,
+            None => fs::remove_file(e.path).map_err(|e| e.to_string())?,
+        }
+    }
+    Ok(())
+}
+
+fn validate_journal(journal: &Journal, path_allowed: impl Fn(&Path) -> bool) -> Result<(), String> {
+    if journal.entries.is_empty()
+        || journal.entries.len() > 4
+        || journal.entries.iter().enumerate().any(|(index, entry)| {
+            !path_allowed(&entry.path)
+                || entry.applied.len() != 64
+                || !entry.applied.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || journal.entries[..index]
+                    .iter()
+                    .any(|previous| paths_match(&previous.path, &entry.path))
+        })
+    {
+        log::warn!(
+            "Native FastFlags recovery record failed entry/path/hash validation; retained for inspection"
+        );
+        return Err(RESTORE_ERROR.into());
+    }
+    Ok(())
+}
+
+fn journal_client(base: &Path, journal: &Journal) -> crate::roblox_library::RobloxClient {
+    use crate::roblox_library::RobloxClient;
+    let vng = crate::roblox_native_launch::installation_root(base, RobloxClient::Vng);
+    if journal
+        .entries
+        .first()
+        .is_some_and(|entry| entry.path.ancestors().any(|path| paths_match(path, &vng)))
+    {
+        RobloxClient::Vng
+    } else {
+        RobloxClient::Standard
+    }
+}
+pub fn diagnostic() -> Result<Option<String>, String> {
+    let Some(raw) = read(&journal_path()?)? else {
+        return Ok(None);
+    };
+    let journal: Journal = serde_json::from_str(&raw).map_err(|error| {
+        log::warn!("Native FastFlags recovery diagnostic could not decode record: {error}");
+        RESTORE_ERROR
+    })?;
+    validate_journal(&journal, allowed)?;
+    for entry in &journal.entries {
+        if read(&entry.path)?
+            .as_deref()
+            .is_none_or(|raw| !hash(raw).eq_ignore_ascii_case(&entry.applied))
+        {
+            return Ok(Some("Something else changed Roblox's flags during this launch. Check whether another launcher is running.".into()));
+        }
+    }
+    let client = std::env::var_os("LOCALAPPDATA")
+        .map(|base| journal_client(Path::new(&base), &journal))
+        .unwrap_or_default();
+    if !journal.flags.is_empty()
+        && let Ok(player) = crate::roblox_native_launch::official_player_for(client)
+        && journal.entries.iter().all(|entry| {
+            match (player.parent(), entry.path.parent().and_then(Path::parent)) {
+                (Some(player), Some(saved)) => !paths_match(player, saved),
+                _ => true,
+            }
+        })
+    {
+        return Ok(Some(
+            "Roblox updated during this launch. Press Play again to load your FastFlags.".into(),
+        ));
+    }
+    Ok(None)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_flag_backups_restore_original_bytes_and_allow_uppercase_hex_hashes() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Fixture(
+            std::env::temp_dir().join(format!("swift-flags-valid-{:032x}", rand::random::<u128>())),
+        );
+        fs::create_dir(&dir.0).unwrap();
+        let file = dir.0.join("ClientAppSettings.json");
+        let backup = dir.0.join("native-launch-flags.json");
+        fs::write(&file, b"{}").unwrap();
+        let original = "{\"original\":true}\n";
+        let journal = Journal {
+            entries: vec![Entry {
+                path: file.clone(),
+                before: Some(original.into()),
+                applied: hash("{}").to_ascii_uppercase(),
+            }],
+            flags: HashMap::new(),
+        };
+        write_journal(&backup, &journal).unwrap();
+        assert_eq!(restore_from(&backup, |path| path == file), Ok(true));
+        assert_eq!(fs::read_to_string(&file).unwrap(), original);
+        assert!(!backup.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vng_backup_classification_uses_the_same_windows_path_rules() {
+        let base = Path::new(r"E:\Users\Élodie\AppData\Local");
+        let journal = Journal {
+            entries: vec![Entry {
+                path: PathBuf::from(
+                    r"e:\users\éLODIE\AppData\local\ROBLOXPCVNG\Versions\version-test\ClientSettings\ClientAppSettings.json",
+                ),
+                before: None,
+                applied: hash("{}"),
+            }],
+            flags: HashMap::new(),
+        };
+        assert!(matches!(
+            journal_client(base, &journal),
+            crate::roblox_library::RobloxClient::Vng
+        ));
+    }
+
+    #[test]
+    fn damaged_native_flag_backups_are_kept_instead_of_deleted_as_external_edits() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Fixture(std::env::temp_dir().join(format!(
+            "swift-flags-damaged-{:032x}",
+            rand::random::<u128>()
+        )));
+        fs::create_dir(&dir.0).unwrap();
+        let file = dir.0.join("ClientAppSettings.json");
+        let backup = dir.0.join("native-launch-flags.json");
+        for applied in [Some("z".repeat(64)), Some("a".repeat(63)), None] {
+            fs::write(&file, b"{}").unwrap();
+            let journal = Journal {
+                entries: applied
+                    .map(|applied| {
+                        vec![Entry {
+                            path: file.clone(),
+                            before: Some("original flag contents".into()),
+                            applied,
+                        }]
+                    })
+                    .unwrap_or_default(),
+                flags: HashMap::new(),
+            };
+            write_journal(&backup, &journal).unwrap();
+            let before = fs::read(&backup).unwrap();
+            let result = restore_from(&backup, |path| path == file);
+            assert!(
+                result.is_err(),
+                "invalid recovery metadata must not consume the only backup"
+            );
+            assert_eq!(fs::read(&backup).unwrap(), before);
+            assert_eq!(fs::read(&file).unwrap(), b"{}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_accepts_windows_casing_without_widening_the_install_boundary() {
+        let base = Path::new(r"E:\Users\Élodie\AppData\Local");
+        for path in [
+            r"e:\users\éLODIE\appdata\LOCAL\roblox\versions\VERSION-test\clientsettings\clientappsettings.JSON",
+            "E:/Users/Élodie/AppData/Local/ROBLOXPCVNG/Versions/version-test/ClientSettings/ClientAppSettings.json",
+        ] {
+            assert!(
+                allowed_in(base, Path::new(path)),
+                "same Windows install rejected: {path}"
+            );
+        }
+        for path in [
+            r"E:\Users\Élodie2\AppData\Local\Roblox\Versions\version-test\ClientSettings\ClientAppSettings.json",
+            r"E:\Users\Élodie\AppData\Local\Roblox-old\Versions\version-test\ClientSettings\ClientAppSettings.json",
+            r"E:\Users\Élodie\AppData\Local\Roblox\Versions\version-test\..\ClientSettings\ClientAppSettings.json",
+            r"E:\Users\Élodie\AppData\Local\Roblox\Versions\version-test\ClientSettings\..\ClientSettings\ClientAppSettings.json",
+            r"E:\Users\Élodie\AppData\Local\Roblox\Versions\version-test\ClientSettings\ClientAppSettings.json\other",
+            r"E:\Users\Élodie\AppData\Local\Voidstrap\Versions\version-test\ClientSettings\ClientAppSettings.json",
+            r"F:\Users\Élodie\AppData\Local\Roblox\Versions\version-test\ClientSettings\ClientAppSettings.json",
+        ] {
+            assert!(
+                !allowed_in(base, Path::new(path)),
+                "outside install accepted: {path}"
+            );
+        }
+    }
+    #[test]
+    fn escaped_backup_cannot_replace_a_record_with_one_recovery_cannot_read() {
+        let root = std::env::temp_dir().join(format!(
+            "swift-flags-backup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("native-launch-flags.json");
+        fs::write(&path, b"previous backup").unwrap();
+        // The source is within the 64 KB backup limit, but JSON escaping
+        // expands control bytes beyond the recovery reader's 256 KB cap.
+        let journal = Journal {
+            entries: vec![Entry {
+                path: root.join("ClientAppSettings.json"),
+                before: Some("\0".repeat(64 * 1024)),
+                applied: hash("{}"),
+            }],
+            flags: HashMap::new(),
+        };
+        let result = write_journal(&path, &journal);
+        let after = fs::read(&path).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(result.is_err());
+        assert_eq!(after, b"previous backup");
+    }
+
+    #[test]
+    fn normal_backup_round_trips_original_bytes_through_the_recovery_reader() {
+        let root = std::env::temp_dir().join(format!(
+            "swift-flags-roundtrip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("native-launch-flags.json");
+        let before = "{\"label\":\"a\\\\b\\n\\\"c\"}\n";
+        let journal = Journal {
+            entries: vec![Entry {
+                path: root.join("ClientAppSettings.json"),
+                before: Some(before.into()),
+                applied: hash("{}"),
+            }],
+            flags: HashMap::new(),
+        };
+        write_journal(&path, &journal).unwrap();
+        let restored: Journal = serde_json::from_str(&read(&path).unwrap().unwrap()).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(restored.entries[0].before.as_deref(), Some(before));
+    }
+    #[test]
+    fn restoration_recovers_original_bytes_but_preserves_external_changes() {
+        let root = std::env::temp_dir().join(format!("swift-flags-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("ClientAppSettings.json");
+        let original = "{\"old\":true}";
+        let applied = "{}";
+        fs::write(&path, applied).unwrap();
+        restore_entry(Entry {
+            path: path.clone(),
+            before: Some(original.into()),
+            applied: hash(applied),
+        })
+        .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::write(&path, "external edit").unwrap();
+        restore_entry(Entry {
+            path: path.clone(),
+            before: Some(original.into()),
+            applied: hash(applied),
+        })
+        .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external edit");
+        fs::write(&path, applied).unwrap();
+        restore_entry(Entry {
+            path: path.clone(),
+            before: None,
+            applied: hash(applied),
+        })
+        .unwrap();
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn paths_cannot_escape_into_another_strap() {
+        let root = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+        assert!(allowed(&root.join(
+            "Roblox/Versions/version-test/ClientSettings/ClientAppSettings.json"
+        )));
+        assert!(allowed(&root.join(
+            "RobloxPCVNG/Versions/version-test/ClientSettings/ClientAppSettings.json"
+        )));
+        assert!(!allowed(&root.join(
+            "Voidstrap/Versions/version-test/ClientSettings/ClientAppSettings.json"
+        )));
+        assert!(!allowed(&root.join(
+            "Roblox/Versions/version-test/../ClientSettings/ClientAppSettings.json"
+        )));
+        assert!(!allowed(&root.join(
+            "RobloxPCVNG/Versions/version-test/../ClientSettings/ClientAppSettings.json"
+        )));
+        assert!(!allowed(&root.join(
+            "RobloxPCVNG/Versions/version-test/ClientSettings/not-flags.json"
+        )));
+    }
+}

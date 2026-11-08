@@ -1,0 +1,237 @@
+//! Discord activity state types
+
+use std::borrow::Cow;
+use std::time::Instant;
+
+// The public Discord application asset list currently contains only this logo.
+pub(super) const DISCORD_BRAND_IMAGE_KEY: &str = "swifttunnel";
+
+/// Current state for Discord Rich Presence display
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DiscordState {
+    /// App is open but VPN is disconnected
+    #[default]
+    Idle,
+    /// VPN is connecting to a region
+    Connecting { region: String },
+    /// VPN is connected to a region
+    Connected {
+        region: String,
+        /// When the connection was established
+        connected_at: Instant,
+    },
+    /// Playing a game while connected
+    PlayingGame {
+        game_name: String,
+        region: String,
+        connected_at: Instant,
+    },
+}
+
+/// Activity message to send to Discord RPC thread
+#[derive(Debug, Clone)]
+pub enum DiscordActivity {
+    /// Set the current activity
+    SetActivity(DiscordState),
+    /// Clear presence (user disabled RPC or app closing)
+    Clear,
+    /// Shutdown the RPC thread
+    Shutdown,
+}
+
+/// Get region display name for Discord
+pub fn region_display_name(region_id: &str) -> &'static str {
+    const UNKNOWN_REGION: &str = "Unknown Region";
+
+    // Server IDs like "us-east-nj" should match their region prefix "us-east"
+    match region_id {
+        "singapore" => "Singapore",
+        "mumbai" => "Mumbai",
+        "tokyo" => "Tokyo",
+        "jakarta" => "Jakarta",
+        "israel" => "Israel",
+        "middle-east" => "Qatar",
+        "sydney" => "Sydney",
+        "germany" | "frankfurt" => "Germany",
+        "paris" => "Paris",
+        "london" => "London",
+        "amsterdam" => "Amsterdam",
+        "korea" => "Korea",
+        "brazil" | "sao-paulo" => "Brazil",
+        _ if region_id.starts_with("singapore-") => "Singapore",
+        _ if region_id.starts_with("mumbai-") => "Mumbai",
+        _ if region_id.starts_with("tokyo-") => "Tokyo",
+        _ if region_id.starts_with("jakarta-") => "Jakarta",
+        _ if region_id.starts_with("israel-") => "Israel",
+        _ if region_id.starts_with("middle-east-") => "Qatar",
+        _ if region_id.starts_with("sydney-") => "Sydney",
+        _ if region_id.starts_with("germany-") => "Germany",
+        _ if region_id.starts_with("paris-") => "Paris",
+        _ if region_id.starts_with("london-") => "London",
+        _ if region_id.starts_with("amsterdam-") => "Amsterdam",
+        _ if region_id.starts_with("korea-") => "Korea",
+        _ if region_id.starts_with("brazil-") => "Brazil",
+        // US regions are multi-segment ("us-east", "us-west", "us-central") and servers append
+        // a location suffix ("us-east-nj"). Require a "-" boundary to avoid false positives.
+        _ if region_id == "us-east" || region_id.starts_with("us-east-") => "US East",
+        _ if region_id == "us-west" || region_id.starts_with("us-west-") => "US West",
+        _ if region_id == "us-central" || region_id.starts_with("us-central-") => "US Central",
+        _ => UNKNOWN_REGION,
+    }
+}
+
+fn format_region_token(token: &str) -> String {
+    if token.is_empty() {
+        return String::new();
+    }
+
+    let lower = token.to_ascii_lowercase();
+    if lower.chars().all(|c| c.is_ascii_digit()) {
+        return lower;
+    }
+
+    match lower.as_str() {
+        "us" | "eu" | "uk" | "uae" | "na" | "sa" | "ap" | "af" | "latam" | "emea" => {
+            lower.to_ascii_uppercase()
+        }
+        _ => {
+            let mut chars = lower.chars();
+            let first = chars
+                .next()
+                .map(|c| c.to_ascii_uppercase())
+                .unwrap_or_default();
+            format!("{}{}", first, chars.as_str())
+        }
+    }
+}
+
+/// Resolve a Discord region label, preserving existing mappings and falling back
+/// to a readable label when the region id is meaningful but not yet mapped.
+pub fn region_display_label(region_id: &str) -> Cow<'static, str> {
+    if let Some(number) = region_id.strip_prefix("middle-east-")
+        && !number.is_empty()
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Cow::Owned(format!("Qatar {number}"));
+    }
+    let known = region_display_name(region_id);
+    if known != "Unknown Region" {
+        return Cow::Borrowed(known);
+    }
+
+    let trimmed = region_id.trim();
+    if trimmed.is_empty() {
+        return Cow::Borrowed("Unknown Region");
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "unknown"
+            | "unknown-region"
+            | "unknown_region"
+            | "auto"
+            | "automatic"
+            | "default"
+            | "none"
+            | "null"
+    ) {
+        return Cow::Borrowed("Unknown Region");
+    }
+
+    let pretty = trimmed
+        .split(|c: char| c == '-' || c == '_' || c.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .map(format_region_token)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if pretty.is_empty() {
+        Cow::Borrowed("Unknown Region")
+    } else {
+        Cow::Owned(pretty)
+    }
+}
+
+/// Use neutral artwork until country and game assets exist in Discord.
+/// Do not invent asset keys: Discord does not render them as emoji flags.
+pub fn region_flag_key(_region_id: &str) -> &'static str {
+    DISCORD_BRAND_IMAGE_KEY
+}
+
+pub fn game_icon_key(_game_name: &str) -> &'static str {
+    DISCORD_BRAND_IMAGE_KEY
+}
+
+/// Get game display name for Discord
+pub fn game_display_name(game_name: &str) -> &'static str {
+    match game_name.to_lowercase().as_str() {
+        "roblox" | "robloxplayerbeta" | "robloxplayerbeta.exe" => "Roblox",
+        _ => "Game",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qatar_relay_labels_preserve_the_node_without_changing_ids() {
+        assert_eq!(region_display_name("middle-east"), "Qatar");
+        assert_eq!(region_display_name("middle-east-03"), "Qatar");
+        assert_eq!(region_display_label("middle-east-03"), "Qatar 03");
+        assert_eq!(region_display_label("middle-east-02"), "Qatar 02");
+        assert_eq!(region_display_name("middle-eastern"), "Unknown Region");
+    }
+
+    #[test]
+    fn new_locations_and_unknown_regions_use_verified_artwork() {
+        for (id, name) in [("jakarta", "Jakarta"), ("israel", "Israel")] {
+            assert_eq!(region_display_label(id), name);
+            assert_eq!(region_display_label(&format!("{id}-02")), name);
+            assert_eq!(region_flag_key(id), "swifttunnel");
+            assert_eq!(region_display_name(&format!("{id}2")), "Unknown Region");
+        }
+        assert_eq!(region_flag_key("future-location"), "swifttunnel");
+        assert_eq!(game_icon_key("roblox"), "swifttunnel");
+    }
+
+    #[test]
+    fn test_region_display_name() {
+        assert_eq!(region_display_name("singapore"), "Singapore");
+        assert_eq!(region_display_name("mumbai"), "Mumbai");
+        assert_eq!(region_display_name("germany"), "Germany");
+        assert_eq!(region_display_name("us-east"), "US East");
+        assert_eq!(region_display_name("us-east-nj"), "US East");
+        assert_eq!(region_display_name("us-west-la"), "US West");
+        assert_eq!(region_display_name("us-central-dallas"), "US Central");
+        assert_eq!(region_display_name("us-east2"), "Unknown Region"); // no "-" boundary
+        assert_eq!(region_display_name("unknown"), "Unknown Region");
+    }
+
+    #[test]
+    fn test_region_display_label_uses_known_mapping() {
+        assert_eq!(region_display_label("us-east-nj"), "US East");
+    }
+
+    #[test]
+    fn test_region_display_label_formats_unknown_region_slug() {
+        assert_eq!(region_display_label("eu-west"), "EU West");
+        assert_eq!(region_display_label("na-east-1"), "NA East 1");
+    }
+
+    #[test]
+    fn test_region_display_label_keeps_unknown_for_non_meaningful_values() {
+        assert_eq!(region_display_label("unknown"), "Unknown Region");
+        assert_eq!(region_display_label(""), "Unknown Region");
+        assert_eq!(region_display_label("auto"), "Unknown Region");
+    }
+
+    #[test]
+    fn test_game_display_name() {
+        assert_eq!(game_display_name("roblox"), "Roblox");
+        assert_eq!(game_display_name("RobloxPlayerBeta.exe"), "Roblox");
+        assert_eq!(game_display_name("unknown_game"), "Game");
+    }
+}

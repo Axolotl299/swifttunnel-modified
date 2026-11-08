@@ -1,0 +1,35 @@
+[workspace]
+members = ["swifttunnel-core", "swifttunnel-desktop/src-tauri", "swifttunnel-lite", "swifttunnel-msi-repair", "swifttunnel-msi-actions", "swifttunnel-setup", "swifttunnel-testbench", "swifttunnel-installer-cache"]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# `strip = "symbols"` removes debuginfo *and* the symbol table, saving
+# 200-800 KB on top of `"debuginfo"` alone. Crash dumps still resolve via
+# PDB if shipped separately.
+strip = "symbols"
+# panic = "unwind" must stay: swifttunnel-core's VPN packet-reader
+# (parallel_interceptor.rs ~L4086), V3 inbound-receiver (~L4147), and
+# UDP relay sender (udp_relay.rs ~L698) threads each wrap their bodies
+# in std::panic::catch_unwind. The unwind path is the mechanism that
+# surfaces worker panics through `workers_panic_cause` to the connection
+# monitor, which drives Connected → Error and runs graceful disconnect
+# + recover_stale_network_state(). Switching to "abort" would kill the
+# process before cleanup, leaving WFP filters, wintun, and split-tunnel
+# driver state dirty on the user's machine.
+panic = "unwind"
+
+# The MSI repair tool is downloaded on its own by users whose install is
+# already broken, so its size matters more than its speed. This used to sit in
+# swifttunnel-msi-repair/Cargo.toml, where Cargo ignores profiles on non-root
+# packages, so it never actually applied. lto and strip come from the release
+# profile above; only opt-level needs overriding per package.
+[profile.release.package.swifttunnel-msi-repair]
+opt-level = "z"
+
+# Faster builds for proc-macro/build-script crates without penalizing runtime
+[profile.release.build-override]
+opt-level = 0
+codegen-units = 16

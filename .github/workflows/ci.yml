@@ -1,0 +1,375 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "swifttunnel-core/**"
+      - "swifttunnel-installer-cache/**"
+      - "swifttunnel-msi-actions/**"
+      - "swifttunnel-msi-repair/**"
+      - "swifttunnel-testbench/**"
+      - "scripts/*msi*"
+      - "scripts/check-installer-ui.ps1"
+      - "scripts/prepare-optional-component-tests.ps1"
+      - "installer/**"
+      - "swifttunnel-lite/**"
+      - "swifttunnel-setup/**"
+      - "swifttunnel-desktop/**"
+      - "scripts/check-desktop-version-sync.mjs"
+      - "scripts/build-recovery-setup*"
+      - "scripts/prepare-release-attestation*"
+      - "release-signing.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/release.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "swifttunnel-core/**"
+      - "swifttunnel-installer-cache/**"
+      - "swifttunnel-msi-actions/**"
+      - "swifttunnel-msi-repair/**"
+      - "swifttunnel-testbench/**"
+      - "scripts/*msi*"
+      - "scripts/check-installer-ui.ps1"
+      - "scripts/prepare-optional-component-tests.ps1"
+      - "installer/**"
+      - "swifttunnel-lite/**"
+      - "swifttunnel-setup/**"
+      - "swifttunnel-desktop/**"
+      - "scripts/check-desktop-version-sync.mjs"
+      - "scripts/build-recovery-setup*"
+      - "scripts/prepare-release-attestation*"
+      - "release-signing.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+    inputs:
+      force_testbench:
+        description: "Queue the self-hosted Windows testbench without probing runner availability. Use only after confirming the runner is online."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: swifttunnel-desktop
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: swifttunnel-desktop/package-lock.json
+
+      - name: Check desktop version sync
+        run: node ../scripts/check-desktop-version-sync.mjs
+
+      - name: Test release packaging
+        run: node --test ../scripts/build-recovery-setup.test.mjs ../scripts/msi-build-paths.test.mjs ../scripts/prepare-release-attestation.test.mjs
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
+  rust:
+    name: Rust Check (GitHub Windows)
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure Git Bash
+        shell: powershell
+        run: |
+          $gitBashPaths = @(
+            'C:\Program Files\Git\bin',
+            'C:\Program Files\Git\usr\bin'
+          ) | Where-Object { Test-Path $_ }
+
+          if ($gitBashPaths.Count -eq 0) {
+            throw 'Git Bash was not found on the GitHub-hosted Windows runner.'
+          }
+
+          foreach ($path in $gitBashPaths) {
+            $path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            $env:Path = "$path;$env:Path"
+          }
+
+          bash --version
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test native MSI recovery logic
+        run: cargo test -p swifttunnel-msi-actions
+
+      - name: Validate Desktop MSI sequence
+        shell: pwsh
+        run: |
+          $triple = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+          & ./scripts/test-desktop-msi-package.ps1 -Target $triple -WorkDir "$env:RUNNER_TEMP/desktop-msi-sequence"
+
+      - name: Test protected installer cache logic
+        run: cargo test -p swifttunnel-installer-cache
+
+      - name: Check core
+        run: cargo check -p swifttunnel-core
+
+      - name: Check desktop backend
+        run: cargo check -p swifttunnel-desktop
+
+      - name: Check Lite, Setup and MSI repair targets
+        run: cargo check -p swifttunnel-lite -p swifttunnel-setup -p swifttunnel-msi-repair --all-targets
+
+      - name: Test MSI repair logic
+        run: cargo test -p swifttunnel-msi-repair --lib --bins
+
+      - name: Test core
+        shell: pwsh
+        run: |
+          ./scripts/prepare-optional-component-tests.ps1
+          cargo test -p swifttunnel-core -- --nocapture
+
+      - name: Test desktop backend
+        run: cargo test -p swifttunnel-desktop -- --nocapture
+
+  rust-arm64:
+    name: Rust Check (Windows ARM64 native)
+    # Run natively on Windows ARM64. The default host toolchain targets
+    # aarch64-pc-windows-msvc, so there's no cross-compile import-lib pain
+    # (windows-rs resolves its native windows.lib instead of LNK1181) and the
+    # ARM64 tests actually execute instead of only compiling with --no-run.
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure Git Bash
+        shell: powershell
+        run: |
+          $gitBashPaths = @(
+            'C:\Program Files\Git\bin',
+            'C:\Program Files\Git\usr\bin'
+          ) | Where-Object { Test-Path $_ }
+
+          if ($gitBashPaths.Count -eq 0) {
+            throw 'Git Bash was not found on the GitHub-hosted Windows runner.'
+          }
+
+          foreach ($path in $gitBashPaths) {
+            $path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            $env:Path = "$path;$env:Path"
+          }
+
+          bash --version
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test native MSI recovery logic
+        run: cargo test -p swifttunnel-msi-actions
+
+      - name: Validate Desktop MSI sequence
+        shell: pwsh
+        run: ./scripts/test-desktop-msi-package.ps1 -Target aarch64-pc-windows-msvc -WorkDir "$env:RUNNER_TEMP/desktop-msi-sequence"
+
+      - name: Check core
+        run: cargo check -p swifttunnel-core
+
+      - name: Check desktop backend
+        run: cargo check -p swifttunnel-desktop
+
+      - name: Check Lite, Setup and MSI repair targets
+        run: cargo check -p swifttunnel-lite -p swifttunnel-setup -p swifttunnel-msi-repair --all-targets
+
+      - name: Test MSI repair logic
+        run: cargo test -p swifttunnel-msi-repair --lib --bins
+
+      - name: Test core
+        shell: pwsh
+        run: |
+          ./scripts/prepare-optional-component-tests.ps1
+          cargo test -p swifttunnel-core -- --nocapture
+
+      - name: Test desktop backend
+        run: cargo test -p swifttunnel-desktop -- --nocapture
+
+  split-tunnel-testbench-availability:
+    name: Split Tunnel Testbench Availability
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    outputs:
+      runner_available: ${{ steps.runner.outputs.available }}
+
+    steps:
+      - name: Check for an online testbench runner
+        id: runner
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${{ inputs.force_testbench || false }}" == "true" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Manual CI dispatch requested with force_testbench=true; caller confirmed the split tunnel testbench runner is online."
+            exit 0
+          fi
+
+          set +e
+          matching_runner_count="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runners" \
+              --jq '.runners[] | select(.status == "online") | select(([.labels[].name] | contains(["self-hosted", "Windows", "X64", "testbench", "swifttunnel-app"]))) | .id' \
+              | wc -l \
+              | tr -d ' '
+          )"
+          api_status=$?
+          set -e
+
+          if [[ "$api_status" -ne 0 ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Could not query self-hosted runners; skipping split tunnel testbench instead of queuing indefinitely."
+            exit 0
+          fi
+
+          if [[ "$matching_runner_count" -gt 0 ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Found $matching_runner_count online split tunnel testbench runner(s)."
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No online split tunnel testbench runner found; skipping split tunnel testbench instead of queuing indefinitely."
+          fi
+
+  split-tunnel-testbench:
+    name: Split Tunnel Testbench (Windows)
+    needs: split-tunnel-testbench-availability
+    # Approval to run a fork's hosted checks must not authorize this machine.
+    if: >-
+      needs.split-tunnel-testbench-availability.outputs.runner_available == 'true' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+       github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+    runs-on: [self-hosted, Windows, X64, testbench, swifttunnel-app]
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Preserve Cargo outputs for later trusted testbench runs only.
+          # Releases build separately on fresh GitHub-hosted windows-2022 runners.
+          clean: false
+
+      - name: Clean workspace but keep local Cargo outputs
+        shell: powershell
+        run: |
+          git reset --hard HEAD
+          git clean -ffdx -e target/ -e swifttunnel-desktop/src-tauri/target/
+          $bundleDirs = @(
+            "target/release/bundle",
+            "target/x86_64-pc-windows-msvc/release/bundle",
+            "target/aarch64-pc-windows-msvc/release/bundle",
+            "swifttunnel-desktop/src-tauri/target/release/bundle",
+            "swifttunnel-desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle",
+            "swifttunnel-desktop/src-tauri/target/aarch64-pc-windows-msvc/release/bundle"
+          )
+          Remove-Item -Path $bundleDirs -Recurse -Force -ErrorAction SilentlyContinue
+
+      - name: Ensure Git Bash
+        shell: powershell
+        run: |
+          $gitBashPaths = @(
+            'C:\Program Files\Git\bin',
+            'C:\Program Files\Git\usr\bin'
+          ) | Where-Object { Test-Path $_ }
+
+          if ($gitBashPaths.Count -eq 0) {
+            throw 'Git Bash was not found on the testbench runner.'
+          }
+
+          foreach ($path in $gitBashPaths) {
+            $path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            $env:Path = "$path;$env:Path"
+          }
+
+          bash --version
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Run split tunnel API tunneling testbench
+        shell: powershell
+        env:
+          SWIFTTUNNEL_TEST_EMAIL: ${{ secrets.SWIFTTUNNEL_TEST_EMAIL }}
+          SWIFTTUNNEL_TEST_PASSWORD: ${{ secrets.SWIFTTUNNEL_TEST_PASSWORD }}
+          SWIFTTUNNEL_TEST_ACCESS_TOKEN: ${{ secrets.SWIFTTUNNEL_TEST_ACCESS_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $params = @{
+            EnableApiTunneling = $true
+            CustomRelay = "45.32.115.254:51821"
+          }
+          if ($env:SWIFTTUNNEL_TEST_EMAIL) {
+            $params.Email = $env:SWIFTTUNNEL_TEST_EMAIL
+          }
+          if ($env:SWIFTTUNNEL_TEST_PASSWORD) {
+            $params.Password = $env:SWIFTTUNNEL_TEST_PASSWORD
+          }
+          .\Windows-testbench\run_split_tunnel_integration_test.ps1 @params

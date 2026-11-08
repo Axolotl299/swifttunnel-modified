@@ -1,0 +1,196 @@
+import type { AppSettings, NetworkConfig } from "./types";
+
+export const DEFAULT_SETTINGS: AppSettings = {
+  theme: "dark",
+  config: {
+    profile: "Balanced",
+    system_optimization: {
+      set_high_priority: false,
+      set_cpu_affinity: false,
+      cpu_cores: [],
+      disable_fullscreen_optimization: false,
+      disable_game_bar: false,
+      power_plan: "Balanced",
+      previous_power_plan: null,
+      timer_resolution_1ms: false,
+      mmcss_gaming_profile: false,
+      game_mode_enabled: false,
+    },
+    roblox_settings: {
+      graphics_quality: "Automatic",
+      unlock_fps: false,
+      target_fps: 144,
+      window_width: 1280,
+      window_height: 720,
+      window_fullscreen: false,
+      ultraboost: false,
+      custom_fflags_enabled: false,
+      custom_fflags_json: "",
+    },
+    network_settings: {
+      enable_network_boost: false,
+      disable_nagle: false,
+      disable_network_throttling: false,
+      firewall_fix: false,
+    },
+    overlay: {
+      enabled: false,
+      metrics: ["fps", "ping", "time", "playtime", "cpu", "ram", "download"],
+      size: "small",
+      style: "straight",
+      color: "#fafafa",
+      position: "top-left",
+      custom_x: null,
+      custom_y: null,
+      locked: true,
+      hotkey: "Ctrl+Shift+O",
+    },
+  },
+  window_state: { x: null, y: null, width: 1020, height: 660, maximized: false },
+  selected_region: "singapore",
+  selected_server: "singapore",
+  manual_relay: null,
+  current_tab: "connect",
+  total_tunneled_ms: 0,
+  update_settings: { auto_check: true, last_check: null },
+  update_channel: "Stable",
+  minimize_to_tray: true,
+  run_on_startup: false,
+  auto_reconnect: false,
+  resume_vpn_on_startup: false,
+  last_connected_region: null,
+  expanded_boost_info: [],
+  selected_game_presets: ["roblox"],
+  network_test_results: {
+    last_stability: null,
+    last_speed: null,
+  },
+  artificial_latency_ms: 0,
+  experimental_mode: false,
+  custom_relay_server: "",
+  enable_discord_rpc: true,
+  auto_routing_enabled: true,
+  whitelisted_regions: [],
+  preferred_physical_adapter_guid: null,
+  network_binding_overrides: {},
+  adapter_binding_mode: "manual",
+  game_process_performance: {
+    high_performance_gpu_binding: false,
+    prefer_performance_cores: false,
+    unbind_cpu0: false,
+  },
+  enable_api_tunneling: false,
+  enable_country_ban: false,
+  idle_when_unfocused: true,
+  show_live_graph: false,
+};
+
+type LegacyNetworkConfig = Partial<NetworkConfig> & {
+  prioritize_roblox_traffic?: boolean;
+  gaming_qos?: boolean;
+};
+
+function isLegacyMasterOnlyNetworkConfig(
+  raw: LegacyNetworkConfig | undefined,
+): boolean {
+  return Boolean(
+    raw?.enable_network_boost &&
+    raw.prioritize_roblox_traffic === undefined &&
+    raw.disable_nagle === undefined &&
+    raw.disable_network_throttling === undefined &&
+    raw.gaming_qos === undefined &&
+    raw.firewall_fix === undefined,
+  );
+}
+
+export function normalizeNetworkBoostConfig(
+  config: LegacyNetworkConfig,
+  options: { legacyMasterOnly?: boolean } = {},
+): NetworkConfig {
+  const next: NetworkConfig = {
+    enable_network_boost: Boolean(config.enable_network_boost),
+    disable_nagle: Boolean(config.disable_nagle),
+    disable_network_throttling: Boolean(config.disable_network_throttling),
+    firewall_fix: Boolean(config.firewall_fix),
+  };
+  const hasSpecificBoost =
+    next.disable_nagle || next.disable_network_throttling || next.firewall_fix;
+
+  if (
+    options.legacyMasterOnly &&
+    next.enable_network_boost &&
+    !hasSpecificBoost
+  ) {
+    next.disable_nagle = true;
+    next.disable_network_throttling = true;
+  }
+
+  next.enable_network_boost =
+    next.disable_nagle || next.disable_network_throttling || next.firewall_fix;
+
+  return next;
+}
+
+export function mergeAppSettings(
+  raw: Partial<AppSettings> | undefined,
+): AppSettings {
+  const rawNetworkSettings = raw?.config?.network_settings as
+    | LegacyNetworkConfig
+    | undefined;
+  const settings = {
+    ...DEFAULT_SETTINGS,
+    ...raw,
+    // Older releases saved false as a default with no UI to change it, so a
+    // missing value means "never chose" and must land on true, not inherit that.
+    // Settings → General owns this now, so an explicit choice is honored.
+    minimize_to_tray: raw?.minimize_to_tray ?? true,
+    selected_game_presets: DEFAULT_SETTINGS.selected_game_presets,
+    config: {
+      ...DEFAULT_SETTINGS.config,
+      ...raw?.config,
+      system_optimization: {
+        ...DEFAULT_SETTINGS.config.system_optimization,
+        ...raw?.config?.system_optimization,
+      },
+      roblox_settings: {
+        ...DEFAULT_SETTINGS.config.roblox_settings,
+        ...raw?.config?.roblox_settings,
+      },
+      network_settings: {
+        ...normalizeNetworkBoostConfig(
+          {
+            ...DEFAULT_SETTINGS.config.network_settings,
+            ...rawNetworkSettings,
+          },
+          {
+            legacyMasterOnly:
+              isLegacyMasterOnlyNetworkConfig(rawNetworkSettings),
+          },
+        ),
+      },
+    },
+    window_state: {
+      ...DEFAULT_SETTINGS.window_state,
+      ...raw?.window_state,
+    },
+    update_settings: {
+      ...DEFAULT_SETTINGS.update_settings,
+      ...raw?.update_settings,
+    },
+    network_test_results: {
+      ...DEFAULT_SETTINGS.network_test_results,
+      ...raw?.network_test_results,
+    },
+    network_binding_overrides: {
+      ...DEFAULT_SETTINGS.network_binding_overrides,
+      ...raw?.network_binding_overrides,
+    },
+    game_process_performance: {
+      ...DEFAULT_SETTINGS.game_process_performance,
+      ...raw?.game_process_performance,
+    },
+  };
+
+  if (settings.enable_api_tunneling || settings.enable_country_ban) settings.auto_routing_enabled = false;
+  return settings;
+}

@@ -1,0 +1,99 @@
+import { useEffect, useRef } from "react";
+import { listen } from "@tauri-apps/api/event";
+import { useGameLibraryStore } from "../stores/gameLibraryStore";
+import { useVpnStore } from "../stores/vpnStore";
+import { gameSessionDescription } from "./robloxGames";
+import { notify } from "./notifications";
+import { reportError } from "./errors";
+import { gamesStartupTarget } from "./commands";
+import { useDeepLinkStore } from "../stores/deepLinkStore";
+let startupRequestHandled = false;
+let startupTargetPromise: Promise<string | null> | null = null;
+
+export function useGameLibrary() {
+  useEffect(() => {
+    let disposed = false;
+    let stop: (() => void) | undefined;
+    let request = 0;
+    const open = (action: string, expected: number) => {
+      if (disposed || request !== expected) return;
+      useGameLibraryStore.getState().requestAction(action);
+      useDeepLinkStore.getState().navigateTo({ tab: "games", anchor: "games_library" });
+    };
+    void listen<string>("games-open", event => {
+      if (disposed) return;
+      // A newer user action supersedes startup and earlier IPC replies. An
+      // older lookup's success or fallback must not overwrite that choice.
+      startupRequestHandled = true;
+      const expected = ++request;
+      const action = event.payload;
+      if (action.startsWith("play:")) {
+        void gamesStartupTarget()
+          .then(place => open(place ? `play:${place}` : action, expected))
+          .catch(() => open(action, expected));
+      } else open(action, expected);
+    }).then(unlisten => {
+      if (disposed) unlisten(); else stop = unlisten;
+    }).catch(error => reportError("Game tray controls", error));
+    if (!startupRequestHandled) {
+      void (startupTargetPromise ??= gamesStartupTarget()).then(place => {
+        // Keep an unsent startup request through effect cleanup/replay, but
+        // never replay it after a newer tray or shortcut action was received.
+        if (!disposed && place && !startupRequestHandled) {
+          startupRequestHandled = true;
+          open(`play:${place}`, 0);
+        }
+      }).catch(() => {});
+    }
+    return () => { disposed = true; stop?.(); };
+  }, []);
+  const current = useGameLibraryStore(s => s.library?.current);
+  const notified = useRef<string | null>(null);
+  useEffect(() => {
+    let disposed = false;
+    let stop: (() => void) | undefined;
+    void listen("roblox-library-changed", () => {
+      if (!disposed) void useGameLibraryStore.getState().refresh();
+    }).then(unlisten => {
+      if (disposed) unlisten(); else stop = unlisten;
+    }).catch(error => reportError("Could not subscribe to game-library updates", error));
+    return () => { disposed = true; stop?.(); };
+  }, []);
+
+  useEffect(() => {
+    if (!current) { notified.current = null; return; }
+    const key = `${current.client}:${current.place_id}:${current.job_id}:${current.observed_at}`;
+    if (notified.current === key) return;
+    // Opt-in; toggling the preference doesn't replay an old join.
+    if (!current.fresh_join || !useGameLibraryStore.getState().library?.notify_joins) {
+      notified.current = key;
+      return;
+    }
+    let disposed = false;
+    let attempts = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const show = async () => {
+      const verified = await useVpnStore.getState().fetchState();
+      if (disposed) return;
+      const route = verified ? useVpnStore.getState().gameRoute : null;
+      const latest = useGameLibraryStore.getState().library?.current;
+      // The store can advance before React runs this effect's cleanup. Never
+      // announce a closed game or borrow the next join's location.
+      if (!latest || `${latest.client}:${latest.place_id}:${latest.job_id}:${latest.observed_at}` !== key) return;
+      if ((!route || route.game_server_ip !== current.ip) && !latest?.location && ++attempts < 5) {
+        timer = setTimeout(send, 2000);
+        return;
+      }
+      const library = useGameLibraryStore.getState().library;
+      if (!library?.notify_joins) return;
+      const entry = library.entries.find(e => e.place_id === current.place_id && e.client === current.client);
+      // Claim only when sending. Effect cleanup/replay (including React's dev
+      // replay) must not permanently cancel an unsent notification.
+      notified.current = key;
+      await notify(entry?.name ?? "Roblox game joined", gameSessionDescription(latest, route));
+    };
+    const send = () => { void show().catch(error => reportError("Could not show game notification", error, { dedupeKey: "game-join-notification" })); };
+    timer = setTimeout(send, 2000);
+    return () => { disposed = true; clearTimeout(timer); };
+  }, [current?.place_id, current?.job_id, current?.client, current?.ip, current?.fresh_join, current?.observed_at]);
+}

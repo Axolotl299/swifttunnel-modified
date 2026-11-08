@@ -1,0 +1,1160 @@
+//! Settings persistence module
+//!
+//! Saves and loads app settings to/from disk
+
+use crate::network_analyzer::NetworkTestResultsCache;
+use crate::structs::Config;
+use crate::updater::{UpdateChannel, UpdateSettings};
+use crate::utils::normalize_guid_ascii_lowercase;
+use log::{debug, error, info};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+const SETTINGS_FILE: &str = "settings.json";
+
+const APP_NAME: &str = "SwiftTunnel";
+static SETTINGS_LOAD_BLOCKED: AtomicBool = AtomicBool::new(false);
+const LOAD_RECOVERY_MESSAGE: &str =
+    "Restart SwiftTunnel to reload your saved settings before saving changes.";
+
+pub fn settings_load_error() -> Option<&'static str> {
+    SETTINGS_LOAD_BLOCKED
+        .load(Ordering::Acquire)
+        .then_some(LOAD_RECOVERY_MESSAGE)
+}
+pub const MIN_WINDOW_WIDTH: f32 = 800.0;
+pub const MIN_WINDOW_HEIGHT: f32 = 600.0;
+
+// Routing mode removed - V3 (UDP relay) is the only mode now.
+// V1 (process-based WireGuard) and V2 (hybrid WireGuard) have been removed.
+// Legacy settings files with routing_mode field are handled via serde(default).
+
+/// Window state for persistence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowState {
+    /// Window X position (None = center)
+    pub x: Option<f32>,
+    /// Window Y position (None = center)
+    pub y: Option<f32>,
+    /// Window width
+    pub width: f32,
+    /// Window height
+    pub height: f32,
+    /// Whether window is maximized
+    pub maximized: bool,
+}
+
+impl WindowState {
+    pub fn sanitize_in_place(&mut self) {
+        if !self.width.is_finite() || self.width < MIN_WINDOW_WIDTH {
+            self.width = MIN_WINDOW_WIDTH;
+        }
+
+        if !self.height.is_finite() || self.height < MIN_WINDOW_HEIGHT {
+            self.height = MIN_WINDOW_HEIGHT;
+        }
+
+        if self.x.is_some_and(|x| !x.is_finite()) {
+            self.x = None;
+        }
+
+        if self.y.is_some_and(|y| !y.is_finite()) {
+            self.y = None;
+        }
+    }
+}
+
+impl Default for WindowState {
+    fn default() -> Self {
+        Self {
+            x: None, // Let OS center the window
+            y: None,
+            width: 1020.0,
+            height: 660.0,
+            maximized: false,
+        }
+    }
+}
+
+/// A deliberate relay choice, bound to the endpoint shown when it was selected.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManualRelay {
+    pub region: String,
+    pub server_id: String,
+    pub ip: String,
+    pub port: u16,
+}
+
+/// App settings including theme preference
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSettings {
+    /// Theme preference: "dark" or "light"
+    pub theme: String,
+    /// App configuration
+    pub config: Config,
+    /// Legacy field from the removed master boost toggle.
+    ///
+    /// Kept only for backwards-compatible deserialization of older settings files.
+    /// Runtime behavior now uses per-boost config and ignores this field.
+    #[serde(default, skip_serializing)]
+    pub optimizations_active: bool,
+    /// Window state (position, size, maximized)
+    #[serde(default)]
+    pub window_state: WindowState,
+    /// Selected gaming region (e.g., "singapore", "mumbai")
+    #[serde(default = "default_region")]
+    pub selected_region: String,
+    /// Selected VPN server within region (auto-selected by best ping)
+    #[serde(default = "default_server")]
+    pub selected_server: String,
+    /// None keeps automatic relay selection. Legacy pins are not reactivated.
+    #[serde(default)]
+    pub manual_relay: Option<ManualRelay>,
+    /// Current tab
+    #[serde(default)]
+    pub current_tab: String,
+    /// Update settings
+    #[serde(default)]
+    pub update_settings: UpdateSettings,
+    /// Selected update channel (Live = pre-release builds, Stable = vetted releases)
+    #[serde(default)]
+    pub update_channel: UpdateChannel,
+    /// Whether to minimize to tray instead of closing
+    #[serde(default = "default_minimize_to_tray")]
+    pub minimize_to_tray: bool,
+    /// Launch app automatically at Windows sign-in
+    #[serde(default = "default_run_on_startup")]
+    pub run_on_startup: bool,
+    /// Reconnect VPN automatically on next launch after an active session
+    #[serde(default = "default_auto_reconnect")]
+    pub auto_reconnect: bool,
+    /// Internal marker: set true after successful connect, cleared on disconnect/logout
+    #[serde(default)]
+    pub resume_vpn_on_startup: bool,
+    /// Last successfully connected region (for "LAST USED" badge)
+    #[serde(default)]
+    pub last_connected_region: Option<String>,
+    /// Expanded boost info panel IDs (user preference to show detailed info)
+    #[serde(default)]
+    pub expanded_boost_info: Vec<String>,
+    /// Whether the one-time frame cap migration has run.
+    ///
+    /// The frame cap shipped off by default, so most existing installs sit at
+    /// Roblox's stock 60 having never found the switch. Turning it on for them
+    /// needs to happen exactly once: the other migrations in
+    /// `sanitize_in_place` simply force a value on every load, which would mean
+    /// nobody could ever turn the cap back off again.
+    ///
+    /// Absent in files written before this existed, so serde defaults it to
+    /// false and those installs get migrated on their next launch.
+    #[serde(default)]
+    pub fps_unlock_migrated: bool,
+    /// Selected game presets for split tunneling (stored as strings: "roblox")
+    #[serde(default = "default_game_presets")]
+    pub selected_game_presets: Vec<String>,
+    /// Cached network test results
+    #[serde(default)]
+    pub network_test_results: NetworkTestResultsCache,
+    // forced_servers (a relay pinned per location) was removed: relays are
+    // chosen automatically by latency and load. A saved one is ignored as an
+    // unknown field.
+    /// Artificial latency to add to VPN connection (0-100ms)
+    /// Used for practice mode to simulate high ping
+    #[serde(default)]
+    pub artificial_latency_ms: u32,
+    /// Enable experimental features (Practice Mode, etc.)
+    #[serde(default)]
+    pub experimental_mode: bool,
+    /// Legacy routing mode field - ignored, V3 is always used.
+    /// Kept for backwards-compatible deserialization of old settings files.
+    #[serde(default, skip_serializing)]
+    pub _routing_mode: serde_json::Value,
+    /// Custom relay server override (experimental feature)
+    /// Format: "host:port" - leave empty for auto (uses VPN server IP:51821)
+    #[serde(default)]
+    pub custom_relay_server: String,
+    /// Enable Discord Rich Presence (show VPN status in Discord)
+    #[serde(default = "default_discord_rpc")]
+    pub enable_discord_rpc: bool,
+    /// Enable auto-routing: automatically switch relay server when game server region changes
+    #[serde(default = "default_auto_routing")]
+    pub auto_routing_enabled: bool,
+    /// Whitelisted game regions where VPN should be bypassed during auto-routing
+    /// Stored as RobloxRegion display names (e.g., "Singapore", "Tokyo", "US East")
+    #[serde(default)]
+    pub whitelisted_regions: Vec<String>,
+    /// Preferred physical network adapter GUID to bind split tunneling to.
+    ///
+    /// When set, SwiftTunnel will prefer this adapter over default-route auto-detection.
+    /// Stored as lowercase `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
+    #[serde(default)]
+    pub preferred_physical_adapter_guid: Option<String>,
+    /// Per-network remembered split-tunnel adapter overrides for Smart Auto.
+    ///
+    /// Keyed by a stable network signature built from the active route plus UP adapters.
+    #[serde(default)]
+    pub network_binding_overrides: HashMap<String, String>,
+    /// Physical adapter binding strategy for split tunnel interception.
+    #[serde(default)]
+    pub adapter_binding_mode: AdapterBindingMode,
+    /// Game-process performance tuning controls (Windows-only, per target game process).
+    ///
+    /// All options are opt-in and default OFF.
+    #[serde(default)]
+    pub game_process_performance: GameProcessPerformanceSettings,
+
+    /// Route Roblox TCP/HTTPS traffic through the relay to bypass ISP blocking.
+    ///
+    /// When enabled, TCP packets from tunnel apps and browser-owned Roblox
+    /// login/API HTTP(S) flows are forwarded through the V3 relay alongside
+    /// UDP game traffic. Off by default.
+    #[serde(default)]
+    pub enable_api_tunneling: bool,
+    /// Bypass a FULL country block (whole platform banned, e.g. Egypt).
+    ///
+    /// Runs the scoped GoodbyeDPI helper for Roblox hostnames AND relays the
+    /// Roblox control plane, launch-critical settings hosts, and gameplay UDP —
+    /// the censor may block Roblox's IP ranges wholesale, so nothing is
+    /// trusted to the direct path. Off by default.
+    #[serde(default)]
+    pub enable_country_ban: bool,
+
+    /// Throttle background polling while the window is not focused.
+    ///
+    /// The UI lives in a WebView2 process, and while connected the Connect
+    /// tab polls throughput, state and ping several times a second. None of
+    /// that is being read once the player alt-tabs into a game, but it keeps
+    /// costing IPC round trips and re-renders that compete with the game for
+    /// CPU. Users have reported exactly this as SwiftTunnel making the game
+    /// stutter, and traced it to the Edge WebView process.
+    ///
+    /// On by default. Exposed as a setting because anyone watching the graph
+    /// on a second monitor genuinely wants the fast rate.
+    #[serde(default = "default_idle_when_unfocused")]
+    pub idle_when_unfocused: bool,
+
+    /// Draw the live throughput graph on the Connect tab.
+    ///
+    /// The graph is the most expensive thing in the UI: it redraws with a
+    /// throughput sample every 500ms. That is fine while someone is looking
+    /// at it, and pure cost for anyone who keeps the window open on a second
+    /// monitor while playing, where it competes with the game for GPU and CPU.
+    ///
+    /// Off by default; people who want it turn it on from the Connect tab or
+    /// Settings. Off stops both the redraw and the sampling.
+    #[serde(default = "default_show_live_graph")]
+    pub show_live_graph: bool,
+    /// Whether the one-time "graph off" migration has run.
+    ///
+    /// The graph shipped on by default, so every existing settings file has it
+    /// saved as on. Switching it off for those installs has to happen exactly
+    /// once, for the same reason as `fps_unlock_migrated`: forcing it on every
+    /// load would leave no way to turn the graph back on.
+    ///
+    /// Absent in files written before this existed, so serde defaults it to
+    /// false and those installs get migrated on their next launch.
+    #[serde(default)]
+    pub live_graph_off_migrated: bool,
+
+    /// Lifetime milliseconds spent tunnelling.
+    ///
+    /// Lives here rather than in the webview's localStorage so the full app
+    /// and Lite share one number. Each Tauri app gets its own webview data
+    /// directory, keyed by bundle identifier, so a browser-side counter would
+    /// silently fork into two the moment somebody installed both.
+    #[serde(default)]
+    pub total_tunneled_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum AdapterBindingMode {
+    SmartAuto,
+    #[default]
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct GameProcessPerformanceSettings {
+    /// Persist a high-performance GPU preference for each target game executable.
+    pub high_performance_gpu_binding: bool,
+    /// Prefer performance-core CPU sets for target game processes on hybrid CPUs.
+    pub prefer_performance_cores: bool,
+    /// Exclude logical CPU 0 from target game process scheduling when possible.
+    pub unbind_cpu0: bool,
+}
+
+fn default_discord_rpc() -> bool {
+    true // Enabled by default
+}
+
+fn default_auto_routing() -> bool {
+    true
+}
+
+fn default_show_live_graph() -> bool {
+    false
+}
+
+fn default_idle_when_unfocused() -> bool {
+    true
+}
+
+fn default_minimize_to_tray() -> bool {
+    true
+}
+
+fn default_run_on_startup() -> bool {
+    false
+}
+
+fn default_auto_reconnect() -> bool {
+    false
+}
+
+fn default_region() -> String {
+    "singapore".to_string()
+}
+
+fn default_server() -> String {
+    "singapore".to_string()
+}
+
+fn default_game_presets() -> Vec<String> {
+    vec!["roblox".to_string()] // Default to Roblox selected
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            theme: "dark".to_string(),
+            config: Config::default(),
+            optimizations_active: false,
+            window_state: WindowState::default(),
+            selected_region: "singapore".to_string(),
+            selected_server: "singapore".to_string(),
+            manual_relay: None,
+            current_tab: "connect".to_string(),
+            update_settings: UpdateSettings::default(),
+            update_channel: UpdateChannel::Stable,
+            minimize_to_tray: default_minimize_to_tray(),
+            run_on_startup: default_run_on_startup(),
+            auto_reconnect: default_auto_reconnect(),
+            resume_vpn_on_startup: false,
+            last_connected_region: None,
+            expanded_boost_info: Vec::new(),
+            // A fresh install already gets the cap on from
+            // RobloxSettingsConfig::default, so there is nothing to migrate.
+            fps_unlock_migrated: true,
+            selected_game_presets: default_game_presets(),
+            network_test_results: NetworkTestResultsCache::default(),
+            artificial_latency_ms: 0,
+            experimental_mode: false,
+            _routing_mode: serde_json::Value::Null,
+            custom_relay_server: String::new(),
+            enable_discord_rpc: default_discord_rpc(),
+            auto_routing_enabled: default_auto_routing(),
+            whitelisted_regions: Vec::new(),
+            preferred_physical_adapter_guid: None,
+            network_binding_overrides: HashMap::new(),
+            adapter_binding_mode: AdapterBindingMode::Manual,
+            game_process_performance: GameProcessPerformanceSettings::default(),
+            enable_api_tunneling: false,
+            enable_country_ban: false,
+            idle_when_unfocused: default_idle_when_unfocused(),
+            show_live_graph: default_show_live_graph(),
+            // A fresh install already starts with the graph off.
+            live_graph_off_migrated: true,
+            total_tunneled_ms: 0,
+        }
+    }
+}
+
+impl AppSettings {
+    pub fn sanitize_in_place(&mut self) {
+        self.window_state.sanitize_in_place();
+        self.preferred_physical_adapter_guid = self
+            .preferred_physical_adapter_guid
+            .as_deref()
+            .and_then(normalize_guid_ascii_lowercase);
+        self.network_binding_overrides = self
+            .network_binding_overrides
+            .drain()
+            .filter_map(|(signature, guid)| {
+                normalize_guid_ascii_lowercase(&guid).map(|normalized| (signature, normalized))
+            })
+            .collect();
+        self.config.network_settings.normalize_legacy_master_boost();
+
+        // One-time: turn the frame cap on for people who installed before it
+        // defaulted on. It shipped off, so most existing installs sit at
+        // Roblox's stock 60 having never found the switch.
+        //
+        // Guarded by a marker rather than forced on every load, because
+        // forcing it would re-enable the cap on every launch and there
+        // would be no way to turn it off. Raises the target rather than setting
+        // it, so anyone who already picked something higher keeps it, and
+        // `apply_xml_settings` will not lower their FramerateCap either.
+        if !self.fps_unlock_migrated {
+            self.config.roblox_settings.unlock_fps = true;
+            self.config.roblox_settings.target_fps =
+                self.config.roblox_settings.target_fps.max(300);
+            self.fps_unlock_migrated = true;
+        }
+
+        // One-time: hide the live graph for installs from before it defaulted
+        // off. It shipped on, so every existing settings file has it saved as
+        // on. Marker-guarded like the frame cap, so turning it back on sticks.
+        if !self.live_graph_off_migrated {
+            self.show_live_graph = false;
+            self.live_graph_off_migrated = true;
+        }
+
+        self.selected_game_presets = default_game_presets();
+        // Preserve explicit matchmaking/bypass settings from older releases.
+        // Moving their TCP connections to another relay would break them.
+        if self.enable_api_tunneling || self.enable_country_ban {
+            self.auto_routing_enabled = false;
+        }
+        // Partial Bypass was removed. A saved `enable_partial_country_ban`
+        // is ignored as an unknown field, so upgrading users simply lose the
+        // mode rather than hitting a parse error. Both normalisation rules
+        // that lived here existed only to reconcile it against the other two
+        // modes, so they went with it.
+    }
+}
+
+fn sanitize_settings(mut settings: AppSettings) -> AppSettings {
+    settings.sanitize_in_place();
+    settings
+}
+
+/// Get the settings directory path
+/// Windows: %APPDATA%\SwiftTunnel\
+fn get_settings_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| p.join(APP_NAME))
+}
+
+/// Get the full path to the settings file
+fn get_settings_path() -> Option<PathBuf> {
+    get_settings_dir().map(|p| p.join(SETTINGS_FILE))
+}
+
+/// Load settings from disk
+pub fn load_settings() -> AppSettings {
+    let path = match get_settings_path() {
+        Some(p) => p,
+        None => {
+            debug!("Could not determine settings path, using defaults");
+            SETTINGS_LOAD_BLOCKED.store(true, Ordering::Release);
+            return sanitize_settings(AppSettings::default());
+        }
+    };
+
+    load_settings_from(&path, &SETTINGS_LOAD_BLOCKED)
+}
+
+fn load_settings_from(path: &std::path::Path, blocked: &AtomicBool) -> AppSettings {
+    // Defaults are safe to persist only for a confirmed missing file, a valid
+    // read, or corruption whose original bytes were successfully preserved.
+    blocked.store(true, Ordering::Release);
+    match crate::utils::read_text_file_bounded(path, MAX_SETTINGS_BYTES, "SwiftTunnel settings") {
+        Ok(content) => match serde_json::from_str(&content) {
+            Ok(settings) => {
+                info!("Loaded settings from {:?}", path);
+                blocked.store(false, Ordering::Release);
+                sanitize_settings(settings)
+            }
+            Err(e) => {
+                error!("Failed to parse settings file: {}", e);
+                if let Some(backup) = backup_corrupt_settings(path) {
+                    error!("Backed up corrupt settings to {:?}", backup);
+                    blocked.store(false, Ordering::Release);
+                }
+                sanitize_settings(AppSettings::default())
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!("Settings file does not exist, using defaults");
+            blocked.store(false, Ordering::Release);
+            sanitize_settings(AppSettings::default())
+        }
+        Err(e) => {
+            error!("Failed to read settings file: {}", e);
+            if e.kind() == std::io::ErrorKind::InvalidData
+                && let Some(backup) = backup_corrupt_settings(path)
+            {
+                error!("Kept unreadable or oversized settings at {:?}", backup);
+                blocked.store(false, Ordering::Release);
+            }
+            sanitize_settings(AppSettings::default())
+        }
+    }
+}
+
+/// Rename a corrupt settings file to `settings.json.corrupt-{unix_ms}` so the
+/// user can recover their original config and so we don't silently overwrite
+/// it on the next save.
+fn backup_corrupt_settings(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let backup = path.with_file_name(format!(
+        "{}.corrupt-{}",
+        path.file_name()?.to_string_lossy(),
+        stamp
+    ));
+    fs::rename(path, &backup).ok()?;
+    Some(backup)
+}
+
+/// Save settings to disk
+pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
+    let dir = match get_settings_dir() {
+        Some(d) => d,
+        None => return Err("Could not determine settings directory".to_string()),
+    };
+
+    save_settings_to(&dir.join(SETTINGS_FILE), settings, &SETTINGS_LOAD_BLOCKED)
+}
+
+fn save_settings_to(
+    path: &std::path::Path,
+    settings: &AppSettings,
+    blocked: &AtomicBool,
+) -> Result<(), String> {
+    if blocked.load(Ordering::Acquire) {
+        return Err(LOAD_RECOVERY_MESSAGE.into());
+    }
+    let dir = path
+        .parent()
+        .ok_or("Could not determine settings directory")?;
+
+    // Create directory if it doesn't exist
+    if !dir.exists()
+        && let Err(e) = fs::create_dir_all(&dir)
+    {
+        return Err(format!("Failed to create settings directory: {}", e));
+    }
+
+    let mut settings_to_save = settings.clone();
+    settings_to_save.sanitize_in_place();
+
+    let json = match serde_json::to_string_pretty(&settings_to_save) {
+        Ok(j) => j,
+        Err(e) => return Err(format!("Failed to serialize settings: {}", e)),
+    };
+
+    if json.len() > MAX_SETTINGS_BYTES {
+        return Err("Settings are too large to save safely.".into());
+    }
+    replace_settings_file(&path, json.as_bytes())
+}
+
+const MAX_SETTINGS_BYTES: usize = 1024 * 1024;
+
+/// Never truncate the live settings as a fallback. If Windows/antivirus holds
+/// it open, keep its contents and let the caller retry the failed save.
+fn replace_settings_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    // Use the same owned, collision-resistant staging and replacement as
+    // other saved files instead of maintaining a second atomic-save routine.
+    crate::atomic_file::replace(path, bytes).map_err(|error| {
+        format!("Could not replace settings. Previous settings were kept; retry Save: {error}")
+    })?;
+    info!("Saved settings to {:?}", path);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct LoadFixture(PathBuf);
+    impl LoadFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "swifttunnel-settings-load-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+        fn path(&self) -> PathBuf {
+            self.0.join("settings.json")
+        }
+    }
+    impl Drop for LoadFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_unreadable_settings_file_cannot_be_replaced_with_startup_defaults() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = LoadFixture::new();
+        let path = fixture.path();
+        let original = serde_json::to_string(&AppSettings {
+            selected_region: "mumbai".into(),
+            minimize_to_tray: false,
+            ..AppSettings::default()
+        })
+        .unwrap();
+        fs::write(&path, &original).unwrap();
+        let blocked = AtomicBool::new(false);
+        // Deny reads but allow renames, like a transient scanner/backup lock.
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(4)
+            .open(&path)
+            .unwrap();
+        let fallback = load_settings_from(&path, &blocked);
+        drop(lock);
+        assert!(
+            save_settings_to(&path, &fallback, &blocked).is_err(),
+            "a later autosave must not replace the settings we failed to read"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let recovered = load_settings_from(&path, &blocked);
+        assert_eq!(recovered.selected_region, "mumbai");
+        assert!(!recovered.minimize_to_tray);
+        save_settings_to(&path, &recovered, &blocked).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_corrupt_settings_backup_blocks_default_saves_even_after_the_lock_clears() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = LoadFixture::new();
+        let path = fixture.path();
+        fs::write(&path, "{broken").unwrap();
+        let blocked = AtomicBool::new(false);
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&path)
+            .unwrap();
+        let fallback = load_settings_from(&path, &blocked);
+        drop(lock);
+        assert!(save_settings_to(&path, &fallback, &blocked).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{broken");
+    }
+
+    #[test]
+    fn new_files_and_successfully_preserved_corruption_allow_saving() {
+        let fixture = LoadFixture::new();
+        let path = fixture.path();
+        let blocked = AtomicBool::new(false);
+        let new = load_settings_from(&path, &blocked);
+        save_settings_to(&path, &new, &blocked).unwrap();
+        fs::write(&path, "{broken").unwrap();
+        let recovered = load_settings_from(&path, &blocked);
+        save_settings_to(&path, &recovered, &blocked).unwrap();
+        let backup = fs::read_dir(&fixture.0)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p != &path)
+            .unwrap();
+        assert_eq!(fs::read_to_string(backup).unwrap(), "{broken");
+        assert!(serde_json::from_str::<AppSettings>(&fs::read_to_string(path).unwrap()).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_replacement_cannot_fall_back_to_truncating_the_live_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "swifttunnel_atomic_settings_{}",
+            rand::random::<u64>()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("settings.json");
+        fs::write(&path, "original settings").unwrap();
+        // Allow reads/writes but deny deletion, modelling a scanner which
+        // prevents rename. The old direct-write fallback would succeed here.
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&path)
+            .unwrap();
+        assert!(replace_settings_file(&path, b"replacement").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original settings");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        drop(locked);
+        replace_settings_file(&path, b"replacement").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_default_settings() {
+        let settings = AppSettings::default();
+        assert_eq!(settings.theme, "dark");
+        assert!(!settings.optimizations_active);
+        assert_eq!(settings.selected_region, "singapore");
+        assert_eq!(settings.selected_server, "singapore");
+        assert_eq!(settings.update_channel, UpdateChannel::Stable);
+        assert!(
+            settings.minimize_to_tray,
+            "Default should hide to tray so X/taskbar close keeps the tunnel alive"
+        );
+        assert!(!settings.run_on_startup);
+        assert!(!settings.auto_reconnect);
+        assert!(!settings.resume_vpn_on_startup);
+        assert!(settings.preferred_physical_adapter_guid.is_none());
+        assert_eq!(settings.adapter_binding_mode, AdapterBindingMode::Manual);
+        assert!(
+            !settings
+                .game_process_performance
+                .high_performance_gpu_binding
+        );
+        assert!(!settings.game_process_performance.prefer_performance_cores);
+        assert!(!settings.game_process_performance.unbind_cpu0);
+    }
+
+    #[test]
+    fn test_settings_roundtrip() {
+        let mut settings = AppSettings {
+            theme: "light".to_string(),
+            optimizations_active: true,
+            selected_region: "tokyo".to_string(),
+            selected_server: "tokyo-02".to_string(),
+            update_channel: UpdateChannel::Live,
+            preferred_physical_adapter_guid: Some(
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+            ),
+            adapter_binding_mode: AdapterBindingMode::Manual,
+            ..Default::default()
+        };
+        settings
+            .game_process_performance
+            .high_performance_gpu_binding = true;
+        settings.game_process_performance.prefer_performance_cores = true;
+        settings.game_process_performance.unbind_cpu0 = true;
+
+        let json = serde_json::to_string(&settings).unwrap();
+        let loaded: AppSettings = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.theme, "light");
+        assert!(
+            !json.contains("optimizations_active"),
+            "legacy master boost field should not be serialized"
+        );
+        assert!(!loaded.optimizations_active);
+        assert_eq!(loaded.selected_region, "tokyo");
+        assert_eq!(loaded.selected_server, "tokyo-02");
+        assert_eq!(loaded.update_channel, UpdateChannel::Live);
+        assert_eq!(
+            loaded.preferred_physical_adapter_guid.as_deref(),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        );
+        assert_eq!(loaded.adapter_binding_mode, AdapterBindingMode::Manual);
+        assert!(loaded.game_process_performance.high_performance_gpu_binding);
+        assert!(loaded.game_process_performance.prefer_performance_cores);
+        assert!(loaded.game_process_performance.unbind_cpu0);
+    }
+
+    #[test]
+    fn test_settings_sanitize_discards_malformed_adapter_preferences() {
+        let mut settings = AppSettings {
+            preferred_physical_adapter_guid: Some("Wi-Fi".to_string()),
+            network_binding_overrides: HashMap::from([
+                ("bad".to_string(), "auto".to_string()),
+                (
+                    "good".to_string(),
+                    "{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}".to_string(),
+                ),
+            ]),
+            ..Default::default()
+        };
+        settings.sanitize_in_place();
+        assert!(settings.preferred_physical_adapter_guid.is_none());
+        assert_eq!(settings.network_binding_overrides.len(), 1);
+        assert_eq!(
+            settings.network_binding_overrides["good"],
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        );
+    }
+
+    #[test]
+    fn test_settings_sanitize_normalizes_preferred_physical_adapter_guid() {
+        let mut settings = AppSettings {
+            preferred_physical_adapter_guid: Some(
+                "  {AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}  ".to_string(),
+            ),
+            ..Default::default()
+        };
+        settings.sanitize_in_place();
+        assert_eq!(
+            settings.preferred_physical_adapter_guid.as_deref(),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        );
+    }
+
+    #[test]
+    fn test_settings_adapter_binding_mode_defaults_to_manual() {
+        let json = r#"{"theme": "dark", "config": {}, "optimizations_active": false}"#;
+        let loaded: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.adapter_binding_mode, AdapterBindingMode::Manual);
+    }
+
+    #[test]
+    fn test_settings_game_process_performance_defaults_disabled() {
+        let json = r#"{"theme": "dark", "config": {}, "optimizations_active": false}"#;
+        let loaded: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(!loaded.game_process_performance.high_performance_gpu_binding);
+        assert!(!loaded.game_process_performance.prefer_performance_cores);
+        assert!(!loaded.game_process_performance.unbind_cpu0);
+    }
+
+    #[test]
+    fn test_settings_auto_routing_default() {
+        // Missing Auto settings opt in; explicit false remains a user choice.
+        let json = r#"{"theme": "dark", "config": {}, "optimizations_active": false}"#;
+        let loaded: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(loaded.auto_routing_enabled);
+    }
+
+    #[test]
+    fn routing_modes_preserve_explicit_assist_and_manual_choices() {
+        let mut settings = AppSettings {
+            enable_api_tunneling: true,
+            ..AppSettings::default()
+        };
+        settings.sanitize_in_place();
+        assert!(!settings.auto_routing_enabled);
+        assert!(settings.enable_api_tunneling);
+        let json = r#"{"theme":"dark","config":{},"optimizations_active":false,"auto_routing_enabled":false}"#;
+        let mut loaded: AppSettings = serde_json::from_str(json).unwrap();
+        loaded.sanitize_in_place();
+        assert!(!loaded.auto_routing_enabled);
+    }
+
+    #[test]
+    fn test_settings_sanitize_migrates_legacy_network_boost_master() {
+        let mut settings: AppSettings = serde_json::from_str(
+            r#"{
+              "theme": "dark",
+              "config": {
+                "network_settings": {
+                  "enable_network_boost": true
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        settings.sanitize_in_place();
+
+        assert!(settings.config.network_settings.enable_network_boost);
+        assert!(settings.config.network_settings.disable_nagle);
+        assert!(settings.config.network_settings.disable_network_throttling);
+        assert!(!settings.config.network_settings.firewall_fix);
+    }
+
+    #[test]
+    fn test_settings_sanitize_preserves_all_off_network_boosts() {
+        let mut settings: AppSettings = serde_json::from_str(
+            r#"{
+              "theme": "dark",
+              "config": {
+                "network_settings": {
+                  "enable_network_boost": false
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        settings.sanitize_in_place();
+
+        assert!(!settings.config.network_settings.enable_network_boost);
+        assert!(!settings.config.network_settings.disable_nagle);
+        assert!(!settings.config.network_settings.disable_network_throttling);
+    }
+
+    #[test]
+    fn test_settings_minimize_to_tray_default() {
+        // Settings without minimize_to_tray should default to true (hide to tray).
+        let json = r#"{"theme": "dark", "config": {}, "optimizations_active": false}"#;
+        let loaded: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(loaded.minimize_to_tray);
+    }
+
+    #[test]
+    fn test_settings_sanitize_preserves_an_explicit_close_to_tray_opt_out() {
+        let mut settings = AppSettings {
+            minimize_to_tray: false,
+            ..Default::default()
+        };
+
+        settings.sanitize_in_place();
+
+        assert!(!settings.minimize_to_tray);
+        let mut reloaded: AppSettings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        reloaded.sanitize_in_place();
+        assert!(!reloaded.minimize_to_tray);
+    }
+
+    /// An install from before the cap defaulted on gets it turned on, once.
+    ///
+    /// The marker is absent from those files, so serde leaves it false and the
+    /// migration runs on next launch.
+    #[test]
+    fn the_frame_cap_migration_turns_it_on_for_an_existing_install() {
+        let json = r#"{"theme":"dark","config":{"roblox_settings":{"graphics_quality":"Automatic","unlock_fps":false,"target_fps":144}},"optimizations_active":false}"#;
+        let mut settings: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(
+            !settings.fps_unlock_migrated,
+            "a file written before the marker existed must read as unmigrated"
+        );
+
+        settings.sanitize_in_place();
+
+        assert!(settings.config.roblox_settings.unlock_fps);
+        assert_eq!(settings.config.roblox_settings.target_fps, 300);
+        assert!(settings.fps_unlock_migrated);
+    }
+
+    /// It raises the target, never lowers it, so somebody who already asked for
+    /// more than the migration's floor keeps what they chose.
+    #[test]
+    fn the_frame_cap_migration_never_lowers_a_higher_target() {
+        let mut settings = AppSettings::default();
+        settings.fps_unlock_migrated = false;
+        settings.config.roblox_settings.unlock_fps = false;
+        settings.config.roblox_settings.target_fps = 600;
+
+        settings.sanitize_in_place();
+
+        assert!(settings.config.roblox_settings.unlock_fps);
+        assert_eq!(
+            settings.config.roblox_settings.target_fps, 600,
+            "600 is above the floor, so it must survive"
+        );
+    }
+
+    /// Once is once. Forcing this on every load would re-enable the cap on
+    /// every launch and leave no way to turn it off.
+    #[test]
+    fn the_frame_cap_migration_does_not_run_twice() {
+        let mut settings = AppSettings::default();
+        settings.sanitize_in_place();
+
+        // The player turns it off afterwards.
+        settings.config.roblox_settings.unlock_fps = false;
+        settings.sanitize_in_place();
+
+        assert!(
+            !settings.config.roblox_settings.unlock_fps,
+            "a migration that already ran must not override a later choice"
+        );
+    }
+
+    /// An install from before the graph defaulted off has it saved as on.
+    /// The next launch turns it off, once.
+    #[test]
+    fn the_live_graph_migration_turns_it_off_for_an_existing_install() {
+        let json =
+            r#"{"theme":"dark","config":{},"optimizations_active":false,"show_live_graph":true}"#;
+        let mut settings: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(
+            !settings.live_graph_off_migrated,
+            "a file written before the marker existed must read as unmigrated"
+        );
+
+        settings.sanitize_in_place();
+
+        assert!(!settings.show_live_graph);
+        assert!(settings.live_graph_off_migrated);
+    }
+
+    /// A fresh install starts with the graph off and nothing to migrate.
+    #[test]
+    fn the_live_graph_is_off_for_a_fresh_install() {
+        let mut settings = AppSettings::default();
+        assert!(!settings.show_live_graph);
+
+        settings.sanitize_in_place();
+
+        assert!(!settings.show_live_graph);
+    }
+
+    /// Once is once: turning the graph back on after the migration sticks.
+    #[test]
+    fn the_live_graph_migration_does_not_run_twice() {
+        let mut settings = AppSettings::default();
+        settings.sanitize_in_place();
+
+        // The player turns it back on.
+        settings.show_live_graph = true;
+        settings.sanitize_in_place();
+
+        assert!(
+            settings.show_live_graph,
+            "a migration that already ran must not override a later choice"
+        );
+    }
+
+    #[test]
+    fn test_settings_startup_reconnect_defaults() {
+        let json = r#"{"theme": "dark", "config": {}, "optimizations_active": false}"#;
+        let loaded: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(!loaded.run_on_startup);
+        assert!(!loaded.auto_reconnect);
+        assert!(!loaded.resume_vpn_on_startup);
+    }
+
+    #[test]
+    fn test_settings_whitelisted_regions_default() {
+        // Settings without whitelisted_regions should default to empty vec
+        let json = r#"{"theme": "dark", "config": {}, "optimizations_active": false}"#;
+        let loaded: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(loaded.whitelisted_regions.is_empty());
+    }
+
+    #[test]
+    fn test_settings_whitelisted_regions_roundtrip() {
+        let settings = AppSettings {
+            whitelisted_regions: vec!["Singapore".to_string(), "US East".to_string()],
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&settings).unwrap();
+        let loaded: AppSettings = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.whitelisted_regions.len(), 2);
+        assert!(
+            loaded
+                .whitelisted_regions
+                .contains(&"Singapore".to_string())
+        );
+        assert!(loaded.whitelisted_regions.contains(&"US East".to_string()));
+    }
+
+    #[test]
+    fn test_settings_api_tunneling_default() {
+        let json = r#"{"theme": "dark", "config": {}, "optimizations_active": false}"#;
+        let loaded: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(!loaded.enable_api_tunneling);
+        assert!(!loaded.enable_country_ban);
+    }
+
+    #[test]
+    fn test_settings_api_tunneling_roundtrip() {
+        let settings = AppSettings {
+            enable_api_tunneling: true,
+            enable_country_ban: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let loaded: AppSettings = serde_json::from_str(&json).unwrap();
+        assert!(loaded.enable_api_tunneling);
+        assert!(loaded.enable_country_ban);
+    }
+
+    #[test]
+    fn ignores_a_saved_partial_bypass_flag() {
+        // Partial Bypass was removed. Anyone upgrading still has
+        // `enable_partial_country_ban` in their settings.json, and the parse
+        // must survive it rather than throwing the whole file away.
+        let json = r#"{
+            "theme": "dark",
+            "config": {},
+            "optimizations_active": false,
+            "enable_country_ban": true,
+            "enable_partial_country_ban": true
+        }"#;
+
+        let loaded: AppSettings = serde_json::from_str(json).unwrap();
+
+        assert!(loaded.enable_country_ban, "the surviving mode is preserved");
+    }
+
+    #[test]
+    fn test_settings_backward_compat() {
+        // Test that settings without selected_region still deserialize
+        let old_json = r#"{
+            "theme": "dark",
+            "config": {},
+            "optimizations_active": false,
+            "window_state": {"width": 350.0, "height": 520.0, "maximized": false},
+            "selected_server": "mumbai-02",
+            "current_tab": "connect"
+        }"#;
+
+        let loaded: AppSettings = serde_json::from_str(old_json).unwrap();
+        assert_eq!(loaded.selected_region, "singapore"); // Default value
+        assert_eq!(loaded.selected_server, "mumbai-02");
+    }
+
+    #[test]
+    fn test_window_state_sanitize_in_place_clamps_invalid_values() {
+        let mut ws = WindowState {
+            x: Some(f32::NAN),
+            y: Some(f32::INFINITY),
+            width: 120.0,
+            height: -1.0,
+            maximized: false,
+        };
+
+        ws.sanitize_in_place();
+
+        assert_eq!(ws.x, None);
+        assert_eq!(ws.y, None);
+        assert_eq!(ws.width, MIN_WINDOW_WIDTH);
+        assert_eq!(ws.height, MIN_WINDOW_HEIGHT);
+    }
+
+    #[test]
+    fn test_app_settings_sanitize_in_place_updates_window_state() {
+        let mut settings = AppSettings::default();
+        settings.window_state.width = 1.0;
+        settings.window_state.height = 2.0;
+        settings.window_state.x = Some(f32::NAN);
+        settings.window_state.y = Some(f32::NAN);
+
+        settings.sanitize_in_place();
+
+        assert_eq!(settings.window_state.width, MIN_WINDOW_WIDTH);
+        assert_eq!(settings.window_state.height, MIN_WINDOW_HEIGHT);
+        assert_eq!(settings.window_state.x, None);
+        assert_eq!(settings.window_state.y, None);
+    }
+
+    #[test]
+    fn test_corrupt_settings_file_is_renamed_with_timestamp() {
+        let dir = std::env::temp_dir().join(format!(
+            "swifttunnel-settings-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        fs::write(&path, "{ this is not valid json").unwrap();
+
+        let backup = backup_corrupt_settings(&path).expect("backup should be created");
+
+        assert!(!path.exists(), "original file should be renamed");
+        assert!(backup.exists(), "backup file should exist");
+        let backup_name = backup.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            backup_name.starts_with("settings.json.corrupt-"),
+            "unexpected backup name: {}",
+            backup_name
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

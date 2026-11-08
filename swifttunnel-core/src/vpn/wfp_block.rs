@@ -1,0 +1,758 @@
+//! WFP (Windows Filtering Platform) temporary block filters
+//!
+//! This module provides instant packet blocking for newly detected game processes.
+//! When ETW detects a game process starting, we IMMEDIATELY add a WFP block filter
+//! for that process's full image path. This holds all packets from that process
+//! while we set up the split tunnel. Once ready, we remove the block filter and
+//! packets flow correctly through the VPN.
+//!
+//! This eliminates the race condition where packets could bypass the VPN before
+//! the UDP table reflects the socket binding (0.5-2ms gap).
+//!
+//! Mutations can wait on the Windows filtering service. Keep their locks and
+//! handles owned across that wait while letting a multithreaded runtime progress.
+
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::sync::Mutex;
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
+use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
+use windows::core::{GUID, PCWSTR, PWSTR};
+
+/// GUID for our sublayer (random, unique to SwiftTunnel)
+const SWIFTTUNNEL_SUBLAYER_GUID: GUID = GUID::from_u128(0x8a9b3c4d_5e6f_7a8b_9c0d_1e2f3a4b5c6d);
+const FWP_E_ALREADY_EXISTS_CODE: u32 = 0x8032_0009;
+const FWP_E_FILTER_NOT_FOUND_CODE: u32 = 0x8032_0003;
+const FWP_E_SUBLAYER_NOT_FOUND_CODE: u32 = 0x8032_0007;
+const FILTER_ENUM_BATCH_SIZE: u32 = 128;
+
+/// Global WFP engine handle and active filters
+static WFP_STATE: Mutex<Option<WfpBlockState>> = Mutex::new(None);
+
+struct WfpBlockState {
+    engine_handle: HANDLE,
+    /// Map of image path (lowercase) -> filter ID for active block filters
+    active_filters: HashMap<String, u64>,
+    /// Counter for generating unique filter GUIDs
+    filter_counter: u32,
+}
+
+// Safety: HANDLE is a raw pointer but WFP engine handles are thread-safe.
+// We protect access with a Mutex and only use the handle for WFP operations.
+unsafe impl Send for WfpBlockState {}
+
+unsafe fn open_wfp_engine(session: Option<*const FWPM_SESSION0>) -> Result<HANDLE, String> {
+    let mut engine_handle = HANDLE::default();
+    let result = unsafe {
+        FwpmEngineOpen0(
+            None,              // serverName (local)
+            RPC_C_AUTHN_WINNT, // authnService
+            None,              // authIdentity
+            session,
+            &mut engine_handle,
+        )
+    };
+
+    if result != 0 {
+        return Err(format!("FwpmEngineOpen0 failed: 0x{:08x}", result));
+    }
+
+    Ok(engine_handle)
+}
+
+fn free_wfp_memory<T>(ptr: *mut T) {
+    if ptr.is_null() {
+        return;
+    }
+
+    unsafe {
+        let mut raw = ptr as *mut c_void;
+        FwpmFreeMemory0(&mut raw);
+    }
+}
+
+fn collect_filters_in_swifttunnel_sublayer(engine_handle: HANDLE) -> Result<Vec<u64>, String> {
+    let mut enum_handle = HANDLE::default();
+    unsafe {
+        let result = FwpmFilterCreateEnumHandle0(engine_handle, None, &mut enum_handle);
+        if result != 0 {
+            return Err(format!(
+                "FwpmFilterCreateEnumHandle0 failed: 0x{:08x}",
+                result
+            ));
+        }
+    }
+
+    let mut filter_ids = Vec::new();
+    let mut enum_error: Option<String> = None;
+
+    loop {
+        let mut entries: *mut *mut FWPM_FILTER0 = std::ptr::null_mut();
+        let mut returned = 0u32;
+        let result = unsafe {
+            FwpmFilterEnum0(
+                engine_handle,
+                enum_handle,
+                FILTER_ENUM_BATCH_SIZE,
+                &mut entries,
+                &mut returned,
+            )
+        };
+
+        if result != 0 {
+            enum_error = Some(format!("FwpmFilterEnum0 failed: 0x{:08x}", result));
+            free_wfp_memory(entries);
+            break;
+        }
+
+        if returned == 0 {
+            free_wfp_memory(entries);
+            break;
+        }
+
+        unsafe {
+            for idx in 0..returned as usize {
+                let filter = *entries.add(idx);
+                if !filter.is_null() && (*filter).subLayerKey == SWIFTTUNNEL_SUBLAYER_GUID {
+                    filter_ids.push((*filter).filterId);
+                }
+            }
+        }
+
+        free_wfp_memory(entries);
+
+        if returned < FILTER_ENUM_BATCH_SIZE {
+            break;
+        }
+    }
+
+    unsafe {
+        let destroy_result = FwpmFilterDestroyEnumHandle0(engine_handle, enum_handle);
+        if destroy_result != 0 {
+            log::warn!(
+                "FwpmFilterDestroyEnumHandle0 failed during cleanup: 0x{:08x}",
+                destroy_result
+            );
+        }
+    }
+
+    if let Some(error) = enum_error {
+        Err(error)
+    } else {
+        Ok(filter_ids)
+    }
+}
+
+fn delete_filters_in_swifttunnel_sublayer(engine_handle: HANDLE) -> Result<usize, String> {
+    let filter_ids = collect_filters_in_swifttunnel_sublayer(engine_handle)?;
+    let mut deleted = 0usize;
+
+    for filter_id in filter_ids {
+        let result = unsafe { FwpmFilterDeleteById0(engine_handle, filter_id) };
+        if result == 0 {
+            deleted += 1;
+        } else if result != FWP_E_FILTER_NOT_FOUND_CODE {
+            log::warn!(
+                "Failed to delete stale SwiftTunnel WFP filter {}: 0x{:08x}",
+                filter_id,
+                result
+            );
+        }
+    }
+
+    Ok(deleted)
+}
+
+fn cleanup_stale_result() -> Result<usize, String> {
+    unsafe {
+        let engine_handle = open_wfp_engine(None)?;
+        let deleted = delete_filters_in_swifttunnel_sublayer(engine_handle);
+
+        if deleted.is_ok() {
+            let sublayer_result =
+                FwpmSubLayerDeleteByKey0(engine_handle, &SWIFTTUNNEL_SUBLAYER_GUID);
+            if sublayer_result != 0 && sublayer_result != FWP_E_SUBLAYER_NOT_FOUND_CODE {
+                log::warn!(
+                    "Failed to delete SwiftTunnel WFP sublayer during stale cleanup: 0x{:08x}",
+                    sublayer_result
+                );
+            }
+        }
+
+        let close_result = FwpmEngineClose0(engine_handle);
+        if close_result != 0 {
+            log::warn!(
+                "FwpmEngineClose0 failed during stale cleanup: 0x{:08x}",
+                close_result
+            );
+        }
+
+        deleted
+    }
+}
+
+/// Stateless cleanup for filters left by older non-dynamic WFP sessions.
+///
+/// New sessions are dynamic, so Windows removes their filters if the app is
+/// killed. This remains as migration/recovery for users who already have a
+/// stale "SwiftTunnel Process Block" filter from an older build.
+pub fn cleanup_stale() {
+    crate::utils::blocking_step(cleanup_stale_inner);
+}
+
+fn cleanup_stale_inner() {
+    match cleanup_stale_result() {
+        Ok(deleted) if deleted > 0 => {
+            log::info!("Removed {} stale SwiftTunnel WFP block filter(s)", deleted);
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("Failed to clean stale SwiftTunnel WFP filters: {}", e),
+    }
+}
+
+/// Initialize WFP engine for temporary block filters
+pub fn init() -> Result<(), String> {
+    crate::utils::blocking_step(init_inner)
+}
+
+fn init_inner() -> Result<(), String> {
+    {
+        let state = WFP_STATE
+            .lock()
+            .map_err(|e| format!("Lock failed: {}", e))?;
+
+        if state.is_some() {
+            return Ok(()); // Already initialized
+        }
+    }
+
+    cleanup_stale();
+
+    let mut state = WFP_STATE
+        .lock()
+        .map_err(|e| format!("Lock failed: {}", e))?;
+
+    if state.is_some() {
+        return Ok(());
+    }
+
+    unsafe {
+        // Dynamic sessions make WFP remove our temporary filters if the app is
+        // killed before `cleanup()` runs.
+        let session_name: Vec<u16> = "SwiftTunnel WFP Blocks\0".encode_utf16().collect();
+        let session_desc: Vec<u16> = "Temporary process holds for split tunnel setup\0"
+            .encode_utf16()
+            .collect();
+        let session = FWPM_SESSION0 {
+            displayData: FWPM_DISPLAY_DATA0 {
+                name: PWSTR::from_raw(session_name.as_ptr() as *mut u16),
+                description: PWSTR::from_raw(session_desc.as_ptr() as *mut u16),
+            },
+            flags: FWPM_SESSION_FLAG_DYNAMIC,
+            ..Default::default()
+        };
+        let engine_handle = open_wfp_engine(Some(&session as *const _))?;
+
+        // Create wide strings for display data. Keep these alive for the call.
+        let name: Vec<u16> = "SwiftTunnel Temporary Blocks\0".encode_utf16().collect();
+        let desc: Vec<u16> = "Holds game packets during split tunnel setup\0"
+            .encode_utf16()
+            .collect();
+
+        // Add our sublayer (if it doesn't exist)
+        let sublayer = FWPM_SUBLAYER0 {
+            subLayerKey: SWIFTTUNNEL_SUBLAYER_GUID,
+            displayData: FWPM_DISPLAY_DATA0 {
+                name: PWSTR::from_raw(name.as_ptr() as *mut u16),
+                description: PWSTR::from_raw(desc.as_ptr() as *mut u16),
+            },
+            weight: 0xFFFF, // High weight so our blocks take priority
+            ..Default::default()
+        };
+
+        let add_result = FwpmSubLayerAdd0(engine_handle, &sublayer, None);
+        // Ignore "already exists" error (0x80320009)
+        if add_result != 0 && add_result != FWP_E_ALREADY_EXISTS_CODE {
+            let _ = FwpmEngineClose0(engine_handle);
+            return Err(format!("FwpmSubLayerAdd0 failed: 0x{:08x}", add_result));
+        }
+
+        *state = Some(WfpBlockState {
+            engine_handle,
+            active_filters: HashMap::new(),
+            filter_counter: 0,
+        });
+
+        log::info!("WFP block filter engine initialized");
+        Ok(())
+    }
+}
+
+/// Build a mapping of volume device paths to drive letters using QueryDosDevice
+///
+/// Returns a HashMap like:
+///   r"\Device\HarddiskVolume3" -> 'C'
+///   r"\Device\HarddiskVolume4" -> 'D'
+fn build_drive_mapping() -> HashMap<String, char> {
+    use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
+
+    let mut mapping = HashMap::new();
+
+    // Check all possible drive letters A-Z
+    for drive_char in 'A'..='Z' {
+        // Create drive string like "C:"
+        let drive_name: Vec<u16> = format!("{}:", drive_char)
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // Buffer to receive device path
+        let mut buffer = [0u16; 512];
+
+        unsafe {
+            let len = QueryDosDeviceW(PCWSTR::from_raw(drive_name.as_ptr()), Some(&mut buffer));
+
+            if len > 0 {
+                // QueryDosDevice returns null-separated strings, take the first one
+                let device_path = String::from_utf16_lossy(&buffer[..len as usize])
+                    .split('\0')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+
+                if !device_path.is_empty() {
+                    mapping.insert(device_path, drive_char);
+                }
+            }
+        }
+    }
+
+    mapping
+}
+
+/// Convert NT path to DOS path for WFP
+/// NT paths look like: \Device\HarddiskVolume3\Users\...
+/// WFP needs DOS paths: C:\Users\...
+///
+/// Uses QueryDosDevice to properly map volume devices to drive letters,
+/// supporting drives other than C: (e.g., Roblox installed on D:)
+fn nt_to_dos_path(nt_path: &str) -> Option<String> {
+    if nt_path.starts_with(r"\Device\HarddiskVolume") || nt_path.starts_with(r"\Device\Mup") {
+        // Build the volume → drive letter mapping
+        let drive_map = build_drive_mapping();
+        device_path_to_dos(nt_path, &drive_map)
+    } else if nt_path.starts_with(r"\??\") {
+        // Already a DOS-style path with \??\ prefix
+        Some(nt_path.strip_prefix(r"\??\")?.to_string())
+    } else if nt_path.chars().nth(1) == Some(':') {
+        // Already a DOS path like C:\Users\...
+        Some(nt_path.to_string())
+    } else {
+        None
+    }
+}
+
+fn device_path_to_dos(nt_path: &str, drive_map: &HashMap<String, char>) -> Option<String> {
+    drive_map.iter().find_map(|(device_path, drive_letter)| {
+        // Volume1 must never match Volume10. Unmapped volumes remain unknown;
+        // the caller can continue with speculative tunneling instead.
+        let rest = nt_path.strip_prefix(device_path)?;
+        rest.starts_with('\\')
+            .then(|| format!("{drive_letter}:{rest}"))
+    })
+}
+
+/// Add a temporary block filter for a process by its full image path
+/// This immediately blocks ALL outbound connections from this process
+///
+/// The image_path should be the full NT path from ETW, e.g.:
+/// \Device\HarddiskVolume3\Users\test\AppData\Local\Roblox\...\RobloxPlayerBeta.exe
+pub fn block_process_by_path(image_path: &str) -> Result<(), String> {
+    crate::utils::blocking_step(|| block_process_by_path_inner(image_path))
+}
+
+fn block_process_by_path_inner(image_path: &str) -> Result<(), String> {
+    if image_path.is_empty() {
+        return Err("Empty image path".to_string());
+    }
+
+    let mut state_guard = WFP_STATE
+        .lock()
+        .map_err(|e| format!("Lock failed: {}", e))?;
+    let state = state_guard.as_mut().ok_or("WFP not initialized")?;
+
+    let key = image_path.to_lowercase();
+
+    // Check if already blocked
+    if state.active_filters.contains_key(&key) {
+        log::debug!("Path {} already blocked", image_path);
+        return Ok(());
+    }
+
+    // Convert NT path to DOS path for WFP
+    let dos_path = nt_to_dos_path(image_path)
+        .ok_or_else(|| format!("Could not convert NT path to DOS path: {}", image_path))?;
+
+    log::info!("WFP blocking process: {} (DOS: {})", image_path, dos_path);
+
+    unsafe {
+        // Get the WFP app ID blob for this path
+        let dos_path_wide: Vec<u16> = dos_path.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut app_id: *mut FWP_BYTE_BLOB = std::ptr::null_mut();
+
+        let result =
+            FwpmGetAppIdFromFileName0(PCWSTR::from_raw(dos_path_wide.as_ptr()), &mut app_id);
+
+        if result != 0 {
+            return Err(format!(
+                "FwpmGetAppIdFromFileName0 failed for '{}': 0x{:08x}",
+                dos_path, result
+            ));
+        }
+
+        if app_id.is_null() {
+            return Err("FwpmGetAppIdFromFileName0 returned null app_id".to_string());
+        }
+
+        // Create the filter condition matching this app
+        let condition = FWPM_FILTER_CONDITION0 {
+            fieldKey: FWPM_CONDITION_ALE_APP_ID,
+            matchType: FWP_MATCH_EQUAL,
+            conditionValue: FWP_CONDITION_VALUE0 {
+                r#type: FWP_BYTE_BLOB_TYPE,
+                Anonymous: FWP_CONDITION_VALUE0_0 { byteBlob: app_id },
+            },
+        };
+
+        // Generate unique filter GUID
+        state.filter_counter += 1;
+        let filter_guid = GUID::from_u128(
+            0x1234_5678_9abc_def0_1234_5678_0000_0000u128 | (state.filter_counter as u128),
+        );
+
+        // Create wide strings for display data
+        let filter_name: Vec<u16> = "SwiftTunnel Process Block\0".encode_utf16().collect();
+        let filter_desc: Vec<u16> = "Temporary block during split tunnel setup\0"
+            .encode_utf16()
+            .collect();
+
+        // Create the block filter at ALE_AUTH_CONNECT layer
+        // This blocks ALL new outbound connections from this process
+        let filter = FWPM_FILTER0 {
+            filterKey: filter_guid,
+            displayData: FWPM_DISPLAY_DATA0 {
+                name: PWSTR::from_raw(filter_name.as_ptr() as *mut u16),
+                description: PWSTR::from_raw(filter_desc.as_ptr() as *mut u16),
+            },
+            layerKey: FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+            subLayerKey: SWIFTTUNNEL_SUBLAYER_GUID,
+            weight: FWP_VALUE0 {
+                r#type: FWP_UINT8,
+                Anonymous: FWP_VALUE0_0 { uint8: 15 }, // High weight
+            },
+            action: FWPM_ACTION0 {
+                r#type: FWP_ACTION_BLOCK,
+                Anonymous: FWPM_ACTION0_0 {
+                    filterType: GUID::zeroed(),
+                },
+            },
+            numFilterConditions: 1,
+            filterCondition: &condition as *const _ as *mut _,
+            ..Default::default()
+        };
+
+        let mut filter_id: u64 = 0;
+        let add_result = FwpmFilterAdd0(state.engine_handle, &filter, None, Some(&mut filter_id));
+
+        // Free the app ID blob
+        free_wfp_memory(app_id);
+
+        if add_result != 0 {
+            return Err(format!("FwpmFilterAdd0 failed: 0x{:08x}", add_result));
+        }
+
+        state.active_filters.insert(key, filter_id);
+        log::info!(
+            "WFP block filter added for {} (filter_id={})",
+            image_path,
+            filter_id
+        );
+
+        Ok(())
+    }
+}
+
+/// Remove the block filter for a process
+pub fn unblock_process_by_path(image_path: &str) -> Result<(), String> {
+    crate::utils::blocking_step(|| unblock_process_by_path_inner(image_path))
+}
+
+fn unblock_process_by_path_inner(image_path: &str) -> Result<(), String> {
+    let mut state_guard = WFP_STATE
+        .lock()
+        .map_err(|e| format!("Lock failed: {}", e))?;
+    let state = state_guard.as_mut().ok_or("WFP not initialized")?;
+    remove_owned_filter(&mut state.active_filters, image_path, |filter_id| unsafe {
+        FwpmFilterDeleteById0(state.engine_handle, filter_id)
+    })
+}
+
+fn remove_owned_filter(
+    filters: &mut HashMap<String, u64>,
+    image_path: &str,
+    mut delete: impl FnMut(u64) -> u32,
+) -> Result<(), String> {
+    let key = image_path.to_lowercase();
+
+    if let Some(filter_id) = filters.get(&key).copied() {
+        let result = delete(filter_id);
+        if result == 0 || result == FWP_E_FILTER_NOT_FOUND_CODE {
+            filters.remove(&key);
+            log::info!(
+                "WFP block filter removed for {} (filter_id={})",
+                image_path,
+                filter_id
+            );
+        } else {
+            return Err(format!(
+                "Failed to remove block filter for '{image_path}': 0x{result:08x}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Release the current process batch. If an individual removal fails, retire
+/// our dynamic session instead of leaving an untracked hold on the game.
+/// Later events can use the driver's existing speculative tunneling fallback.
+pub fn release_process_holds(paths: &[String]) -> Result<(), String> {
+    crate::utils::blocking_step(|| {
+        release_holds_with(paths, unblock_process_by_path_inner, cleanup_inner)
+    })
+}
+
+fn release_holds_with(
+    paths: &[String],
+    mut release: impl FnMut(&str) -> Result<(), String>,
+    cleanup: impl FnOnce(),
+) -> Result<(), String> {
+    for path in paths {
+        if let Err(error) = release(path) {
+            cleanup();
+            return Err(format!(
+                "{error}; requested cleanup of temporary process holds"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Cleanup all WFP state
+pub fn cleanup() {
+    crate::utils::blocking_step(cleanup_inner);
+}
+
+fn cleanup_inner() {
+    if let Ok(mut state_guard) = WFP_STATE.lock() {
+        cleanup_state_with(
+            &mut state_guard,
+            |handle, id| unsafe { FwpmFilterDeleteById0(handle, id) },
+            |handle| unsafe { FwpmSubLayerDeleteByKey0(handle, &SWIFTTUNNEL_SUBLAYER_GUID) },
+            |handle| unsafe { FwpmEngineClose0(handle) },
+        );
+    }
+}
+
+fn cleanup_state_with(
+    state_slot: &mut Option<WfpBlockState>,
+    mut delete: impl FnMut(HANDLE, u64) -> u32,
+    delete_sublayer: impl FnOnce(HANDLE) -> u32,
+    close: impl FnOnce(HANDLE) -> u32,
+) {
+    if let Some(state) = state_slot.as_mut() {
+        // Remove all active filters
+        let handle = state.engine_handle;
+        state.active_filters.retain(|path, filter_id| {
+            let result = delete(handle, *filter_id);
+            if result == 0 || result == FWP_E_FILTER_NOT_FOUND_CODE {
+                log::debug!("Cleanup: removed block filter for '{}'", path);
+                false
+            } else {
+                log::warn!(
+                    "Cleanup: failed to remove block filter for '{}': 0x{:08x}",
+                    path,
+                    result
+                );
+                true
+            }
+        });
+
+        // Remove our sublayer
+        let sublayer_result = delete_sublayer(state.engine_handle);
+        if sublayer_result != 0 && sublayer_result != FWP_E_SUBLAYER_NOT_FOUND_CODE {
+            log::warn!(
+                "Cleanup: failed to remove WFP sublayer: 0x{:08x}",
+                sublayer_result
+            );
+        }
+
+        // Close engine
+        let result = close(handle);
+        if result == 0 {
+            // The dynamic session also removes any remaining owned filters.
+            *state_slot = None;
+            log::info!("WFP block filter engine closed");
+        } else {
+            log::warn!("WFP engine close failed: 0x{result:08x}; keeping it for cleanup retry");
+        }
+    }
+}
+
+/// Check if WFP blocking is initialized
+pub fn is_initialized() -> bool {
+    WFP_STATE.lock().map(|s| s.is_some()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_release_uses_session_cleanup_only_after_a_failed_removal() {
+        let paths = vec!["first".into(), "second".into(), "third".into()];
+        let mut released = Vec::new();
+        let mut cleaned = 0;
+        assert!(
+            release_holds_with(
+                &paths,
+                |path| {
+                    released.push(path.to_owned());
+                    Ok(())
+                },
+                || cleaned += 1
+            )
+            .is_ok()
+        );
+        assert_eq!(released, paths);
+        assert_eq!(cleaned, 0);
+        released.clear();
+        assert!(
+            release_holds_with(
+                &paths,
+                |path| {
+                    released.push(path.to_owned());
+                    if path == "second" {
+                        Err("injected removal failure".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                || cleaned += 1
+            )
+            .is_err()
+        );
+        assert_eq!(released, ["first", "second"]);
+        assert_eq!(cleaned, 1);
+    }
+
+    #[test]
+    fn failed_filter_deletion_keeps_ownership_and_reports_failure_for_retry() {
+        let mut filters = HashMap::from([("player.exe".into(), 123), ("other.exe".into(), 456)]);
+        let before = filters.clone();
+        assert!(
+            remove_owned_filter(&mut filters, "PLAYER.exe", |id| {
+                assert_eq!(id, 123);
+                5
+            })
+            .is_err()
+        );
+        assert_eq!(filters, before);
+        assert!(remove_owned_filter(&mut filters, "PLAYER.exe", |_| 0).is_ok());
+        assert_eq!(filters, HashMap::from([("other.exe".into(), 456)]));
+        assert!(
+            remove_owned_filter(&mut filters, "other.exe", |_| FWP_E_FILTER_NOT_FOUND_CODE).is_ok()
+        );
+        assert!(filters.is_empty());
+        assert!(remove_owned_filter(&mut filters, "missing.exe", |_| panic!("not owned")).is_ok());
+    }
+
+    #[test]
+    fn failed_engine_close_preserves_remaining_owned_filters_for_later_cleanup() {
+        let mut state = Some(WfpBlockState {
+            engine_handle: HANDLE::default(),
+            active_filters: HashMap::from([("player.exe".into(), 123), ("other.exe".into(), 456)]),
+            filter_counter: 2,
+        });
+        cleanup_state_with(
+            &mut state,
+            |_, id| if id == 123 { 5 } else { 0 },
+            |_| 5,
+            |_| 5,
+        );
+        assert!(state.is_some(), "a failed close must retain its handle");
+        assert_eq!(
+            state.as_ref().unwrap().active_filters,
+            HashMap::from([("player.exe".into(), 123)])
+        );
+        let mut removed = Vec::new();
+        cleanup_state_with(
+            &mut state,
+            |_, id| {
+                removed.push(id);
+                0
+            },
+            |_| 0,
+            |_| 0,
+        );
+        assert_eq!(removed, [123]);
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn successful_dynamic_session_close_completes_cleanup_even_if_individual_delete_failed() {
+        let mut state = Some(WfpBlockState {
+            engine_handle: HANDLE::default(),
+            active_filters: HashMap::from([("player.exe".into(), 123)]),
+            filter_counter: 1,
+        });
+        cleanup_state_with(&mut state, |_, _| 5, |_| 5, |_| 0);
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn drive_mapping_requires_the_complete_device_name() {
+        let volume_one = HashMap::from([(r"\Device\HarddiskVolume1".into(), 'C')]);
+        assert_eq!(
+            device_path_to_dos(
+                r"\Device\HarddiskVolume10\Games\RobloxPlayerBeta.exe",
+                &volume_one
+            ),
+            None
+        );
+        let volume_ten = HashMap::from([(r"\Device\HarddiskVolume10".into(), 'E')]);
+        assert_eq!(
+            device_path_to_dos(
+                r"\Device\HarddiskVolume1\Games\RobloxPlayerBeta.exe",
+                &volume_ten
+            ),
+            None
+        );
+        let both = HashMap::from([
+            (r"\Device\HarddiskVolume1".into(), 'C'),
+            (r"\Device\HarddiskVolume10".into(), 'E'),
+        ]);
+        assert_eq!(
+            device_path_to_dos(
+                r"\Device\HarddiskVolume10\Games\RobloxPlayerBeta.exe",
+                &both
+            ),
+            Some(r"E:\Games\RobloxPlayerBeta.exe".into())
+        );
+        assert_eq!(
+            device_path_to_dos(r"\Device\HarddiskVolume1\Games\RobloxPlayerBeta.exe", &both),
+            Some(r"C:\Games\RobloxPlayerBeta.exe".into())
+        );
+    }
+}

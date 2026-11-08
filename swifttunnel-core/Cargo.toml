@@ -1,0 +1,147 @@
+[package]
+name = "swifttunnel-core"
+version = "1.0.40"
+edition = "2024"
+authors = ["SwiftTunnel <support@swifttunnel.net>"]
+description = "SwiftTunnel core library - VPN, auth, optimization, and networking modules"
+
+[dependencies]
+swifttunnel-installer-cache = { path = "../swifttunnel-installer-cache" }
+swifttunnel-msi-repair = { path = "../swifttunnel-msi-repair" }
+# Windows API - version 0.62 to match ndisapi dependency
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    # Ordinal Windows path comparison, including non-ASCII user folders.
+    "Win32_Globalization",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_ApplicationInstallationAndServicing",
+    "Win32_System_SystemInformation",
+    "Win32_System_Performance",
+    "Win32_Security",
+    "Win32_System_Memory",
+    # VPN/Network features
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    # Windows Filtering Platform (WFP) for split tunneling
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    # Split tunnel driver communication
+    "Win32_Storage_FileSystem",
+    "Win32_System_Ioctl",
+    # COM/RPC for WFP
+    "Win32_System_Rpc",
+    # Timer APIs for 1ms resolution (PC Boosts)
+    "Win32_Media",
+    # Service Control Manager for BFE auto-start
+    "Win32_System_Services",
+    # GetSystemMetrics for RDP session detection
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+    # GetAsyncKeyState (left-button state) for the in-game overlay drag
+    "Win32_UI_Input_KeyboardAndMouse",
+    # ShellExecuteW for UAC elevation (auto-elevate on connect)
+    "Win32_UI_Shell",
+    "Win32_System_Com",
+    # ETW (Event Tracing for Windows) for instant process detection
+    "Win32_System_Diagnostics_Etw",
+    # Required for ETW trace APIs (OpenTraceW, EVENT_TRACE_LOGFILEW)
+    "Win32_System_Time",
+] }
+
+# System utilities
+sysinfo = { version = "0.32", default-features = false, features = ["system", "windows"] }
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync", "fs", "io-util", "macros"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Home directory detection
+dirs = "5.0"
+
+# HTTP client for API calls
+# rustls-tls-native-roots trusts the Windows system certificate store (not just
+# bundled webpki roots) so HTTPS still validates when antivirus/proxy TLS
+# inspection presents a locally-trusted CA — the browser works via the system
+# store, so the app must too, or login fails with "error sending request".
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls", "rustls-tls-native-roots", "stream", "system-proxy"] }
+
+# Windows Packet Filter (ndisapi) for packet-level split tunneling
+ndisapi = "0.6"
+
+# Additional async utilities for VPN packet handling
+futures-util = "0.3"
+
+# Semantic versioning comparison for updates
+semver = "1.0"
+
+# Regular expressions for error message simplification
+regex-lite = "0.1"
+
+# Secure credential storage (DPAPI on Windows)
+keyring = "3"
+
+# Cryptography for PKCE and auth session sealing
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+# AES-256-GCM for auth session at-rest encryption. ring is already in the
+# dependency graph transitively via rustls, so this is free binary-size-wise.
+# Direct use avoids importing Win32 CryptProtectData/CryptUnprotectData, which
+# Defender ML heuristics score very heavily against unsigned binaries.
+ring = "0.17"
+
+# URL handling
+url = "2"
+
+# Date/time handling
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+
+# Bounded loopback OAuth parsing, already used by reqwest.
+httparse = "1.10"
+
+# Fast mutex
+parking_lot = "0.12"
+
+# Per-CPU parallel packet processing
+crossbeam-channel = "0.5"
+
+# Lock-free Arc swapping for BSOD-safe RCU pattern
+arc-swap = "1.7"
+
+num_cpus = "1.16"
+
+# Stack-allocated buffers for zero-alloc packet processing
+arrayvec = "0.7"
+
+# Faster hashing for internal (non-DoS-sensitive) HashMaps on packet hot paths
+ahash = "0.8"
+
+# Discord Rich Presence for activity status
+discord-rich-presence = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+# Maintained fork of winrt-notification; the original 0.5 pulls in windows 0.24,
+# which ships no aarch64 import libraries and fails ARM64 linking (LNK1181).
+tauri-winrt-notification = "0.7"
+
+[dev-dependencies]
+# Owned loopback HTTP fixtures only.
+tiny_http = "0.12"

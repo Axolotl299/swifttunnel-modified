@@ -1,0 +1,328 @@
+import { type FormEvent, useState } from "react";
+import * as motion from "framer-motion/m";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { useAuthStore } from "../../stores/authStore";
+import { openSystemLink as systemOpenUrl } from "../../lib/openSystemLink";
+import { Button, Spinner, Icon, type IconName } from "../ui";
+import { SwiftLogo } from "../common/SwiftLogo";
+import { OAUTH_TIMEOUT_MS, useOAuthPolling } from "../../lib/useOAuthPolling";
+
+declare const __APP_VERSION__: string;
+
+const SIGNUP_URL = "https://www.swifttunnel.net/signup";
+
+const FEATURES: { icon: IconName; title: string; desc: string }[] = [
+  {
+    icon: "shield",
+    title: "Split tunneling",
+    desc: "Only game traffic routes through the relay",
+  },
+  {
+    icon: "optimize",
+    title: "Boost suite",
+    desc: "FPS unlock, RAM cleaner, latency tweaks",
+  },
+  {
+    icon: "globe",
+    title: "Global relay",
+    // Hardcoded because the fleet list is only fetched after sign-in. Update
+    // alongside PING_ENABLED_REGIONS in the web repo when the fleet changes
+    // this said "28 servers across 12 regions" for a while after the fleet was
+    // rebuilt down to 10.
+    desc: "10 relays across 5 regions",
+  },
+];
+
+export function LoginScreen() {
+  const { state, error, login, startOAuth, pollOAuth, cancelOAuth } =
+    useAuthStore();
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const isAwaiting = state === "awaiting_oauth";
+  const isLoggingIn = state === "logging_in";
+  const elapsedSecs = useOAuthPolling(isAwaiting, pollOAuth, cancelOAuth);
+  const remaining = Math.max(
+    0,
+    Math.ceil(OAUTH_TIMEOUT_MS / 1000 - elapsedSecs),
+  );
+
+  const handleLogin = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    void login(email, password);
+  };
+
+  const openSignup = () => {
+    void systemOpenUrl(SIGNUP_URL);
+  };
+
+  return (
+    <div
+      data-tauri-drag-region
+      className="relative flex h-screen w-screen items-center justify-center overflow-hidden"
+      style={{ backgroundColor: "var(--color-bg-base)" }}
+    >
+      {/* Grid atmosphere, two pitches read as depth where one reads as
+          wallpaper. Masked to fade out at the edges so the sign-in card stays
+          the focal point. */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-0 opacity-90"
+        style={{
+          backgroundImage:
+            "linear-gradient(to right, rgba(255,255,255,0.055) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.055) 1px, transparent 1px)",
+          backgroundSize: "48px 48px",
+          maskImage:
+            "radial-gradient(ellipse 85% 75% at 50% 45%, black 40%, transparent)",
+          WebkitMaskImage:
+            "radial-gradient(ellipse 85% 75% at 50% 45%, black 40%, transparent)",
+        }}
+      />
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-0 opacity-70"
+        style={{
+          backgroundImage:
+            "linear-gradient(to right, rgba(255,255,255,0.05) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.05) 1px, transparent 1px)",
+          backgroundSize: "192px 192px",
+          maskImage:
+            "radial-gradient(ellipse 80% 70% at 50% 45%, black 35%, transparent)",
+          WebkitMaskImage:
+            "radial-gradient(ellipse 80% 70% at 50% 45%, black 35%, transparent)",
+        }}
+      />
+      {/* Glow behind the logo, and a floor shadow so the card is grounded. */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-0"
+        style={{
+          background:
+            "radial-gradient(ellipse 50% 40% at 50% 30%, rgba(255,255,255,0.06), transparent 70%)",
+        }}
+      />
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-x-0 bottom-0 h-1/3"
+        style={{
+          background: "linear-gradient(to top, rgba(0,0,0,0.5), transparent)",
+        }}
+      />
+
+      {/* Window controls. The sign-in screen previously had none at all, so the
+          only way to close the app before signing in was Alt+F4. Kept outside
+          the drag region's mousedown so clicks aren't swallowed by dragging. */}
+      <div
+        className="absolute right-0 top-0 z-20 flex items-center"
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <button
+          type="button"
+          aria-label="Minimize"
+          onClick={() => void getCurrentWindow().minimize()}
+          className="flex h-9 w-11 items-center justify-center text-text-muted transition-colors hover:bg-white/5 hover:text-text-primary"
+        >
+          <svg width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true">
+            <path d="M1 5.5h9" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          aria-label="Close"
+          onClick={() => void getCurrentWindow().close()}
+          className="flex h-9 w-11 items-center justify-center text-text-muted transition-colors hover:bg-[#e81123] hover:text-white"
+        >
+          <svg width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true">
+            <path d="M1.5 1.5l8 8M9.5 1.5l-8 8" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+          </svg>
+        </button>
+      </div>
+
+      <div className="relative z-10 flex w-full max-w-[360px] flex-col gap-6 px-8">
+        {/* Brand */}
+        <motion.div
+          initial={{ opacity: 0, y: 6 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.3 }}
+          className="flex flex-col items-center gap-3"
+        >
+          <SwiftLogo size={120} />
+          <div className="text-center">
+            <div className="mb-2 flex items-center justify-center gap-2">
+              <span
+                className="h-1 w-1 rounded-full"
+                style={{ backgroundColor: "var(--color-status-connected)" }}
+              />
+              <span className="font-mono text-[9.5px] font-semibold uppercase tracking-[0.18em] text-text-muted">
+                Gaming · Relay · 10 Servers
+              </span>
+            </div>
+            <h1 className="text-[22px] font-semibold tracking-[-0.02em] text-text-primary">
+              SwiftTunnel
+            </h1>
+            <p className="mt-1 text-[12px] text-text-muted">
+              Sign in to deploy the tunnel
+            </p>
+          </div>
+        </motion.div>
+
+        {/* Login card */}
+        <motion.div
+          initial={{ opacity: 0, y: 6 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.3, delay: 0.05 }}
+          className="rounded-[var(--radius-card)] p-5"
+          style={{
+            backgroundColor: "var(--color-bg-card)",
+            border: "1px solid var(--color-border-subtle)",
+          }}
+        >
+          {isAwaiting ? (
+            <div className="flex flex-col items-center gap-3 py-2">
+              <Spinner size={18} color="var(--color-accent-primary)" />
+              <p className="text-[13px] font-medium text-text-primary">
+                Waiting for browser login
+              </p>
+              <p className="text-center text-[11px] text-text-muted">
+                Complete sign-in in your browser to continue
+              </p>
+              <p className="font-mono text-[10.5px] text-text-dimmed">
+                Times out in {remaining}s
+              </p>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => void cancelOAuth()}
+              >
+                Cancel
+              </Button>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-3">
+              <form className="flex flex-col gap-2.5" onSubmit={handleLogin}>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  placeholder="Email"
+                  autoComplete="email"
+                  disabled={isLoggingIn}
+                  className="h-[38px] rounded-[var(--radius-button)] px-3 text-[12px] outline-none transition-colors disabled:opacity-60"
+                  style={{
+                    backgroundColor: "var(--color-bg-elevated)",
+                    border: "1px solid var(--color-border-default)",
+                    color: "var(--color-text-primary)",
+                  }}
+                />
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  placeholder="Password"
+                  autoComplete="current-password"
+                  disabled={isLoggingIn}
+                  className="h-[38px] rounded-[var(--radius-button)] px-3 text-[12px] outline-none transition-colors disabled:opacity-60"
+                  style={{
+                    backgroundColor: "var(--color-bg-elevated)",
+                    border: "1px solid var(--color-border-default)",
+                    color: "var(--color-text-primary)",
+                  }}
+                />
+                <Button
+                  type="submit"
+                  variant="primary"
+                  size="lg"
+                  fullWidth
+                  loading={isLoggingIn}
+                  disabled={!email.trim() || !password}
+                >
+                  Sign in
+                </Button>
+              </form>
+
+              <div className="flex items-center gap-2">
+                <div
+                  className="h-px flex-1"
+                  style={{ backgroundColor: "var(--color-border-subtle)" }}
+                />
+                <span className="text-[10px] uppercase tracking-[0.16em] text-text-dimmed">
+                  or
+                </span>
+                <div
+                  className="h-px flex-1"
+                  style={{ backgroundColor: "var(--color-border-subtle)" }}
+                />
+              </div>
+
+              <Button
+                variant="secondary"
+                size="md"
+                fullWidth
+                onClick={startOAuth}
+                disabled={isLoggingIn}
+                leadingIcon={
+                  <Icon name="login" size={14} strokeWidth={2} />
+                }
+              >
+                Sign in in browser
+              </Button>
+
+              <button
+                type="button"
+                onClick={openSignup}
+                disabled={isLoggingIn}
+                className="self-center text-[11px] text-text-muted transition-colors hover:text-text-primary disabled:opacity-60"
+              >
+                Create account
+              </button>
+            </div>
+          )}
+
+          {error && (
+            <p className="mt-3 text-center text-[11px] text-status-error">
+              {error}
+            </p>
+          )}
+        </motion.div>
+
+        {/* Feature list */}
+        <div className="flex flex-col gap-1.5">
+          {FEATURES.map((feature, i) => (
+            <motion.div
+              key={feature.title}
+              initial={{ opacity: 0, y: 4 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.15 + i * 0.06, duration: 0.3 }}
+              className="flex items-center gap-3 rounded-[5px] px-3 py-2"
+            >
+              <div
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[5px]"
+                style={{
+                  backgroundColor: "var(--color-accent-primary-soft-10)",
+                  border: "1px solid var(--color-border-subtle)",
+                }}
+              >
+                <Icon
+                  name={feature.icon}
+                  size={14}
+                  strokeWidth={2}
+                  style={{ color: "var(--color-accent-secondary)" }}
+                />
+              </div>
+              <div>
+                <div className="text-[12px] font-medium text-text-primary">
+                  {feature.title}
+                </div>
+                <div className="text-[10.5px] text-text-muted">
+                  {feature.desc}
+                </div>
+              </div>
+            </motion.div>
+          ))}
+        </div>
+
+        <p className="text-center font-mono text-[10px] text-text-dimmed">
+          v{__APP_VERSION__}
+        </p>
+      </div>
+    </div>
+  );
+}

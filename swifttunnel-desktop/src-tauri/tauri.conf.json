@@ -1,0 +1,81 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
+  "productName": "SwiftTunnel",
+  "version": "3.9.7",
+  "identifier": "net.swifttunnel.desktop",
+  "build": {
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build && npm run bundle:lite",
+    "removeUnusedCommands": false
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "SwiftTunnel",
+        "width": 1020,
+        "height": 660,
+        "minWidth": 900,
+        "minHeight": 600,
+        "maxWidth": 1360,
+        "maxHeight": 860,
+        "maximizable": true,
+        "decorations": false,
+        "center": true,
+        "resizable": true,
+        "fullscreen": false,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: https://asset.localhost https://*.swifttunnel.net https://*.roblox.com https://*.rbxcdn.com; connect-src 'self' https://*.swifttunnel.net https://*.supabase.co"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "useLocalToolsDir": true,
+    "publisher": "SwiftTunnel",
+    "copyright": "Copyright SwiftTunnel. All rights reserved.",
+    "targets": [
+      "msi"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      },
+      "wix": {
+        "template": "wix/main.wxs",
+        "upgradeCode": "e8a8d9ae-1ddb-53d0-bcf4-8268bddc947d",
+        "fragmentPaths": [
+          "wix/nsis-migration.wxs",
+          "wix/lite.wxs",
+          "../../installer/SwiftSetupUI.wxs"
+        ],
+        "componentGroupRefs": [
+          "NsisMigration",
+          "SwiftTunnelLite"
+        ]
+      }
+    },
+    "resources": [
+      "resources/drivers",
+      "resources/lite",
+      "resources/swifty.png"
+    ],
+    "icon": [
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY",
+      "endpoints": [
+        "https://github.com/Swift-tunnel/swifttunnel-app/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

@@ -1,0 +1,5387 @@
+use crate::structs::*;
+use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+#[cfg(all(test, windows))]
+use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
+#[cfg(windows)]
+use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, SetFileAttributesW};
+
+/// Current Roblox settings read from the XML file
+#[derive(Debug, Clone)]
+pub struct CurrentRobloxSettings {
+    pub fps_cap: u32,
+    /// Saved menu preference (0 for Automatic, 1-10), not the engine's 0-21 scale.
+    pub graphics_quality: i32,
+    pub fullscreen: bool,
+    pub window_size: Option<(u32, u32)>,
+}
+
+pub struct RobloxOptimizer {
+    settings_path: PathBuf,
+    backup_path: PathBuf,
+}
+
+/// What a full client reset actually did, for the line shown afterwards.
+///
+/// A reset that says nothing is indistinguishable from one that silently found
+/// nothing, and the second is common: someone runs it twice, or runs it on a
+/// machine whose flags were already gone. Counting the files and naming the
+/// launchers turns "done" into something the player can check against what they
+/// installed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RobloxResetReport {
+    /// Roblox was alive when the reset started and was ended.
+    ///
+    /// Worth reporting rather than doing silently: the player may not have
+    /// realised it was still running, which on Windows is the normal case
+    /// because Roblox outlives its own window.
+    pub roblox_was_running: bool,
+    /// `ClientAppSettings.json` files deleted, across every location.
+    pub flag_files_removed: usize,
+    /// Which launchers those came from, e.g. `Roblox`, `Bloxstrap`.
+    pub sources: Vec<String>,
+    /// Whether GlobalBasicSettings was put back (graphics level, frame cap).
+    pub settings_restored: bool,
+    /// Paths that could not be cleared, usually locked by a running client.
+    pub failures: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LauncherFlagImport {
+    pub source: String,
+    pub json: String,
+    pub accepted: usize,
+    pub skipped: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RobloxImportPreview {
+    pub sources: Vec<LauncherFlagImport>,
+    pub fps_cap: Option<u32>,
+    pub graphics_quality: Option<GraphicsQuality>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FFlagApplyOutcome {
+    Applied,
+    SkippedMissingRobloxVersion,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct GpuPreferenceSnapshot {
+    #[serde(default)]
+    values: HashMap<String, Option<String>>,
+    #[serde(default)]
+    applied: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GpuPreferenceRestoreAction {
+    Restore(String),
+    Delete,
+    LeaveUntouched,
+}
+
+const GPU_PREFERENCE_SNAPSHOT_FILE: &str = "gpu_preference_snapshots.json";
+
+fn gpu_preference_snapshot_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| p.join("SwiftTunnel").join(GPU_PREFERENCE_SNAPSHOT_FILE))
+}
+
+impl RobloxOptimizer {
+    const MIN_WINDOW_WIDTH: u32 = 800;
+    const MAX_WINDOW_WIDTH: u32 = 3840;
+    const MIN_WINDOW_HEIGHT: u32 = 600;
+    const MAX_WINDOW_HEIGHT: u32 = 2160;
+
+    pub fn new() -> Self {
+        // Find the GlobalBasicSettings XML file
+        let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let roblox_dir = PathBuf::from(&local_app_data).join("Roblox");
+
+        // Find the GlobalBasicSettings file (could be numbered)
+        let settings_path = Self::find_settings_file(&roblox_dir);
+
+        Self {
+            settings_path,
+            backup_path: dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("SwiftTunnel")
+                .join("roblox_settings_backup.xml"),
+        }
+    }
+
+    pub fn game_preferences_path(
+        client: crate::roblox_library::RobloxClient,
+    ) -> std::result::Result<PathBuf, String> {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .ok_or("Windows could not find your app-data folder.")?;
+        let root = base.join(if client == crate::roblox_library::RobloxClient::Vng {
+            "RobloxPCVNG"
+        } else {
+            "Roblox"
+        });
+        Ok(Self::find_settings_file(&root))
+    }
+
+    pub fn existing_client_flag_files() -> Result<Vec<PathBuf>> {
+        Ok(Self::get_client_settings_paths(false)?
+            .into_iter()
+            .map(|p| p.join("ClientAppSettings.json"))
+            .filter(|p| p.is_file())
+            .collect())
+    }
+
+    /// Find the GlobalBasicSettings XML file
+    fn find_settings_file(roblox_dir: &Path) -> PathBuf {
+        // Prefer any discovered GlobalBasicSettings_*.xml file and pick the highest index.
+        let mut latest_indexed: Option<(u32, PathBuf)> = None;
+        if let Ok(entries) = fs::read_dir(roblox_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+
+                let Some(index) = Self::parse_settings_file_index(file_name) else {
+                    continue;
+                };
+                // Most root entries are logs, caches or version directories.
+                // Only candidate settings names need a filesystem metadata call.
+                if !path.is_file() {
+                    continue;
+                }
+
+                if latest_indexed
+                    .as_ref()
+                    .map(|(best, _)| index > *best)
+                    .unwrap_or(true)
+                {
+                    latest_indexed = Some((index, path));
+                }
+            }
+        }
+
+        if let Some((_, path)) = latest_indexed {
+            info!("Found Roblox settings at: {:?}", path);
+            return path;
+        }
+
+        // Try to find GlobalBasicSettings files with different numbers
+        for i in (1..=20).rev() {
+            let path = roblox_dir.join(format!("GlobalBasicSettings_{}.xml", i));
+            if path.exists() {
+                info!("Found Roblox settings at: {:?}", path);
+                return path;
+            }
+        }
+
+        // Fallback to standard name
+        let standard_path = roblox_dir.join("GlobalBasicSettings_13.xml");
+        info!("Using default settings path: {:?}", standard_path);
+        standard_path
+    }
+
+    fn parse_settings_file_index(file_name: &str) -> Option<u32> {
+        let prefix = "GlobalBasicSettings_";
+        let suffix = ".xml";
+        if !file_name.starts_with(prefix) || !file_name.ends_with(suffix) {
+            return None;
+        }
+
+        let number_part = &file_name[prefix.len()..file_name.len() - suffix.len()];
+        number_part.parse::<u32>().ok()
+    }
+
+    fn resolve_settings_path(&self) -> PathBuf {
+        if self.settings_path.exists() {
+            return self.settings_path.clone();
+        }
+
+        let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let roblox_dir = PathBuf::from(&local_app_data).join("Roblox");
+        Self::find_settings_file(&roblox_dir)
+    }
+
+    /// Proactively repair Roblox GlobalBasicSettings file permissions.
+    ///
+    /// Older versions of SwiftTunnel (and some user tweaks) could leave the
+    /// GlobalBasicSettings XML file marked read-only. Roblox needs to write to
+    /// this file during startup; if it's read-only, Roblox may show
+    /// "Failed to download or apply critical settings".
+    pub fn repair_global_basic_settings_permissions(&self) -> Result<()> {
+        let settings_path = self.resolve_settings_path();
+        if !settings_path.exists() {
+            return Ok(());
+        }
+
+        if Self::is_readonly_path(&settings_path) {
+            info!(
+                "Roblox GlobalBasicSettings is read-only. Removing attribute to prevent startup errors..."
+            );
+            Self::remove_readonly_path(&settings_path)?;
+        }
+
+        Ok(())
+    }
+
+    /// Get the path to the settings file
+    pub fn get_settings_path(&self) -> &Path {
+        &self.settings_path
+    }
+
+    /// Read current Roblox settings from the XML file
+    pub fn read_current_settings(&self) -> Result<CurrentRobloxSettings> {
+        let settings_path = self.resolve_settings_path();
+        if !settings_path.exists() {
+            return Err(anyhow::anyhow!("Roblox settings file not found"));
+        }
+
+        let content = crate::utils::read_text_file_bounded(
+            &settings_path,
+            4 * 1024 * 1024,
+            "Roblox settings",
+        )?;
+
+        // A damaged/edited negative XML value must not wrap into a huge saved
+        // unsigned cap during startup adoption or config reconciliation.
+        let fps_cap = Self::extract_int_value(&content, "FramerateCap")
+            .and_then(|cap| u32::try_from(cap).ok())
+            .unwrap_or(60);
+
+        // The saved menu preference is separate from the engine's current
+        // rendering level, especially while Automatic adapts to the device.
+        // Only accept a supported menu value from legacy files without it.
+        let graphics_quality = Self::extract_int_value(&content, "SavedQualityLevel")
+            .filter(|level| (0..=10).contains(level))
+            .or_else(|| {
+                Self::extract_int_value(&content, "GraphicsQualityLevel")
+                    .filter(|level| (0..=10).contains(level))
+            })
+            .unwrap_or(5);
+
+        // Parse fullscreen
+        let fullscreen = Self::extract_bool_value(&content, "Fullscreen").unwrap_or(false);
+        let window_size = Self::extract_vector2_value(&content, "StartScreenSize")
+            .and_then(|(x, y)| Self::sanitize_window_dimensions_from_xml(x, y));
+
+        Ok(CurrentRobloxSettings {
+            fps_cap,
+            graphics_quality,
+            fullscreen,
+            window_size,
+        })
+    }
+
+    /// Extract an integer value from XML content
+    fn extract_int_value(content: &str, name: &str) -> Option<i32> {
+        // Look for pattern: <int name="FieldName">value</int>
+        let pattern = format!("<int name=\"{}\">", name);
+        if let Some(start) = content.find(&pattern) {
+            let value_start = start + pattern.len();
+            if let Some(end) = content[value_start..].find("</int>") {
+                let value_str = &content[value_start..value_start + end];
+                return value_str.trim().parse().ok();
+            }
+        }
+
+        // Also check for token type (used for SavedQualityLevel)
+        let token_pattern = format!("<token name=\"{}\">", name);
+        if let Some(start) = content.find(&token_pattern) {
+            let value_start = start + token_pattern.len();
+            if let Some(end) = content[value_start..].find("</token>") {
+                let value_str = &content[value_start..value_start + end];
+                return value_str.trim().parse().ok();
+            }
+        }
+
+        None
+    }
+
+    /// Extract a boolean value from XML content
+    fn extract_bool_value(content: &str, name: &str) -> Option<bool> {
+        let pattern = format!("<bool name=\"{}\">", name);
+        if let Some(start) = content.find(&pattern) {
+            let value_start = start + pattern.len();
+            if let Some(end) = content[value_start..].find("</bool>") {
+                let value_str = &content[value_start..value_start + end]
+                    .trim()
+                    .to_lowercase();
+                return Some(value_str == "true");
+            }
+        }
+        None
+    }
+
+    fn extract_vector2_value(content: &str, name: &str) -> Option<(i32, i32)> {
+        let pattern = format!("<Vector2 name=\"{}\">", name);
+        let start = content.find(&pattern)?;
+        let vector_start = start + pattern.len();
+        let vector_end = content[vector_start..].find("</Vector2>")?;
+        let vector_body = &content[vector_start..vector_start + vector_end];
+
+        let x = Self::extract_vector_axis(vector_body, "X")?;
+        let y = Self::extract_vector_axis(vector_body, "Y")?;
+        Some((x, y))
+    }
+
+    fn extract_vector_axis(vector_body: &str, axis: &str) -> Option<i32> {
+        let open = format!("<{}>", axis);
+        let close = format!("</{}>", axis);
+        let start = vector_body.find(&open)?;
+        let value_start = start + open.len();
+        let end = vector_body[value_start..].find(&close)?;
+        let value = &vector_body[value_start..value_start + end];
+        value.trim().parse().ok()
+    }
+
+    #[cfg(windows)]
+    fn remove_readonly_path(path: &Path) -> Result<()> {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+
+        let path_wide: Vec<u16> = OsStr::new(path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        unsafe {
+            SetFileAttributesW(
+                windows::core::PCWSTR::from_raw(path_wide.as_ptr()),
+                FILE_ATTRIBUTE_NORMAL,
+            )?;
+        }
+
+        info!("Removed read-only attribute from settings file");
+        Ok(())
+    }
+
+    #[cfg(all(test, windows))]
+    fn set_readonly_path(path: &Path) -> Result<()> {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+
+        let path_wide: Vec<u16> = OsStr::new(path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        unsafe {
+            SetFileAttributesW(
+                windows::core::PCWSTR::from_raw(path_wide.as_ptr()),
+                FILE_ATTRIBUTE_READONLY,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn is_readonly_path(path: &Path) -> bool {
+        if let Ok(metadata) = fs::metadata(path) {
+            // FILE_ATTRIBUTE_READONLY = 0x1
+            (metadata.file_attributes() & 0x1) != 0
+        } else {
+            false
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn remove_readonly_path(path: &Path) -> Result<()> {
+        // On non-Windows, use permissions
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o644); // rw-r--r--
+        fs::set_permissions(path, perms)?;
+        Ok(())
+    }
+
+    #[cfg(all(test, not(windows)))]
+    fn set_readonly_path(path: &Path) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o444); // r--r--r--
+        fs::set_permissions(path, perms)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn is_readonly_path(path: &Path) -> bool {
+        if let Ok(metadata) = fs::metadata(path) {
+            metadata.permissions().readonly()
+        } else {
+            false
+        }
+    }
+
+    /// Apply Roblox-specific optimizations.
+    /// Returns a list of non-fatal warnings (e.g. FFlag failures) on success.
+    /// Only returns `Err` when the XML settings step fails hard.
+    /// Rewrite only the launch window size, after Roblox has exited.
+    ///
+    /// Roblox saves its own window geometry into GlobalBasicSettings on the way
+    /// out, which overwrites whatever we set. That is why users report the
+    /// window resolution option "not working": it is applied, then clobbered,
+    /// so the next launch uses Roblox's number rather than theirs. A machine
+    /// under test had StartScreenSize at 1938x1038, a size nothing in this app
+    /// would ever write.
+    ///
+    /// Writing when Roblox *starts* would be too late, since it has already
+    /// read the file by then. Writing once it has closed means our value is the
+    /// one sitting there for the next launch.
+    ///
+    /// Deliberately narrow: touching only StartScreenSize and Fullscreen, not
+    /// FFlags or graphics quality, so a background re-apply can never surprise
+    /// someone by changing settings they did not ask about.
+    pub fn reapply_window_size(&self, config: &RobloxSettingsConfig) -> Result<()> {
+        let settings_path = self.resolve_settings_path();
+        if !settings_path.exists() {
+            return Ok(());
+        }
+
+        let content = crate::utils::read_text_file_bounded(
+            &settings_path,
+            4 * 1024 * 1024,
+            "Roblox settings",
+        )?;
+        let (width, height) =
+            Self::sanitize_window_dimensions(config.window_width, config.window_height);
+
+        let updated =
+            self.set_xml_vector2_value(&content, "StartScreenSize", width as i32, height as i32);
+        let updated = self.set_xml_bool_value(&updated, "Fullscreen", config.window_fullscreen);
+
+        if updated == content {
+            return Ok(());
+        }
+
+        self.replace_settings_file(&settings_path, updated.as_bytes())?;
+        info!(
+            "Restored Roblox launch window to {}x{} after it closed (fullscreen: {})",
+            width, height, config.window_fullscreen
+        );
+        Ok(())
+    }
+
+    pub fn apply_optimizations(&self, config: &RobloxSettingsConfig) -> Result<Vec<String>> {
+        let _ = config.checked_frame_cap().map_err(anyhow::Error::msg)?;
+        info!("Applying Roblox optimizations via GlobalBasicSettings");
+        let settings_path = self.resolve_settings_path();
+        let mut warnings: Vec<String> = Vec::new();
+        crate::roblox_native_launch::safe_path(&settings_path).map_err(anyhow::Error::msg)?;
+
+        if !settings_path.exists() {
+            return Err(anyhow::anyhow!(
+                "Roblox settings file not found. Please ensure Roblox is installed and has been run at least once."
+            ));
+        }
+
+        // Remove read-only if it was set (so we can write)
+        if Self::is_readonly_path(&settings_path) {
+            info!("Settings file is read-only, removing attribute to apply changes...");
+            if let Err(e) = Self::remove_readonly_path(&settings_path) {
+                error!("Failed to remove read-only attribute: {}", e);
+                return Err(anyhow::anyhow!(
+                    "Cannot modify settings: file is read-only and we couldn't remove the attribute. Error: {}",
+                    e
+                ));
+            }
+        }
+
+        self.apply_xml_settings(&settings_path, config)?;
+
+        // Apply FFlag optimizations (ultraboost) — always attempted regardless
+        // of whether the XML settings step succeeded. FFlags live in a separate
+        // file (ClientAppSettings.json) inside the Roblox version folder and are
+        // independent of GlobalBasicSettings.
+        if let Err(e) = self.apply_client_fflags(config) {
+            let msg = format!("Could not apply FFlag optimizations: {}", e);
+            warn!("{}", msg);
+            warnings.push(msg);
+        }
+
+        // Per-app GPU preference: on hybrid laptops (Intel iGPU + dGPU)
+        // Roblox often defaults to the integrated GPU. Setting "High
+        // performance" via HKCU\...\UserGpuPreferences routes it to the
+        // high-performance GPU. Reversed when Ultraboost is disabled.
+        if let Err(e) = Self::sync_gpu_preference(config.ultraboost) {
+            let msg = format!("Could not sync Roblox GPU preference: {}", e);
+            warn!("{}", msg);
+            warnings.push(msg);
+        }
+
+        info!("Roblox optimizations applied successfully");
+        Ok(warnings)
+    }
+
+    /// `HKCU\SOFTWARE\Microsoft\DirectX\UserGpuPreferences` — Windows uses
+    /// this key to route per-app GPU selection. The value name is the
+    /// executable's absolute path; the data is `GpuPreference=N;` where
+    /// `2` = High performance and `1` = Power saving.
+    const USER_GPU_PREFERENCES_KEY: &'static str =
+        r"HKCU\SOFTWARE\Microsoft\DirectX\UserGpuPreferences";
+    const ROBLOX_GPU_EXECUTABLES: &'static [&'static str] =
+        &["RobloxPlayerBeta.exe", "RobloxStudioBeta.exe"];
+    const GPU_PREFERENCE_HIGH_PERFORMANCE: &'static str = "GpuPreference=2;";
+
+    /// Mirror the Ultraboost toggle into Windows' per-app GPU preference.
+    ///
+    /// When `enable == true`, every `RobloxPlayerBeta.exe` /
+    /// `RobloxStudioBeta.exe` discovered under
+    /// `%LOCALAPPDATA%\Roblox\Versions\version-*` is registered as
+    /// `GpuPreference=2;` (High performance), after snapshotting any existing
+    /// user value. When `enable == false`, only values tracked in the snapshot
+    /// are restored or deleted; unknown values are left untouched because they
+    /// may be user-owned.
+    fn sync_gpu_preference(enable: bool) -> Result<()> {
+        static GPU_OPERATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _operation = GPU_OPERATION
+            .lock()
+            .map_err(|_| anyhow::anyhow!("GPU preference operation could not be resumed"))?;
+        let mut snapshot = Self::load_gpu_preference_snapshot()?;
+        let targets: Vec<String> = if enable {
+            Self::collect_roblox_gpu_executables()
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        } else {
+            // The journal includes removed versions. Enumerating untracked
+            // registry values or installed versions cannot help this restore.
+            snapshot.values.keys().cloned().collect()
+        };
+        if targets.is_empty() {
+            return Ok(());
+        }
+        if enable {
+            for path in &targets {
+                if !snapshot.values.contains_key(path) {
+                    let original =
+                        Self::query_registry_string_value(Self::USER_GPU_PREFERENCES_KEY, path)?;
+                    let applied = Self::high_performance_gpu_value(original.as_deref());
+                    if original.as_deref() == Some(applied.as_str()) {
+                        continue;
+                    }
+                    snapshot.values.insert(path.clone(), original);
+                    snapshot.applied.insert(path.clone(), applied);
+                }
+            }
+            // Save every original before the first registry change.
+            Self::persist_gpu_preference_snapshot(&snapshot)?;
+        }
+        let mut failures = Vec::new();
+        for path in targets {
+            let Some(original) = snapshot.values.get(&path) else {
+                continue;
+            };
+            let expected = snapshot
+                .applied
+                .get(&path)
+                .map(String::as_str)
+                .unwrap_or(Self::GPU_PREFERENCE_HIGH_PERFORMANCE);
+            let current =
+                match Self::query_registry_string_value(Self::USER_GPU_PREFERENCES_KEY, &path) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        failures.push(format!("{path}: {error}"));
+                        continue;
+                    }
+                };
+            if enable {
+                if current.as_deref() == Some(expected) || current != *original {
+                    continue;
+                }
+                if let Err(error) =
+                    Self::set_registry_string_value(Self::USER_GPU_PREFERENCES_KEY, &path, expected)
+                {
+                    failures.push(format!("{path}: {error}"));
+                }
+            } else {
+                // Do not overwrite a Windows graphics preference the user
+                // changed after SwiftTunnel applied its temporary value.
+                let result = {
+                    match Self::gpu_restore_for_current(original, current.as_deref(), expected) {
+                        GpuPreferenceRestoreAction::Restore(value) => {
+                            Self::set_registry_string_value(
+                                Self::USER_GPU_PREFERENCES_KEY,
+                                &path,
+                                &value,
+                            )
+                        }
+                        GpuPreferenceRestoreAction::Delete => {
+                            Self::delete_registry_value(Self::USER_GPU_PREFERENCES_KEY, &path)
+                        }
+                        GpuPreferenceRestoreAction::LeaveUntouched => Ok(()),
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        snapshot.values.remove(&path);
+                        snapshot.applied.remove(&path);
+                    }
+                    Err(error) => failures.push(format!("{path}: {error}")),
+                }
+            }
+        }
+        if !enable {
+            Self::persist_gpu_preference_snapshot(&snapshot)?;
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "GPU preference changes failed: {}",
+                failures.join("; ")
+            ))
+        }
+    }
+
+    pub(crate) fn high_performance_gpu_value(original: Option<&str>) -> String {
+        let mut fields: Vec<_> = original
+            .unwrap_or_default()
+            .split(';')
+            .filter(|field| {
+                !field.trim().is_empty()
+                    && !field
+                        .trim()
+                        .split('=')
+                        .next()
+                        .unwrap_or("")
+                        .eq_ignore_ascii_case("GpuPreference")
+            })
+            .collect();
+        fields.push("GpuPreference=2");
+        format!("{};", fields.join(";"))
+    }
+
+    fn gpu_restore_for_current(
+        original: &Option<String>,
+        current: Option<&str>,
+        applied: &str,
+    ) -> GpuPreferenceRestoreAction {
+        if current != Some(applied) {
+            GpuPreferenceRestoreAction::LeaveUntouched
+        } else {
+            Self::gpu_preference_restore_action(Some(original))
+        }
+    }
+
+    fn load_gpu_preference_snapshot() -> Result<GpuPreferenceSnapshot> {
+        let path = gpu_preference_snapshot_path()
+            .ok_or_else(|| anyhow::anyhow!("Could not find the GPU recovery folder"))?;
+        Self::read_gpu_preference_snapshot(&path)
+    }
+
+    fn read_gpu_preference_snapshot(path: &Path) -> Result<GpuPreferenceSnapshot> {
+        let content =
+            match crate::utils::read_text_file_bounded(path, 256 * 1024, "GPU preference recovery")
+            {
+                Ok(content) => content,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(GpuPreferenceSnapshot::default());
+                }
+                Err(error) => return Err(error.into()),
+            };
+        let snapshot: GpuPreferenceSnapshot = serde_json::from_str(&content).map_err(|error| {
+            anyhow::anyhow!(
+                "GPU recovery data could not be read; the original file was kept: {error}"
+            )
+        })?;
+        if snapshot.values.len() > 1024
+            || snapshot.values.keys().any(|path| {
+                let path = Path::new(path);
+                !path.is_absolute()
+                    || path.file_name().is_none_or(|name| {
+                        !Self::ROBLOX_GPU_EXECUTABLES
+                            .iter()
+                            .any(|exe| name.to_string_lossy().eq_ignore_ascii_case(exe))
+                    })
+            })
+            || snapshot
+                .applied
+                .keys()
+                .any(|path| !snapshot.values.contains_key(path))
+        {
+            return Err(anyhow::anyhow!(
+                "GPU recovery data contains invalid entries; the original file was kept"
+            ));
+        }
+        Ok(snapshot)
+    }
+
+    fn persist_gpu_preference_snapshot(snapshot: &GpuPreferenceSnapshot) -> Result<()> {
+        let path = gpu_preference_snapshot_path()
+            .ok_or_else(|| anyhow::anyhow!("Could not find the GPU recovery folder"))?;
+        Self::write_gpu_preference_snapshot(&path, snapshot)
+    }
+
+    fn write_gpu_preference_snapshot(path: &Path, snapshot: &GpuPreferenceSnapshot) -> Result<()> {
+        use std::io::Write;
+        if snapshot.values.is_empty() {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            return Ok(());
+        }
+        if Self::read_gpu_preference_snapshot(path)? == *snapshot {
+            return Ok(());
+        }
+        fs::create_dir_all(
+            path.parent()
+                .ok_or_else(|| anyhow::anyhow!("Invalid GPU recovery path"))?,
+        )?;
+        let temporary = path.with_extension(format!(
+            "{}.{:032x}.tmp",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let bytes = serde_json::to_vec_pretty(snapshot)?;
+        if bytes.len() > 256 * 1024 {
+            return Err(anyhow::anyhow!(
+                "GPU recovery record exceeds its size limit"
+            ));
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let result = (|| -> std::io::Result<()> {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temporary, path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result.map_err(Into::into)
+    }
+
+    fn gpu_preference_restore_action(
+        snapshot: Option<&Option<String>>,
+    ) -> GpuPreferenceRestoreAction {
+        match snapshot {
+            Some(Some(original)) => GpuPreferenceRestoreAction::Restore(original.clone()),
+            Some(None) => GpuPreferenceRestoreAction::Delete,
+            None => GpuPreferenceRestoreAction::LeaveUntouched,
+        }
+    }
+
+    fn collect_roblox_gpu_executables() -> Vec<PathBuf> {
+        let version_folders = Self::find_roblox_version_folders();
+        let mut out = Vec::new();
+        for folder in version_folders {
+            for exe in Self::ROBLOX_GPU_EXECUTABLES {
+                let candidate = folder.join(exe);
+                if candidate.exists() {
+                    out.push(candidate);
+                }
+            }
+        }
+        out
+    }
+    fn query_registry_string_value(key_path: &str, value_name: &str) -> Result<Option<String>> {
+        crate::system_optimizer::SystemOptimizer::query_registry_checked(key_path, value_name)
+    }
+    fn set_registry_string_value(key_path: &str, value_name: &str, data: &str) -> Result<()> {
+        crate::system_optimizer::SystemOptimizer::set_registry_string_checked(
+            key_path, value_name, data,
+        )
+    }
+    fn delete_registry_value(key_path: &str, value_name: &str) -> Result<()> {
+        crate::system_optimizer::SystemOptimizer::delete_registry_value_checked(
+            key_path, value_name,
+        )
+    }
+
+    /// Apply XML-level settings (FPS cap, graphics quality, window size).
+    /// Separated from apply_optimizations so FFlags can run independently.
+    fn apply_xml_settings(
+        &self,
+        settings_path: &Path,
+        config: &RobloxSettingsConfig,
+    ) -> Result<()> {
+        let frame_cap = config.checked_frame_cap().map_err(anyhow::Error::msg)?;
+        // Backup current settings first
+        self.backup_settings_for(settings_path)?;
+
+        // Read current content
+        let mut content = crate::utils::read_text_file_bounded(
+            settings_path,
+            4 * 1024 * 1024,
+            "Roblox settings",
+        )?;
+
+        // Apply the FPS cap exactly as configured, in both directions.
+        //
+        // This briefly refused to lower it, to stop the on-by-default cap
+        // writing its 300 over someone already running 650. That guard was in
+        // the wrong place: it also meant a player who typed 500 into the Cap
+        // field while sitting at 600 was silently ignored, which makes the
+        // control a lie. Whatever is in the config is what the player asked
+        // for, so it is what gets written.
+        //
+        // The protection it was reaching for lives in `sync_roblox_window_settings`
+        // instead, which adopts Roblox's existing cap into the config at startup
+        // the same way it adopts window size and graphics level. A machine at
+        // 650 arrives here with 650 already configured, so there is nothing to
+        // overwrite and nothing to guard against.
+        if let Some(frame_cap) = frame_cap {
+            content = self.set_xml_int_value(&content, "FramerateCap", frame_cap);
+            info!("Set FPS cap to: {}", config.target_fps);
+        }
+
+        // Apply graphics quality
+        let quality_value = self.graphics_quality_to_int(&config.graphics_quality);
+        content = self.set_xml_int_value(&content, "GraphicsQualityLevel", quality_value);
+        content = self.set_xml_token_value(&content, "SavedQualityLevel", quality_value);
+        info!("Set graphics quality to level: {}", quality_value);
+
+        // Apply windowed resolution and fullscreen defaults.
+        let (window_width, window_height) =
+            Self::sanitize_window_dimensions(config.window_width, config.window_height);
+        content = self.set_xml_vector2_value(
+            &content,
+            "StartScreenSize",
+            window_width as i32,
+            window_height as i32,
+        );
+        content = self.set_xml_bool_value(&content, "Fullscreen", config.window_fullscreen);
+        info!(
+            "Set Roblox launch window to {}x{} (fullscreen: {})",
+            window_width, window_height, config.window_fullscreen
+        );
+
+        // Write updated content back
+        self.replace_settings_file(settings_path, content.as_bytes())?;
+
+        // Note: We no longer set the file to read-only. Setting it read-only
+        // caused Roblox to fail with "Failed to apply critical settings" because
+        // Roblox needs to write to this file during its startup sequence.
+        // The FPS settings may be reset by Roblox, but the background monitor
+        // will re-detect and re-apply them when needed.
+
+        Ok(())
+    }
+
+    /// Convert GraphicsQuality enum to integer value
+    fn graphics_quality_to_int(&self, quality: &GraphicsQuality) -> i32 {
+        match quality {
+            GraphicsQuality::Automatic => 0,
+            GraphicsQuality::Manual => 0,
+            GraphicsQuality::Level1 => 1,
+            GraphicsQuality::Level2 => 2,
+            GraphicsQuality::Level3 => 3,
+            GraphicsQuality::Level4 => 4,
+            GraphicsQuality::Level5 => 5,
+            GraphicsQuality::Level6 => 6,
+            GraphicsQuality::Level7 => 7,
+            GraphicsQuality::Level8 => 8,
+            GraphicsQuality::Level9 => 9,
+            GraphicsQuality::Level10 => 10,
+        }
+    }
+
+    /// Set an integer value in the XML content
+    fn set_xml_int_value(&self, content: &str, name: &str, value: i32) -> String {
+        let pattern = format!("<int name=\"{}\">", name);
+
+        if let Some(start) = content.find(&pattern) {
+            let value_start = start + pattern.len();
+            if let Some(end_offset) = content[value_start..].find("</int>") {
+                let before = &content[..value_start];
+                let after = &content[value_start + end_offset..];
+                return format!("{}{}{}", before, value, after);
+            }
+        }
+
+        // If not found, return original content
+        content.to_string()
+    }
+
+    /// Set a token value in the XML content
+    fn set_xml_token_value(&self, content: &str, name: &str, value: i32) -> String {
+        let pattern = format!("<token name=\"{}\">", name);
+
+        if let Some(start) = content.find(&pattern) {
+            let value_start = start + pattern.len();
+            if let Some(end_offset) = content[value_start..].find("</token>") {
+                let before = &content[..value_start];
+                let after = &content[value_start + end_offset..];
+                return format!("{}{}{}", before, value, after);
+            }
+        }
+
+        content.to_string()
+    }
+
+    /// Set a boolean value in the XML content
+    fn set_xml_bool_value(&self, content: &str, name: &str, value: bool) -> String {
+        let pattern = format!("<bool name=\"{}\">", name);
+        let value_str = if value { "true" } else { "false" };
+
+        if let Some(start) = content.find(&pattern) {
+            let value_start = start + pattern.len();
+            if let Some(end_offset) = content[value_start..].find("</bool>") {
+                let before = &content[..value_start];
+                let after = &content[value_start + end_offset..];
+                return format!("{}{}{}", before, value_str, after);
+            }
+        }
+
+        let entry = format!("<bool name=\"{}\">{}</bool>", name, value_str);
+        Self::append_setting_block(content, &entry)
+    }
+
+    fn set_xml_vector2_value(&self, content: &str, name: &str, x: i32, y: i32) -> String {
+        let pattern = format!("<Vector2 name=\"{}\">", name);
+        let entry = format!(
+            "<Vector2 name=\"{}\"><X>{}</X><Y>{}</Y></Vector2>",
+            name, x, y
+        );
+
+        if let Some(start) = content.find(&pattern) {
+            let Some(end_offset) = content[start..].find("</Vector2>") else {
+                return content.to_string();
+            };
+            let end = start + end_offset + "</Vector2>".len();
+            return format!("{}{}{}", &content[..start], entry, &content[end..]);
+        }
+
+        Self::append_setting_block(content, &entry)
+    }
+
+    fn append_setting_block(content: &str, entry: &str) -> String {
+        if let Some(close_idx) = content.rfind("</roblox>") {
+            let mut output = String::new();
+            output.push_str(&content[..close_idx]);
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str("  ");
+            output.push_str(entry);
+            output.push('\n');
+            output.push_str(&content[close_idx..]);
+            output
+        } else {
+            format!("{}\n{}\n", content, entry)
+        }
+    }
+
+    fn sanitize_window_dimensions(width: u32, height: u32) -> (u32, u32) {
+        let mut sanitized_width = width.clamp(Self::MIN_WINDOW_WIDTH, Self::MAX_WINDOW_WIDTH);
+        let mut sanitized_height = height.clamp(Self::MIN_WINDOW_HEIGHT, Self::MAX_WINDOW_HEIGHT);
+
+        if sanitized_width % 2 != 0 {
+            sanitized_width = if sanitized_width == Self::MAX_WINDOW_WIDTH {
+                sanitized_width - 1
+            } else {
+                sanitized_width + 1
+            };
+        }
+
+        if sanitized_height % 2 != 0 {
+            sanitized_height = if sanitized_height == Self::MAX_WINDOW_HEIGHT {
+                sanitized_height - 1
+            } else {
+                sanitized_height + 1
+            };
+        }
+
+        (sanitized_width, sanitized_height)
+    }
+
+    fn sanitize_window_dimensions_from_xml(width: i32, height: i32) -> Option<(u32, u32)> {
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        Some(Self::sanitize_window_dimensions(
+            width as u32,
+            height as u32,
+        ))
+    }
+
+    /// Snapshot Roblox's settings the first time, and only the first time.
+    ///
+    /// This used to overwrite the backup on every apply, which quietly made
+    /// "restore original settings" a lie: apply Ultraboost twice and the
+    /// backup holds the first apply's forced quality level, so restoring hands
+    /// the player their own degraded settings back and calls it the original.
+    /// Uninstall restores from this file, so that turned a temporary change
+    /// into a permanent one.
+    ///
+    /// Keeping the first snapshot means the file is what its name says: Roblox
+    /// as it was before SwiftTunnel ever touched it.
+    fn backup_settings_for(&self, settings_path: &Path) -> Result<()> {
+        crate::roblox_native_launch::safe_path(settings_path).map_err(anyhow::Error::msg)?;
+        crate::roblox_native_launch::safe_path(&self.backup_path).map_err(anyhow::Error::msg)?;
+        if self.backup_path.exists() {
+            return Ok(());
+        }
+        if settings_path.exists() {
+            let original = crate::utils::read_file_bounded(
+                settings_path,
+                4 * 1024 * 1024,
+                "Roblox settings backup",
+            )?;
+            info!("Creating backup of Roblox settings");
+            if let Some(parent) = self.backup_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            // Do not expose a partial backup after an interrupted copy. Future
+            // applies preserve the first published snapshot, including its bytes.
+            crate::atomic_file::replace(&self.backup_path, &original)?;
+            info!("Backup created at: {:?}", self.backup_path);
+        }
+        Ok(())
+    }
+
+    /// Restore original settings from backup
+    pub fn restore_settings(&self) -> Result<()> {
+        info!("Restoring original Roblox settings from backup");
+
+        if !self.backup_path.exists() {
+            warn!("No backup file found");
+            return Ok(());
+        }
+
+        let settings_path = self.resolve_settings_path();
+
+        self.restore_settings_backup(&settings_path)?;
+
+        // Remove all FFlag optimizations when restoring
+        if let Err(e) = self.remove_all_fflags() {
+            warn!("Could not remove FFlag optimizations during restore: {}", e);
+        }
+
+        // Don't set read-only after restore - user is disabling optimizations
+        info!("Settings restored successfully");
+        Ok(())
+    }
+
+    fn replace_settings_file(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        if bytes.len() > 4 * 1024 * 1024 {
+            anyhow::bail!(
+                "Roblox settings are too large to save safely. The previous file was kept."
+            );
+        }
+        crate::roblox_native_launch::safe_path(path).map_err(anyhow::Error::msg)?;
+        if Self::is_readonly_path(path) {
+            Self::remove_readonly_path(path)?;
+        }
+        crate::atomic_file::replace(path, bytes)?;
+        Ok(())
+    }
+
+    fn restore_settings_backup(&self, settings_path: &Path) -> Result<()> {
+        crate::roblox_native_launch::safe_path(&self.backup_path).map_err(anyhow::Error::msg)?;
+        // The backup writer has the same bound. Refuse an altered/oversized
+        // snapshot before changing the live file, and never truncate a shared
+        // file or expose a partial restore if writing fails.
+        let original = crate::utils::read_file_bounded(
+            &self.backup_path,
+            4 * 1024 * 1024,
+            "Roblox settings backup",
+        )?;
+        self.replace_settings_file(settings_path, &original)
+    }
+
+    /// Undo everything SwiftTunnel applied to the Roblox client, whether or not a
+    /// backup exists: strip our FFlags from ClientAppSettings.json and, when a
+    /// GlobalBasicSettings backup exists, restore it. Backs the Repair tab's
+    /// "reset Roblox settings" fix.
+    pub fn reset_swifttunnel_changes(&self) -> Result<()> {
+        self.prepare_global_settings_reset()?;
+        self.reset_swifttunnel_changes_in_paths(
+            Self::get_client_settings_paths_for_removal(),
+            || Self::sync_gpu_preference(false),
+        )
+    }
+
+    fn prepare_global_settings_reset(&self) -> Result<()> {
+        Self::prepare_global_settings_reset_with(
+            || !self.is_roblox_running(),
+            crate::roblox_game_profile::restore_launch_settings,
+            || crate::roblox_game_profile::pending() || crate::roblox_launch_flags::pending(),
+        )
+    }
+
+    fn prepare_global_settings_reset_with(
+        stopped: impl FnOnce() -> bool,
+        restore: impl FnOnce() -> std::result::Result<bool, String>,
+        pending: impl FnOnce() -> bool,
+    ) -> Result<()> {
+        if !stopped() {
+            anyhow::bail!("Close Roblox before resetting its settings.");
+        }
+        // Finish conditional per-game recovery before the explicit reset.
+        // Otherwise a delayed watcher can mistake a reset value for its old
+        // temporary override and restore the pre-reset setting over it.
+        restore().map_err(anyhow::Error::msg)?;
+        if pending() {
+            anyhow::bail!(
+                "Roblox's previous settings are still being restored. Wait a moment and retry Reset."
+            );
+        }
+        Ok(())
+    }
+
+    fn reset_swifttunnel_changes_in_paths(
+        &self,
+        client_settings_paths: Vec<PathBuf>,
+        restore_gpu: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let mut failures = Vec::new();
+        if let Err(e) = self.remove_all_fflags_in_paths(client_settings_paths) {
+            failures.push(format!("Could not remove FFlags: {e}"));
+        }
+
+        if self.backup_path.exists() {
+            let settings_path = self.resolve_settings_path();
+            if let Err(e) = self.restore_settings_backup(&settings_path) {
+                failures.push(format!("Could not restore settings backup: {e}"));
+            }
+        }
+
+        if let Err(e) = restore_gpu() {
+            failures.push(format!("Could not restore GPU preference: {e}"));
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("Roblox reset incomplete: {}", failures.join("; "))
+        }
+    }
+
+    /// Put the Roblox client back to stock, whoever changed it.
+    ///
+    /// `reset_swifttunnel_changes` removes our own keys and leaves everything
+    /// else alone, which is right for undoing an app people still have. It is
+    /// not enough for the thing people actually ask for, which is a Roblox that
+    /// renders normally again after some combination of SwiftTunnel, a
+    /// bootstrapper and a copied flag list has been through it. Nobody can tell
+    /// which flag came from where, and the one that ruins render distance looks
+    /// exactly like the one that unlocks frames.
+    ///
+    /// So this deletes `ClientAppSettings.json` outright, everywhere one is
+    /// found: every Roblox version folder, and every launcher's modifications
+    /// folder. The second half is the part that cannot be skipped. A launcher
+    /// copies its own `ClientAppSettings.json` into the version folder at every
+    /// single launch, so clearing only the version folder looks like it worked
+    /// and is undone by the next time the game opens. That is why resetting
+    /// Roblox's own files never fixes this: the master copy is not in Roblox.
+    ///
+    /// GlobalBasicSettings holds the other half, graphics level and frame cap,
+    /// and lives above the version folders where nothing else clears it. The
+    /// backup goes back when there is one; otherwise the three values anything
+    /// forces are put back to Roblox's defaults, rather than deleting a file
+    /// that also holds volume, sensitivity and keybinds the player chose.
+    ///
+    /// Destructive by design and by request: a launcher's own flag setup is
+    /// removed too, and a running Roblox is killed. The caller has to have said
+    /// so.
+    pub fn reset_client_to_default(&self) -> RobloxResetReport {
+        let mut report = RobloxResetReport {
+            roblox_was_running: self.is_roblox_running(),
+            ..Default::default()
+        };
+
+        // Kill Roblox first, or the reset does not stick.
+        //
+        // Roblox holds GlobalBasicSettings open and writes it back on the way
+        // out, so restoring it under a live client means the client overwrites
+        // the restore the moment it exits. The flag files are worse: Roblox
+        // reads them at launch, so one that is still running keeps the old
+        // behaviour and puts the player straight back where they started.
+        //
+        // Asking them to close it first does not work either. Roblox routinely
+        // stays in the task list long after its window is gone, which is
+        // exactly what happened while this was being tested: three separate
+        // "closed it" attempts and the process was alive every time. Somebody
+        // pressing a reset button has already decided the client is the
+        // problem, so ending it is the honest thing to do rather than a step to
+        // hand back to them.
+        {
+            match self.close_running_instances() {
+                Ok(()) => info!("Reset: closed the running Roblox client"),
+                Err(e) => {
+                    warn!("Reset: could not close Roblox: {e}");
+                    report.failures.push(format!("could not close Roblox: {e}"));
+                    return report;
+                }
+            }
+        }
+
+        if let Err(error) = self.prepare_global_settings_reset() {
+            warn!("Reset: temporary game settings could not be restored: {error}");
+            report.failures.push(error.to_string());
+            return report;
+        }
+
+        for client_settings in Self::get_client_settings_paths_for_removal() {
+            let settings_path = client_settings.join("ClientAppSettings.json");
+            if !settings_path.exists() {
+                continue;
+            }
+
+            if Self::is_readonly_path(&settings_path) {
+                let _ = Self::remove_readonly_path(&settings_path);
+            }
+
+            match fs::remove_file(&settings_path) {
+                Ok(()) => {
+                    report.flag_files_removed += 1;
+                    if let Some(source) = Self::describe_client_settings_source(&client_settings)
+                        && !report.sources.contains(&source)
+                    {
+                        report.sources.push(source);
+                    }
+                    let _ = Self::remove_empty_bootstrapper_client_settings_dir(&client_settings);
+                }
+                Err(e) => {
+                    warn!("Reset: could not delete {}: {e}", settings_path.display());
+                    report
+                        .failures
+                        .push(format!("{}: {e}", settings_path.display()));
+                }
+            }
+        }
+
+        match self.restore_global_basic_settings() {
+            Ok(restored) => report.settings_restored = restored,
+            Err(error) => {
+                warn!("Reset: could not restore Roblox FPS and graphics settings: {error}");
+                report.failures.push(
+                    "Could not restore Roblox FPS and graphics settings. Close Roblox and retry."
+                        .into(),
+                );
+            }
+        }
+
+        if let Err(e) = Self::sync_gpu_preference(false) {
+            warn!("Reset: could not clear the Roblox GPU preference: {e}");
+            report
+                .failures
+                .push(format!("GPU preferences could not be restored: {e}"));
+        }
+
+        info!(
+            "Reset Roblox to default: {} flag file(s) removed, settings restored: {}",
+            report.flag_files_removed, report.settings_restored
+        );
+        report
+    }
+
+    /// Which launcher a ClientSettings folder belongs to, for the report.
+    ///
+    /// Named so the person reading it recognises the thing on their machine.
+    /// "Bloxstrap" means something to them; the full path does not, and putting
+    /// one on screen invites them to go and check it by hand.
+    fn describe_client_settings_source(client_settings: &Path) -> Option<String> {
+        for (project, _) in Self::BOOTSTRAPPER_CLIENT_SETTINGS_LOCATIONS {
+            if client_settings
+                .components()
+                .any(|part| part.as_os_str().eq_ignore_ascii_case(project))
+            {
+                return Some((*project).to_string());
+            }
+        }
+        Some("Roblox".to_string())
+    }
+
+    /// Put GlobalBasicSettings back, and say whether anything was done.
+    ///
+    /// The backup is preferred because it is the player's own file from before
+    /// SwiftTunnel touched anything. Without one, only the three values a
+    /// performance preset forces are reset: the file also holds volume, camera
+    /// sensitivity and keybinds, and deleting it to be thorough would take
+    /// those with it for no reason.
+    fn restore_global_basic_settings(&self) -> Result<bool> {
+        let settings_path = self.resolve_settings_path();
+
+        if self.backup_path.exists() {
+            self.restore_settings_backup(&settings_path)?;
+            return Ok(true);
+        }
+
+        if !settings_path.exists() {
+            return Ok(false);
+        }
+
+        crate::roblox_native_launch::safe_path(&settings_path).map_err(anyhow::Error::msg)?;
+        let content = crate::utils::read_text_file_bounded(
+            &settings_path,
+            4 * 1024 * 1024,
+            "Roblox settings",
+        )?;
+        let content = Self::reset_forced_xml_values(&content, self);
+        self.replace_settings_file(&settings_path, content.as_bytes())?;
+        Ok(true)
+    }
+
+    /// Roblox's own defaults for the values a performance preset overrides.
+    ///
+    /// Free function shape (taking the optimizer for the setters) so the
+    /// substitution can be tested without a settings file on disk.
+    fn reset_forced_xml_values(content: &str, optimizer: &Self) -> String {
+        // 60 rather than removing the tag: Roblox treats a missing cap as 60
+        // anyway, and writing it keeps the file valid for a client that is
+        // mid-launch while this runs.
+        let content = optimizer.set_xml_int_value(content, "FramerateCap", 60);
+        let content = optimizer.set_xml_int_value(&content, "GraphicsQualityLevel", 0);
+        optimizer.set_xml_token_value(&content, "SavedQualityLevel", 0)
+    }
+
+    /// Whether SwiftTunnel's Ultraboost FFlags are actually present in the live
+    /// ClientAppSettings.json — a Roblox update or the user can wipe them.
+    fn ultraboost_fflags_present(&self) -> bool {
+        let Some((probe_key, _)) = Self::ULTRABOOST_FFLAGS.first() else {
+            return false;
+        };
+        let Ok(paths) = Self::get_client_settings_paths(false) else {
+            return false;
+        };
+        for client_settings in paths {
+            let settings_path = client_settings.join("ClientAppSettings.json");
+            if let Ok(settings) = Self::read_client_app_settings(&settings_path)
+                && settings.contains_key(*probe_key)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Reconcile a saved Roblox config against what's ACTUALLY applied to the
+    /// client, so the Optimize page reflects external changes (e.g. a Roblox
+    /// update or the user wiping the FFlags / FPS cap). Defensive: only turns
+    /// things off when it can confirm they're gone, and only for FFlags + FPS.
+    pub fn effective_roblox_config(&self, config: &RobloxSettingsConfig) -> RobloxSettingsConfig {
+        self.reconcile_roblox_config(
+            config,
+            crate::roblox_game_profile::pending() || crate::roblox_launch_flags::pending(),
+        )
+    }
+
+    fn reconcile_roblox_config(
+        &self,
+        config: &RobloxSettingsConfig,
+        temporary_settings_pending: bool,
+    ) -> RobloxSettingsConfig {
+        let mut effective = config.clone();
+        // The live files can hold this game's temporary FPS or safe-launch
+        // flags until recovery completes. They are not a new global choice.
+        if temporary_settings_pending || !self.is_roblox_installed() {
+            return effective;
+        }
+
+        // Ultraboost lives in ClientAppSettings.json FFlags.
+        if config.ultraboost && !self.ultraboost_fflags_present() {
+            effective.ultraboost = false;
+        }
+
+        // FPS unlock lives in GlobalBasicSettings `FramerateCap` (<= 60 = gone).
+        if config.unlock_fps
+            && let Ok(current) = self.read_current_settings()
+        {
+            if current.fps_cap <= 60 {
+                effective.unlock_fps = false;
+            } else {
+                effective.target_fps = current.fps_cap;
+            }
+        }
+
+        effective
+    }
+
+    /// Check if Roblox is installed (settings file exists)
+    pub fn is_roblox_installed(&self) -> bool {
+        self.resolve_settings_path().exists()
+    }
+
+    /// Check whether a Roblox client process is currently running.
+    pub fn is_roblox_running(&self) -> bool {
+        Self::player_is_running()
+    }
+
+    /// Presence-only callers do not need to discover any settings files.
+    pub fn player_is_running() -> bool {
+        #[cfg(windows)]
+        {
+            match crate::process_snapshot::any_named(Self::ROBLOX_CLIENT_PROCESSES) {
+                Ok(running) => running,
+                Err(error) => {
+                    warn!("Roblox process check failed; settings were left unchanged: {error}");
+                    true
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// Force-close running Roblox client processes.
+    ///
+    /// Kills more than [`Self::is_roblox_running`] looks for, deliberately.
+    /// `RobloxCrashHandler.exe` is a helper that outlives the client it was
+    /// watching, so it belongs in the list of things to end but not in the list
+    /// of things that mean "Roblox is open": counting it as the client would
+    /// leave the app offering to restart a game nobody is playing.
+    pub fn close_running_instances(&self) -> Result<()> {
+        #[cfg(windows)]
+        {
+            crate::process_snapshot::terminate_named(Self::ROBLOX_PROCESSES_TO_KILL)
+                .map_err(|error| anyhow::anyhow!(error))
+        }
+        #[cfg(not(windows))]
+        {
+            Err(anyhow::anyhow!(
+                "Closing Roblox is only supported on Windows"
+            ))
+        }
+    }
+
+    /// Reopen the resolved official player after applying boosts.
+    pub fn reopen_client(&self, player: &Path) -> Result<()> {
+        crate::roblox_native_launch::open_home(player)
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!(error))
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    //  ULTRABOOST FFLAGS
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /// Allowlisted performance FFlags applied by Ultraboost.
+    ///
+    /// Every entry was verified against Roblox's Sept-2025 client FFlag
+    /// allowlist; non-allowlisted flags are silently ignored by the engine
+    /// and are intentionally not written here. Additions over the prior
+    /// version:
+    ///   * `DFFlagDebugPauseVoxelizer=True` — pauses the voxel-lighting
+    ///     voxelizer thread, cutting CPU work in scenes with Voxel
+    ///     dynamic lighting (most legacy games).
+    ///   * Four CSG LOD switching distances pinned at `0` — forces the
+    ///     lowest-poly LOD bucket at the shortest possible distance.
+    ///   * `FFlagDebugGraphicsPreferVulkan=False` /
+    ///     `FFlagDebugGraphicsPreferOpenGL=False` — defensive negations so
+    ///     a bootstrapper preset cannot silently undo our D3D11 selection
+    ///     (Vulkan on Roblox/Windows is unofficial and crash-prone).
+    ///
+    /// `DFIntDebugFRMQualityLevelOverride` is `1` (lowest) instead of the
+    /// prior `4`; Roblox's FRM quality scales 1-21 and community
+    /// performance presets use the minimum for maximum FPS.
+    ///
+    /// `FIntDebugForceMSAASamples` is `1` instead of `0` because Roblox's
+    /// client allowlist accepts 1x/2x/4x MSAA samples. A value of `0` can be
+    /// ignored, leaving anti-aliasing at the user's previous/default quality.
+    const ULTRABOOST_FFLAGS: &[(&str, &str)] = &[
+        ("FFlagHandleAltEnterFullscreenManually", "False"),
+        ("FFlagDebugGraphicsPreferD3D11", "True"),
+        ("FFlagDebugGraphicsPreferVulkan", "False"),
+        ("FFlagDebugGraphicsPreferOpenGL", "False"),
+        ("FIntDebugForceMSAASamples", "1"),
+        ("DFFlagTextureQualityOverrideEnabled", "True"),
+        ("DFIntTextureQualityOverride", "0"),
+        ("DFIntDebugFRMQualityLevelOverride", "1"),
+        ("FFlagDebugSkyGray", "True"),
+        ("FIntFRMMinGrassDistance", "0"),
+        ("FIntFRMMaxGrassDistance", "0"),
+        ("FIntGrassMovementReducedMotionFactor", "0"),
+        ("DFFlagDebugPauseVoxelizer", "True"),
+        ("DFIntCSGLevelOfDetailSwitchingDistance", "0"),
+        ("DFIntCSGLevelOfDetailSwitchingDistanceL12", "0"),
+        ("DFIntCSGLevelOfDetailSwitchingDistanceL23", "0"),
+        ("DFIntCSGLevelOfDetailSwitchingDistanceL34", "0"),
+    ];
+
+    /// Roblox's local client configuration FFlag allowlist accepted by Custom
+    /// FFlag Import. This intentionally stays broader than Ultraboost:
+    /// Ultraboost writes only SwiftTunnel's performance preset, while custom
+    /// import may accept any Roblox-allowlisted key.
+    const CUSTOM_FFLAG_ALLOWLIST: &[(&str, &str)] = &[
+        ("DFIntCSGLevelOfDetailSwitchingDistance", "0"),
+        ("DFIntCSGLevelOfDetailSwitchingDistanceL12", "0"),
+        ("DFIntCSGLevelOfDetailSwitchingDistanceL23", "0"),
+        ("DFIntCSGLevelOfDetailSwitchingDistanceL34", "0"),
+        ("FFlagHandleAltEnterFullscreenManually", "False"),
+        ("DFFlagTextureQualityOverrideEnabled", "True"),
+        ("DFIntTextureQualityOverride", "0"),
+        ("FIntDebugForceMSAASamples", "1"),
+        ("DFFlagDisableDPIScale", "False"),
+        ("FFlagDebugGraphicsPreferD3D11", "True"),
+        ("FFlagDebugSkyGray", "True"),
+        ("DFFlagDebugPauseVoxelizer", "True"),
+        ("DFIntDebugFRMQualityLevelOverride", "1"),
+        ("FIntFRMMaxGrassDistance", "0"),
+        ("FIntFRMMinGrassDistance", "0"),
+        ("FFlagDebugGraphicsPreferVulkan", "False"),
+        ("FFlagDebugGraphicsPreferOpenGL", "False"),
+        ("FIntGrassMovementReducedMotionFactor", "0"),
+    ];
+
+    /// Retired FFlag. Previously written for FPS unlock, but the framerate cap is
+    /// now driven solely by `FramerateCap` in GlobalBasicSettings. Still removed
+    /// from existing ClientAppSettings so prior versions' entries are cleaned up.
+    const FPS_UNLOCK_FFLAG: &str = "DFIntTaskSchedulerTargetFps";
+
+    /// Old blocked FFlags that must be cleaned up from previous versions.
+    ///
+    /// `DFFlagDebugPauseVoxelizer` was previously listed here because earlier
+    /// builds wrote it as a disabled override. It is now actively part of
+    /// `ULTRABOOST_FFLAGS` (it's allowlisted and yields a real CPU lift on
+    /// voxel-lighting scenes), so removing it from the cleanup list prevents
+    /// us from immediately stripping our own write.
+    const LEGACY_BLOCKED_FFLAGS: &[&str] = &[
+        "DFIntDebugDynamicRenderKiloPixels",
+        "FIntRenderShadowIntensity",
+        "FFlagDisablePostFx",
+        "FIntDebugTextureManagerSkipMips",
+    ];
+
+    /// Former SwiftTunnel UltraBoost entries that should be removed from
+    /// existing ClientAppSettings. `DFFlagDisableDPIScale` is a valid Roblox
+    /// client flag, but it favors sharper high-DPI rendering over maximum FPS
+    /// so it is no longer written by Ultraboost.
+    const REMOVED_ULTRABOOST_FFLAGS: &[&str] = &["DFFlagDisableDPIScale"];
+
+    /// Check a custom FFlag payload without writing anything.
+    ///
+    /// Runs exactly the validation the writer runs, so whatever passes here is
+    /// what would be applied: valid JSON, a non-empty object, under 8KB, and
+    /// every key on Roblox local client FFlag allowlist. Returns how many
+    /// flags would be written.
+    ///
+    /// Exists so a client can reject a bad paste at the moment it happens
+    /// rather than at the moment it tries to restart the game.
+    pub fn validate_custom_fflags(json: &str) -> std::result::Result<usize, String> {
+        let config = RobloxSettingsConfig {
+            custom_fflags_enabled: true,
+            custom_fflags_json: json.to_string(),
+            ultraboost: false,
+            ..RobloxSettingsConfig::default()
+        };
+        Self::parse_custom_fflags(&config)
+            .map(|flags| flags.len())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Say which keys were turned down, and why.
+    ///
+    /// All of them at once. Reporting only the first meant correcting a file
+    /// one key per attempt, and since the keys are read in alphabetical order
+    /// rather than the order they were written, the one named was rarely the
+    /// one being looked at.
+    fn describe_rejected(keys: &[&str]) -> String {
+        let reserved = keys.contains(&Self::FPS_UNLOCK_FFLAG);
+        let mut others: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|key| *key != Self::FPS_UNLOCK_FFLAG)
+            .collect();
+        others.sort_unstable();
+
+        let mut message = String::new();
+        if reserved {
+            // Not rejected for being unsafe: SwiftTunnel writes this one itself
+            // from the Unlock frame rate switch and the Cap field, so a file
+            // setting it too would be two things arguing over one value.
+            message.push_str(&format!(
+                "{} is set by SwiftTunnel's frame rate controls, so take it out of the file.",
+                Self::FPS_UNLOCK_FFLAG
+            ));
+        }
+        if !others.is_empty() {
+            if reserved {
+                message.push(' ');
+            }
+            message.push_str(&format!(
+                "Not on SwiftTunnel's allowlist: {}.",
+                others.join(", ")
+            ));
+        }
+        message
+    }
+
+    /// Every FFlag a custom payload is allowed to set.
+    pub fn allowed_custom_fflags() -> impl Iterator<Item = &'static str> {
+        Self::CUSTOM_FFLAG_ALLOWLIST.iter().map(|(key, _)| *key)
+    }
+
+    /// Read existing launcher flag files without changing them. Imported
+    /// values are checked by the same validator as the normal Apply action.
+    pub fn inspect_launcher_imports(&self) -> Result<RobloxImportPreview> {
+        use std::io::Read;
+        let mut sources = Vec::new();
+        for folder in Self::get_client_settings_paths(false)? {
+            let source =
+                Self::describe_client_settings_source(&folder).unwrap_or_else(|| "Roblox".into());
+            let path = folder.join("ClientAppSettings.json");
+            if !path.exists() {
+                continue;
+            }
+            let read = (|| -> Result<String> {
+                let mut bytes = Vec::new();
+                fs::File::open(&path)?
+                    .take(256 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() > 256 * 1024 {
+                    anyhow::bail!("Flag file is larger than 256 KB.");
+                }
+                Ok(String::from_utf8(bytes)?)
+            })();
+            match read {
+                Ok(raw) => sources.push(Self::preview_flag_import(&source, &raw)),
+                Err(error) => sources.push(LauncherFlagImport {
+                    source,
+                    json: "{}".into(),
+                    accepted: 0,
+                    skipped: Vec::new(),
+                    error: Some(error.to_string()),
+                }),
+            }
+        }
+        let current = self.read_current_settings().ok();
+        Ok(RobloxImportPreview {
+            sources,
+            fps_cap: current
+                .as_ref()
+                .map(|s| s.fps_cap)
+                .filter(|fps| (30..=99999).contains(fps)),
+            graphics_quality: current
+                .as_ref()
+                .map(|s| GraphicsQuality::from_level(s.graphics_quality)),
+        })
+    }
+
+    pub fn preview_flag_import(source: &str, raw: &str) -> LauncherFlagImport {
+        let mut report = LauncherFlagImport {
+            source: source.into(),
+            json: "{}".into(),
+            accepted: 0,
+            skipped: Vec::new(),
+            error: None,
+        };
+        let parse = (|| -> Result<()> {
+            if raw.len() > 256 * 1024 {
+                anyhow::bail!("Flag file is larger than 256 KB.");
+            }
+            let value: serde_json::Value =
+                serde_json::from_str(raw.trim_start_matches('\u{feff}'))?;
+            let object = value
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("Flags must be a JSON object."))?;
+            if object.len() > 2048 {
+                anyhow::bail!("Flag file has too many entries.");
+            }
+            let mut accepted = serde_json::Map::new();
+            for (key, value) in object {
+                let allowed = Self::CUSTOM_FFLAG_ALLOWLIST
+                    .iter()
+                    .find(|(name, _)| *name == key);
+                if let Some((_, expected)) = allowed {
+                    match Self::normalize_custom_fflag_value(key, expected, value) {
+                        Ok(value) => {
+                            accepted.insert(key.clone(), serde_json::Value::String(value));
+                        }
+                        Err(_) => report.skipped.push(format!("{key}: invalid value")),
+                    }
+                } else {
+                    report
+                        .skipped
+                        .push(format!("{key}: unsupported or ignored by Roblox"));
+                }
+            }
+            report.accepted = accepted.len();
+            report.json = serde_json::to_string_pretty(&accepted)?;
+            if report.accepted > 0 {
+                Self::validate_custom_fflags(&report.json).map_err(anyhow::Error::msg)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = parse {
+            report.error = Some(error.to_string());
+            report.accepted = 0;
+            report.json = "{}".into();
+        }
+        report
+    }
+
+    /// The complete flags owned by SwiftTunnel for a direct player launch.
+    pub fn native_launch_flags(config: &RobloxSettingsConfig) -> Result<HashMap<String, String>> {
+        if config.ultraboost {
+            return Ok(Self::ULTRABOOST_FFLAGS
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect());
+        }
+        Self::parse_custom_fflags(config)
+    }
+
+    fn parse_custom_fflags(config: &RobloxSettingsConfig) -> Result<HashMap<String, String>> {
+        if !config.custom_fflags_enabled {
+            return Ok(HashMap::new());
+        }
+        if config.ultraboost {
+            return Err(anyhow::anyhow!(
+                "Choose either Ultraboost or Custom FFlag Import, not both."
+            ));
+        }
+
+        let raw = config.custom_fflags_json.trim();
+        if raw.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Paste a JSON object before applying custom FFlags."
+            ));
+        }
+        if raw.len() > 8192 {
+            return Err(anyhow::anyhow!(
+                "Custom FFlag JSON is too large. Keep it under 8 KB."
+            ));
+        }
+
+        let value: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|e| anyhow::anyhow!("Custom FFlags must be valid JSON: {}", e))?;
+        let Some(object) = value.as_object() else {
+            return Err(anyhow::anyhow!(
+                "Custom FFlags must be a JSON object like {{ \"FFlagName\": true }}."
+            ));
+        };
+        if object.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Custom FFlags must include at least one allowlisted key."
+            ));
+        }
+
+        let mut output = HashMap::new();
+        let mut rejected: Vec<&str> = Vec::new();
+        for (key, value) in object {
+            let Some((_, expected)) = Self::CUSTOM_FFLAG_ALLOWLIST
+                .iter()
+                .find(|(allowed_key, _)| *allowed_key == key)
+            else {
+                rejected.push(key.as_str());
+                continue;
+            };
+
+            let normalized = Self::normalize_custom_fflag_value(key, expected, value)?;
+            output.insert(key.clone(), normalized);
+        }
+
+        if !rejected.is_empty() {
+            return Err(anyhow::anyhow!("{}", Self::describe_rejected(&rejected)));
+        }
+
+        Ok(output)
+    }
+
+    fn normalize_custom_fflag_value(
+        key: &str,
+        expected: &str,
+        value: &serde_json::Value,
+    ) -> Result<String> {
+        let expects_bool = expected.eq_ignore_ascii_case("true")
+            || expected.eq_ignore_ascii_case("false")
+            || key.starts_with("FFlag")
+            || key.starts_with("DFFlag");
+
+        if expects_bool {
+            if let Some(v) = value.as_bool() {
+                return Ok(if v { "True" } else { "False" }.to_string());
+            }
+            if let Some(v) = value.as_str() {
+                return match v.trim().to_ascii_lowercase().as_str() {
+                    "true" => Ok("True".to_string()),
+                    "false" => Ok("False".to_string()),
+                    _ => Err(anyhow::anyhow!(
+                        "Custom FFlag '{}' must be true or false.",
+                        key
+                    )),
+                };
+            }
+            return Err(anyhow::anyhow!(
+                "Custom FFlag '{}' must be true or false.",
+                key
+            ));
+        }
+
+        let integer = if let Some(v) = value.as_i64() {
+            Some(v)
+        } else if let Some(v) = value.as_u64() {
+            i64::try_from(v).ok()
+        } else if let Some(v) = value.as_f64() {
+            // JSON numbers such as 100.0 and 1e2 are also whole numbers to
+            // the editor. The range check below keeps accepted values exact.
+            (v.is_finite() && v.fract() == 0.0).then_some(v as i64)
+        } else if let Some(v) = value.as_str() {
+            v.trim().parse::<i64>().ok()
+        } else {
+            None
+        };
+
+        let Some(integer) = integer else {
+            return Err(anyhow::anyhow!(
+                "Custom FFlag '{}' must be an integer.",
+                key
+            ));
+        };
+        if !(-1_000_000..=1_000_000).contains(&integer) {
+            return Err(anyhow::anyhow!(
+                "Custom FFlag '{}' is outside the allowed integer range.",
+                key
+            ));
+        }
+
+        Ok(integer.to_string())
+    }
+
+    /// Known Bloxstrap-family persistent ClientSettings locations under LOCALAPPDATA.
+    ///
+    /// The normal Roblox version folder is still handled separately. These paths
+    /// are for bootstrappers that copy persistent user modifications into the
+    /// active Roblox version folder when they launch Roblox.
+    /// Processes whose presence means "Roblox is open".
+    ///
+    /// Only the client itself. Helpers that outlive it do not belong here: one
+    /// of them still running is not a game in progress, and counting it as one
+    /// would leave the app offering to restart something nobody is playing.
+    const ROBLOX_CLIENT_PROCESSES: &[&str] = &["RobloxPlayerBeta.exe", "RobloxPlayer.exe"];
+
+    /// Processes to end when closing Roblox.
+    ///
+    /// A superset of the above. `RobloxCrashHandler.exe` routinely sits in the
+    /// task list long after the client is gone, which is a large part of why
+    /// people believe they have closed Roblox when they have not, so ending it
+    /// is part of ending Roblox.
+    const ROBLOX_PROCESSES_TO_KILL: &[&str] = &[
+        "RobloxPlayerBeta.exe",
+        "RobloxPlayer.exe",
+        "RobloxCrashHandler.exe",
+    ];
+
+    const BOOTSTRAPPER_CLIENT_SETTINGS_LOCATIONS: &[(&str, &[&str])] = &[
+        ("Bloxstrap", &["Modifications", "ClientSettings"]),
+        ("Bloxstrap-QA", &["Modifications", "ClientSettings"]),
+        ("Fishstrap", &["Modifications", "ClientSettings"]),
+        ("Fishstrap-QA", &["Modifications", "ClientSettings"]),
+        ("Bubblestrap", &["Modifications", "ClientSettings"]),
+        ("Froststrap", &["ClientSettings"]),
+        ("Froststrap-QA", &["ClientSettings"]),
+        ("Voidstrap", &["VoidstrapMods", "ClientSettings"]),
+        ("Voidstrap-QA", &["VoidstrapMods", "ClientSettings"]),
+    ];
+
+    /// A fingerprint of every Roblox client install on this machine.
+    ///
+    /// Changes when Roblox updates, because an update lands as a new
+    /// `version-<hash>` folder rather than an edit of the old one. That is the
+    /// event worth reacting to: FFlags live inside the version folder, so an
+    /// update silently discards them, while the frame cap and graphics level
+    /// live in GlobalBasicSettings and survive.
+    ///
+    /// Recovery used to happen only when the app next started, and only if
+    /// Ultraboost was on, so somebody who launched Roblox directly for a few
+    /// weeks lost their flags at the first update and had no way to know.
+    ///
+    /// Include each version's location: the same build can be installed by
+    /// multiple launchers or moved to another drive. No file contents are read.
+    pub fn install_fingerprint() -> String {
+        Self::fingerprint_of(&Self::find_roblox_version_folders())
+    }
+
+    /// The pure half, so it can be tested without a real Roblox install.
+    ///
+    /// Separated because the caller above reads this machine's LOCALAPPDATA,
+    /// and a test that went through it would pass or fail on whatever Roblox
+    /// happens to be installed on the machine running it.
+    fn fingerprint_of(folders: &[PathBuf]) -> String {
+        let mut paths: Vec<String> = folders
+            .iter()
+            .map(|path| {
+                #[cfg(windows)]
+                {
+                    let mut value = path.to_string_lossy().replace('/', "\\");
+                    value.make_ascii_lowercase();
+                    value
+                }
+                #[cfg(not(windows))]
+                {
+                    path.to_string_lossy().into_owned()
+                }
+            })
+            .collect();
+        // Sorted, because the folder listing is ordered by modification time.
+        // Without this an unchanged install could reorder between polls and
+        // trigger a pointless reapply.
+        paths.sort();
+        paths.dedup();
+        paths.join("|")
+    }
+
+    fn find_roblox_version_folders() -> Vec<PathBuf> {
+        let mut versions: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+
+        // Every launcher root, wherever it was actually installed to.
+        for root in Self::launcher_roots() {
+            let versions_dir = root.join("Versions");
+            if versions_dir.exists() {
+                Self::collect_version_folders(&versions_dir, &mut versions);
+            }
+        }
+
+        versions.sort_by(|(_, left), (_, right)| right.cmp(left));
+        versions.into_iter().map(|(path, _)| path).collect()
+    }
+
+    /// Every place a Roblox client is installed, not just Roblox's own folder.
+    ///
+    /// Bootstrappers install their own copy of Roblox under their own
+    /// directory and launch that. A player using one still has a perfectly
+    /// normal `%LOCALAPPDATA%\Roblox\Versions` full of older builds nobody
+    /// runs any more, so looking only there finds real folders, writes real
+    /// files, and changes nothing about the game that actually starts. Every
+    /// symptom of that is silent: the settings apply, the app says so, and the
+    /// frame rate does not move.
+    ///
+    /// Roblox is first so a plain install behaves exactly as it always has.
+    const ROBLOX_INSTALL_ROOTS: &[&str] = &[
+        "Roblox",
+        "RobloxPCVNG",
+        "Bloxstrap",
+        "Bloxstrap-QA",
+        "Fishstrap",
+        "Fishstrap-QA",
+        "Bubblestrap",
+        "Froststrap",
+        "Froststrap-QA",
+        "Voidstrap",
+        "Voidstrap-QA",
+    ];
+
+    /// Where a launcher actually put itself, if it recorded a location.
+    ///
+    /// `%LOCALAPPDATA%\<Name>` is only the default. Both Bloxstrap and
+    /// Fishstrap let you install anywhere and record the choice in their own
+    /// uninstall key, which their source reads back the same way:
+    ///
+    /// ```text
+    /// HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\<Name>
+    ///     InstallLocation = D:\Fishstrap
+    /// ```
+    ///
+    /// Assuming the default misses anyone who moved it, and misses them in the
+    /// worst way: we find their untouched `%LOCALAPPDATA%\Roblox`, write real
+    /// files into it, and report success while the game they launch from
+    /// another drive reads none of it.
+    #[cfg(windows)]
+    fn bootstrapper_install_location(project: &str) -> Option<PathBuf> {
+        use winreg::RegKey;
+        use winreg::enums::HKEY_CURRENT_USER;
+
+        let key = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(format!(
+                r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{project}"
+            ))
+            .ok()?;
+        let location: String = crate::registry_value::read(&key, "InstallLocation").ok()??;
+        Self::recorded_launcher_directory(&location)
+    }
+
+    #[cfg(any(windows, test))]
+    fn recorded_launcher_directory(location: &str) -> Option<PathBuf> {
+        let path = PathBuf::from(location.trim());
+        (path.is_absolute()
+            && !path
+                .components()
+                .any(|part| part == std::path::Component::ParentDir)
+            && path.is_dir())
+        .then_some(path)
+    }
+
+    #[cfg(not(windows))]
+    fn bootstrapper_install_location(_project: &str) -> Option<PathBuf> {
+        None
+    }
+
+    /// Every launcher root on this machine: the recorded location where there
+    /// is one, the default underneath LOCALAPPDATA otherwise.
+    fn launcher_roots() -> Vec<PathBuf> {
+        let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        let mut roots = Vec::new();
+
+        for project in Self::ROBLOX_INSTALL_ROOTS {
+            if let Some(recorded) = Self::bootstrapper_install_location(project) {
+                roots.push(recorded);
+                continue;
+            }
+            if let Some(base) = &local_app_data {
+                roots.push(base.join(project));
+            }
+        }
+        roots
+    }
+
+    fn find_roblox_version_folders_in(local_app_data: &Path) -> Vec<PathBuf> {
+        let mut versions: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+
+        for root in Self::ROBLOX_INSTALL_ROOTS {
+            let versions_dir = local_app_data.join(root).join("Versions");
+            if versions_dir.exists() {
+                Self::collect_version_folders(&versions_dir, &mut versions);
+            }
+        }
+
+        // Newest first across every root, so the build the player actually
+        // launched wins over one left behind by a launcher they stopped using.
+        versions.sort_by(|(_, left), (_, right)| right.cmp(left));
+        versions.into_iter().map(|(path, _)| path).collect()
+    }
+
+    fn collect_version_folders(
+        versions_dir: &Path,
+        versions: &mut Vec<(PathBuf, std::time::SystemTime)>,
+    ) {
+        let Ok(entries) = fs::read_dir(versions_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().map(|value| value.to_string_lossy()) else {
+                continue;
+            };
+            if name.starts_with("version-")
+                && path.join("RobloxPlayerBeta.exe").exists()
+                && let Ok(metadata) = entry.metadata()
+            {
+                let modified = metadata
+                    .modified()
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                versions.push((path, modified));
+            }
+        }
+    }
+
+    fn get_client_settings_paths(create_missing: bool) -> Result<Vec<PathBuf>> {
+        let Some(local_app_data) = std::env::var("LOCALAPPDATA").ok().map(PathBuf::from) else {
+            return Ok(Vec::new());
+        };
+        let mut paths =
+            Self::get_client_settings_paths_for_local_app_data(&local_app_data, create_missing)?;
+
+        // Launchers installed somewhere other than the default. Both Bloxstrap
+        // and Fishstrap let you choose, and record the choice in their own
+        // uninstall key; someone who put one on another drive would otherwise
+        // have every flag written into a Roblox they never launch.
+        //
+        // Only here, never in the function above: that one takes the directory
+        // to search so tests can point it at a temporary one, and reading the
+        // real registry inside it would let this machine leak into them.
+        for (project, relative_segments) in Self::BOOTSTRAPPER_CLIENT_SETTINGS_LOCATIONS {
+            // Only a launcher that recorded a location, which means it is both
+            // installed and somewhere other than the default the call above
+            // already covered. Looping the whole list unconditionally creates
+            // settings folders for software the machine has never had.
+            let Some(root) = Self::bootstrapper_install_location(project) else {
+                continue;
+            };
+
+            // Each launcher's own subpath, from the table. Froststrap keeps its
+            // settings directly under ClientSettings and Voidstrap under
+            // VoidstrapMods, so one hardcoded subpath writes to the wrong place
+            // for both of them.
+            let settings = relative_segments
+                .iter()
+                .fold(root, |path, segment| path.join(segment));
+
+            match Self::get_bootstrapper_client_settings_path_checked(
+                project,
+                &settings,
+                create_missing,
+            ) {
+                Ok(Some(path)) => paths.push(path),
+                Ok(None) => {}
+                Err(error) => warn!(
+                    "Skipping launcher settings path {}: {error}",
+                    settings.display()
+                ),
+            }
+        }
+
+        Ok(Self::dedupe_paths(paths))
+    }
+
+    /// Every ClientSettings folder that could still be holding flags we wrote.
+    ///
+    /// Deliberately wider than the writing path. `get_client_settings_paths`
+    /// counts a `version-` folder as an install only when `RobloxPlayerBeta.exe`
+    /// sits next to it, which is the right test for writing: seeding flags into
+    /// a folder nothing launches is pointless. It is the wrong test for
+    /// removing. Roblox's own "reset installation", an update caught halfway
+    /// and a client the player has since removed all leave the version folder
+    /// and its `ClientSettings` behind with the executable gone, and cleanup
+    /// then walked past the one file it existed to delete, logged "skipping
+    /// FFlag cleanup" and reported success.
+    ///
+    /// What is left behind is not inert. Reinstalling Roblox over that folder
+    /// picks the flags straight back up, and by then SwiftTunnel is gone, so
+    /// there is nothing left on the machine that knows how to undo them. A
+    /// player is left with a permanently degraded client and no way to connect
+    /// it to an app they uninstalled weeks ago.
+    ///
+    /// So removal takes any `version-` folder that still has a `ClientSettings`
+    /// directory, plus every launcher `Modifications` path. Nothing here creates
+    /// a directory that does not already exist.
+    fn get_client_settings_paths_for_removal() -> Vec<PathBuf> {
+        let mut paths = match Self::get_client_settings_paths(false) {
+            Ok(paths) => paths,
+            Err(error) => {
+                warn!("Could not collect the usual ClientSettings paths for removal: {error}");
+                Vec::new()
+            }
+        };
+
+        for root in Self::launcher_roots() {
+            Self::collect_removal_client_settings_in(&root.join("Versions"), &mut paths);
+        }
+
+        Self::dedupe_paths(paths)
+    }
+
+    /// Append every `version-*/ClientSettings` under `versions_dir` that exists.
+    ///
+    /// Split out from the caller so tests can point it at a temporary directory
+    /// instead of the machine's real launcher roots.
+    fn collect_removal_client_settings_in(versions_dir: &Path, paths: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(versions_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let is_version_folder = path
+                .file_name()
+                .map(|name| name.to_string_lossy().starts_with("version-"))
+                .unwrap_or(false);
+            if !is_version_folder {
+                continue;
+            }
+            let client_settings = path.join("ClientSettings");
+            if client_settings.is_dir() {
+                paths.push(client_settings);
+            }
+        }
+    }
+
+    fn get_client_settings_paths_for_versions(
+        version_folders: &[PathBuf],
+        create_missing: bool,
+    ) -> Result<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+        let mut failures = Vec::new();
+        for version_folder in version_folders {
+            match Self::get_client_settings_path_for_version_checked(version_folder, create_missing)
+            {
+                Ok(Some(path)) => paths.push(path),
+                Ok(None) => {}
+                Err(e) => {
+                    failures.push(format!("{}: {}", version_folder.display(), e));
+                    warn!(
+                        "Skipping Roblox version folder {} while collecting ClientSettings: {}",
+                        version_folder.display(),
+                        e
+                    );
+                }
+            }
+        }
+        if paths.is_empty() && !failures.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Failed to collect ClientSettings from {} Roblox version folder(s): {}",
+                failures.len(),
+                failures.join("; ")
+            ));
+        }
+        Ok(paths)
+    }
+
+    fn get_client_settings_paths_for_local_app_data(
+        local_app_data: &Path,
+        create_missing: bool,
+    ) -> Result<Vec<PathBuf>> {
+        let version_folders = Self::find_roblox_version_folders_in(local_app_data);
+        let mut paths = match Self::get_client_settings_paths_for_versions(
+            &version_folders,
+            create_missing,
+        ) {
+            Ok(version_paths) => version_paths,
+            Err(e) => {
+                warn!(
+                    "Skipping Roblox version folder ClientSettings paths after collection failure: {}",
+                    e
+                );
+                Vec::new()
+            }
+        };
+        paths.extend(
+            Self::get_bootstrapper_client_settings_paths_for_local_app_data(
+                local_app_data,
+                create_missing,
+            ),
+        );
+
+        Ok(Self::dedupe_paths(paths))
+    }
+
+    fn get_client_settings_path_for_version_checked(
+        version_folder: &Path,
+        create_missing: bool,
+    ) -> Result<Option<PathBuf>> {
+        let client_settings = version_folder.join("ClientSettings");
+
+        if !client_settings.exists() {
+            if !create_missing {
+                return Ok(None);
+            }
+            fs::create_dir_all(&client_settings)?;
+            info!("Created ClientSettings folder at: {:?}", client_settings);
+        } else if !client_settings.is_dir() {
+            return Err(anyhow::anyhow!(
+                "ClientSettings path exists but is not a folder: {}",
+                client_settings.display()
+            ));
+        }
+
+        Ok(Some(client_settings))
+    }
+
+    fn get_bootstrapper_client_settings_paths_for_local_app_data(
+        local_app_data: &Path,
+        create_missing: bool,
+    ) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut failures = Vec::new();
+
+        for (project_name, relative_segments) in Self::BOOTSTRAPPER_CLIENT_SETTINGS_LOCATIONS {
+            let base = local_app_data.join(project_name);
+            if !base.exists() {
+                continue;
+            }
+
+            if !base.is_dir() {
+                warn!(
+                    "Skipping {} bootstrapper path because it is not a folder",
+                    base.display()
+                );
+                continue;
+            }
+
+            let client_settings = relative_segments
+                .iter()
+                .fold(base, |path, segment| path.join(segment));
+
+            match Self::get_bootstrapper_client_settings_path_checked(
+                project_name,
+                &client_settings,
+                create_missing,
+            ) {
+                Ok(Some(path)) => paths.push(path),
+                Ok(None) => {}
+                Err(e) => {
+                    failures.push(format!("{}: {}", client_settings.display(), e));
+                    warn!(
+                        "Skipping {} bootstrapper ClientSettings path {}: {}",
+                        project_name,
+                        client_settings.display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        if !failures.is_empty() {
+            warn!(
+                "Failed to collect ClientSettings from {} supported bootstrapper path(s): {}",
+                failures.len(),
+                failures.join("; ")
+            );
+        }
+
+        paths
+    }
+
+    fn get_bootstrapper_client_settings_path_checked(
+        project_name: &str,
+        client_settings: &Path,
+        create_missing: bool,
+    ) -> Result<Option<PathBuf>> {
+        if !client_settings.exists() {
+            if !create_missing {
+                return Ok(None);
+            }
+            fs::create_dir_all(client_settings)?;
+            info!(
+                "Created {} ClientSettings folder at: {:?}",
+                project_name, client_settings
+            );
+        } else if !client_settings.is_dir() {
+            return Err(anyhow::anyhow!(
+                "{} ClientSettings path exists but is not a folder",
+                project_name
+            ));
+        }
+
+        Ok(Some(client_settings.to_path_buf()))
+    }
+
+    fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::new();
+        for path in paths {
+            if seen.insert(path.clone()) {
+                deduped.push(path);
+            }
+        }
+        deduped
+    }
+
+    /// Apply only flag overrides. The dedicated editor must not rewrite FPS,
+    /// graphics XML, system optimizations or network settings.
+    pub fn apply_flag_overrides(&self, config: &RobloxSettingsConfig) -> Result<Vec<String>> {
+        if self.is_roblox_running() {
+            return Err(anyhow::anyhow!("Close Roblox before applying FastFlags."));
+        }
+        let custom = Self::parse_custom_fflags(config)?;
+        let paths = Self::get_client_settings_paths(config.ultraboost || !custom.is_empty())?;
+        if paths.is_empty() && (config.ultraboost || !custom.is_empty()) {
+            return Err(anyhow::anyhow!(
+                "Launch Roblox or your installed launcher once before applying flag overrides."
+            ));
+        }
+        let mut warnings = Vec::new();
+        for (index, path) in paths.iter().enumerate() {
+            if let Err(error) = self.apply_client_fflags_in_path(config, path) {
+                if index == 0 {
+                    return Err(error);
+                }
+                warnings.push(format!(
+                    "An additional launcher or Roblox version could not be updated: {error}"
+                ));
+            }
+        }
+        Ok(warnings)
+    }
+
+    fn apply_client_fflags(&self, config: &RobloxSettingsConfig) -> Result<FFlagApplyOutcome> {
+        let custom_fflags_requested = !Self::parse_custom_fflags(config)?.is_empty();
+        let should_write_fflags = config.ultraboost || custom_fflags_requested;
+        let client_settings_paths = Self::get_client_settings_paths(should_write_fflags)?;
+        if client_settings_paths.is_empty() {
+            if should_write_fflags {
+                return Err(anyhow::anyhow!(
+                    "No Roblox or supported bootstrapper ClientSettings path was found. Launch Roblox or an installed supported bootstrapper once, then apply Ultraboost again."
+                ));
+            }
+            {
+                info!(
+                    "No Roblox or supported bootstrapper ClientSettings path found, skipping FFlag cleanup"
+                );
+                return Ok(FFlagApplyOutcome::SkippedMissingRobloxVersion);
+            }
+        }
+
+        self.apply_client_fflags_in_paths(config, client_settings_paths)
+    }
+
+    #[cfg(test)]
+    fn apply_client_fflags_for_local_app_data(
+        &self,
+        config: &RobloxSettingsConfig,
+        local_app_data: &Path,
+    ) -> Result<FFlagApplyOutcome> {
+        let custom_fflags_requested = !Self::parse_custom_fflags(config)?.is_empty();
+        let should_write_fflags = config.ultraboost || custom_fflags_requested;
+        let client_settings_paths = Self::get_client_settings_paths_for_local_app_data(
+            local_app_data,
+            should_write_fflags,
+        )?;
+        if client_settings_paths.is_empty() {
+            if should_write_fflags {
+                return Err(anyhow::anyhow!(
+                    "No Roblox or supported bootstrapper ClientSettings path was found. Launch Roblox or an installed supported bootstrapper once, then apply Ultraboost again."
+                ));
+            }
+            {
+                info!(
+                    "No Roblox or supported bootstrapper ClientSettings path found, skipping FFlag cleanup"
+                );
+                return Ok(FFlagApplyOutcome::SkippedMissingRobloxVersion);
+            }
+        }
+
+        self.apply_client_fflags_in_paths(config, client_settings_paths)
+    }
+
+    fn apply_client_fflags_in_paths(
+        &self,
+        config: &RobloxSettingsConfig,
+        client_settings_paths: Vec<PathBuf>,
+    ) -> Result<FFlagApplyOutcome> {
+        let mut applied_any = false;
+        let mut active_failure = None;
+        let mut secondary_failures = Vec::new();
+
+        for (index, client_settings) in client_settings_paths.iter().enumerate() {
+            match self.apply_client_fflags_in_path(config, client_settings) {
+                Ok(_) => {
+                    applied_any = true;
+                }
+                Err(e) => {
+                    let failure = format!("{}: {}", client_settings.display(), e);
+                    warn!(
+                        "Failed to apply FFlags to ClientSettings path {}: {}",
+                        client_settings.display(),
+                        e
+                    );
+                    if index == 0 {
+                        active_failure = Some(failure);
+                    } else {
+                        secondary_failures.push(failure);
+                    }
+                }
+            }
+        }
+
+        if let Some(failure) = active_failure {
+            return Err(anyhow::anyhow!(
+                "Failed to apply FFlags to the primary ClientSettings path: {}",
+                failure
+            ));
+        }
+
+        if !applied_any {
+            return Err(anyhow::anyhow!(
+                "Failed to apply FFlags to {} ClientSettings path(s): {}",
+                secondary_failures.len(),
+                secondary_failures.join("; ")
+            ));
+        }
+
+        if !secondary_failures.is_empty() {
+            warn!(
+                "Applied FFlags to the primary ClientSettings path, but failed to update {} secondary ClientSettings path(s): {}",
+                secondary_failures.len(),
+                secondary_failures.join("; ")
+            );
+        }
+
+        Ok(FFlagApplyOutcome::Applied)
+    }
+
+    fn apply_client_fflags_in_path(
+        &self,
+        config: &RobloxSettingsConfig,
+        client_settings: &Path,
+    ) -> Result<FFlagApplyOutcome> {
+        if !client_settings.is_dir() {
+            return Err(anyhow::anyhow!(
+                "ClientSettings path exists but is not a folder: {}",
+                client_settings.display()
+            ));
+        }
+
+        let settings_path = client_settings.join("ClientAppSettings.json");
+
+        let mut settings = Self::read_client_app_settings(&settings_path)?;
+
+        // Always clean up old blocked or retired FFlags from previous versions
+        for key in Self::LEGACY_BLOCKED_FFLAGS {
+            settings.remove(*key);
+        }
+        for key in Self::REMOVED_ULTRABOOST_FFLAGS {
+            settings.remove(*key);
+        }
+
+        // The editor owns the supported override set. Remove stale managed
+        // entries, including DPI scaling (not part of Ultraboost), before
+        // inserting the current selection. Other flags remain untouched.
+        for (key, _) in Self::CUSTOM_FFLAG_ALLOWLIST {
+            settings.remove(*key);
+        }
+        if config.ultraboost {
+            // Insert all ultraboost FFlags
+            for (key, value) in Self::ULTRABOOST_FFLAGS {
+                settings.insert(key.to_string(), serde_json::json!(value));
+            }
+            info!("Ultraboost FFlags applied");
+        } else {
+            // Remove all ultraboost FFlags
+            for (key, _) in Self::ULTRABOOST_FFLAGS {
+                settings.remove(*key);
+            }
+        }
+
+        let custom_fflags = Self::parse_custom_fflags(config)?;
+        if !custom_fflags.is_empty() {
+            for (key, value) in custom_fflags {
+                settings.insert(key, serde_json::json!(value));
+            }
+            info!("Custom allowlisted FFlags applied");
+        }
+
+        // FPS unlock is driven by GlobalBasicSettings `FramerateCap`; the old
+        // scheduler FFlag is retired and always stripped from existing files.
+        settings.remove(Self::FPS_UNLOCK_FFLAG);
+
+        // Write or delete the file
+        if settings.is_empty() {
+            if settings_path.exists() {
+                fs::remove_file(&settings_path)?;
+                Self::remove_empty_bootstrapper_client_settings_dir(client_settings)?;
+            }
+        } else {
+            let json = serde_json::to_string_pretty(&settings)?;
+            self.replace_settings_file(&settings_path, json.as_bytes())?;
+        }
+
+        info!("FFlag optimizations applied to ClientAppSettings.json");
+        Ok(FFlagApplyOutcome::Applied)
+    }
+
+    fn read_client_app_settings(
+        settings_path: &Path,
+    ) -> Result<HashMap<String, serde_json::Value>> {
+        crate::roblox_native_launch::safe_path(settings_path).map_err(anyhow::Error::msg)?;
+        let content = match crate::utils::read_text_file_bounded(
+            settings_path,
+            4 * 1024 * 1024,
+            "Roblox settings",
+        ) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(error) => return Err(error.into()),
+        };
+        serde_json::from_str(content.trim_start_matches('\u{feff}')).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse ClientAppSettings.json at {}: {}",
+                settings_path.display(),
+                e
+            )
+        })
+    }
+
+    /// Remove all SwiftTunnel FFlag settings from ClientAppSettings.json
+    fn remove_all_fflags(&self) -> Result<()> {
+        self.remove_all_fflags_in_paths(Self::get_client_settings_paths_for_removal())
+    }
+
+    fn remove_all_fflags_in_paths(&self, client_settings_paths: Vec<PathBuf>) -> Result<()> {
+        if client_settings_paths.is_empty() {
+            info!(
+                "No Roblox or supported bootstrapper ClientSettings path found, skipping FFlag cleanup"
+            );
+            return Ok(());
+        }
+
+        let mut failures = Vec::new();
+
+        for client_settings in client_settings_paths {
+            let settings_path = client_settings.join("ClientAppSettings.json");
+
+            let result = (|| -> Result<()> {
+                if !settings_path.try_exists()? {
+                    return Ok(());
+                }
+                let mut settings = Self::read_client_app_settings(&settings_path)?;
+
+                // Remove all ultraboost FFlags
+                for (key, _) in Self::ULTRABOOST_FFLAGS {
+                    settings.remove(*key);
+                }
+
+                settings.remove(Self::FPS_UNLOCK_FFLAG);
+
+                // Remove old blocked FFlags (legacy cleanup)
+                for key in Self::LEGACY_BLOCKED_FFLAGS {
+                    settings.remove(*key);
+                }
+                for key in Self::REMOVED_ULTRABOOST_FFLAGS {
+                    settings.remove(*key);
+                }
+
+                if settings.is_empty() {
+                    fs::remove_file(&settings_path)?;
+                    Self::remove_empty_bootstrapper_client_settings_dir(&client_settings)?;
+                } else {
+                    let json = serde_json::to_string_pretty(&settings)?;
+                    self.replace_settings_file(&settings_path, json.as_bytes())?;
+                }
+                Ok(())
+            })();
+
+            match result {
+                Ok(()) => {
+                    info!("FFlag optimizations removed from ClientAppSettings.json");
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to remove FFlags from {}: {}",
+                        settings_path.display(),
+                        e
+                    );
+                    failures.push(format!("{}: {}", settings_path.display(), e));
+                }
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "Failed to remove FFlags from {} ClientSettings path(s): {}",
+                failures.len(),
+                failures.join("; ")
+            ))
+        }
+    }
+
+    fn remove_empty_bootstrapper_client_settings_dir(client_settings: &Path) -> Result<()> {
+        if !Self::is_supported_bootstrapper_client_settings_path(client_settings) {
+            return Ok(());
+        }
+
+        match fs::remove_dir(client_settings) {
+            Ok(()) => {
+                info!(
+                    "Removed empty bootstrapper ClientSettings folder at: {:?}",
+                    client_settings
+                );
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn is_supported_bootstrapper_client_settings_path(client_settings: &Path) -> bool {
+        Self::BOOTSTRAPPER_CLIENT_SETTINGS_LOCATIONS.iter().any(
+            |(project_name, relative_segments)| {
+                let mut suffix = PathBuf::from(project_name);
+                for segment in *relative_segments {
+                    suffix.push(segment);
+                }
+                client_settings.ends_with(suffix)
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn remove_all_fflags_for_local_app_data(&self, local_app_data: &Path) -> Result<()> {
+        let client_settings_paths =
+            Self::get_client_settings_paths_for_local_app_data(local_app_data, false)?;
+        self.remove_all_fflags_in_paths(client_settings_paths)
+    }
+
+    /// Reapply saved Ultraboost client-side state after Roblox creates a new version folder.
+    pub fn reapply_saved_client_fflags(&self, config: &RobloxSettingsConfig) -> Result<()> {
+        self.apply_client_fflags(config)?;
+        Ok(())
+    }
+}
+
+impl Default for RobloxOptimizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RobloxOptimizer {
+    /// Undo everything SwiftTunnel did to Roblox, on uninstall.
+    ///
+    /// This used to strip the FFlags and clear the GPU preference and stop
+    /// there, which left the half of our changes that lives in
+    /// GlobalBasicSettings: the graphics quality level and the frame cap. Those
+    /// sit above the version folders, so nothing else ever cleared them, and a
+    /// player who ran Ultraboost kept its forced quality level for good. That is
+    /// the shape of the render-distance reports: uninstalling did not give the
+    /// client back.
+    ///
+    /// `reset_swifttunnel_changes` is the same routine behind the Repair tab's
+    /// reset, so uninstall and that button now do the same thing rather than
+    /// two different partial jobs. Errors are logged and swallowed so the rest
+    /// of uninstall proceeds.
+    pub fn cleanup_for_uninstall() {
+        info!("Roblox optimizer: undoing Roblox changes for uninstall");
+        let optimizer = Self::new();
+        if let Err(e) = optimizer.reset_swifttunnel_changes() {
+            warn!("Failed to undo Roblox changes during uninstall: {e}");
+        }
+        info!("Roblox optimizer: uninstall cleanup completed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recorded_launcher_directory_cannot_follow_the_apps_working_directory() {
+        assert!(RobloxOptimizer::recorded_launcher_directory(".").is_none());
+        assert!(RobloxOptimizer::recorded_launcher_directory("..").is_none());
+    }
+
+    #[test]
+    fn recorded_launcher_directory_accepts_existing_absolute_folders_only() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Fixture(std::env::temp_dir().join(format!(
+            "swift-launcher-root-{:032x}",
+            rand::random::<u128>()
+        )));
+        fs::create_dir(&root.0).unwrap();
+        assert_eq!(
+            RobloxOptimizer::recorded_launcher_directory(&format!(" {} ", root.0.display())),
+            Some(root.0.clone())
+        );
+        let child = root.0.join("child");
+        fs::create_dir(&child).unwrap();
+        assert!(
+            RobloxOptimizer::recorded_launcher_directory(child.join("..").to_str().unwrap())
+                .is_none()
+        );
+        let file = root.0.join("settings.json");
+        fs::write(&file, b"{}").unwrap();
+        assert!(RobloxOptimizer::recorded_launcher_directory(file.to_str().unwrap()).is_none());
+        assert!(
+            RobloxOptimizer::recorded_launcher_directory(root.0.join("missing").to_str().unwrap())
+                .is_none()
+        );
+    }
+    #[test]
+    fn launcher_import_keeps_supported_flags_and_explains_every_skipped_value() {
+        let report = RobloxOptimizer::preview_flag_import(
+            "Fishstrap",
+            r#"{
+            "FFlagDebugGraphicsPreferD3D11": true,
+            "FIntDebugForceMSAASamples": "not a number",
+            "FFlagImaginaryPerformanceBoost": true,
+            "DFIntTaskSchedulerTargetFps": 240
+        }"#,
+        );
+        assert!(report.error.is_none());
+        assert_eq!(report.accepted, 1);
+        assert_eq!(report.skipped.len(), 3);
+        assert_eq!(
+            RobloxOptimizer::validate_custom_fflags(&report.json).unwrap(),
+            1
+        );
+        assert!(!report.json.contains("Imaginary"));
+        assert!(!report.json.contains("TaskScheduler"));
+    }
+    #[test]
+    fn launcher_import_reads_utf8_bom_files_and_never_accepts_a_non_object() {
+        let report = RobloxOptimizer::preview_flag_import(
+            "Froststrap",
+            "\u{feff}{\"FFlagDebugGraphicsPreferD3D11\":true}",
+        );
+        assert_eq!(report.accepted, 1);
+        for raw in ["broken", "[]", "null"] {
+            let report = RobloxOptimizer::preview_flag_import("Bloxstrap", raw);
+            assert!(report.error.is_some());
+            assert_eq!(report.accepted, 0);
+        }
+    }
+
+    /// The fingerprint changes exactly when a client is added or removed.
+    ///
+    /// That is what tells the version watcher a Roblox update landed and threw
+    /// the FFlags away, so it has to be stable for an unchanged install and
+    /// different for a changed one. Order must not matter: the folder listing
+    /// is sorted by modification time, so an untouched install can come back in
+    /// a different order and would otherwise trigger a pointless reapply.
+    #[test]
+    fn the_install_fingerprint_tracks_which_versions_exist() {
+        let a = PathBuf::from(r"C:\x\Roblox\Versions\version-aaa");
+        let b = PathBuf::from(r"C:\x\Roblox\Versions\version-bbb");
+        let c = PathBuf::from(r"C:\x\Bloxstrap\Versions\version-ccc");
+
+        let before = RobloxOptimizer::fingerprint_of(&[a.clone(), b.clone()]);
+
+        assert_eq!(
+            before,
+            RobloxOptimizer::fingerprint_of(&[b.clone(), a.clone()]),
+            "order must not matter, the listing is by modification time"
+        );
+        assert_ne!(
+            before,
+            RobloxOptimizer::fingerprint_of(&[a.clone(), b.clone(), c]),
+            "a new version folder is an update, and must be noticed"
+        );
+        assert_ne!(
+            before,
+            RobloxOptimizer::fingerprint_of(&[a]),
+            "a removed one must be noticed too"
+        );
+        assert_eq!(
+            RobloxOptimizer::fingerprint_of(&[]),
+            "",
+            "no install at all is stable rather than a panic"
+        );
+    }
+
+    #[test]
+    fn the_install_fingerprint_tracks_the_location_of_each_copy_of_a_build() {
+        let a = PathBuf::from(r"C:\x\Roblox\Versions\version-aaa");
+        let b = PathBuf::from(r"D:\Fishstrap\Versions\version-aaa");
+        let moved = PathBuf::from(r"E:\Fishstrap\Versions\version-aaa");
+        assert_ne!(
+            RobloxOptimizer::fingerprint_of(&[a.clone(), b]),
+            RobloxOptimizer::fingerprint_of(&[a.clone(), moved]),
+            "moving a same-build installation changes the files needing flags"
+        );
+        assert_eq!(
+            RobloxOptimizer::fingerprint_of(std::slice::from_ref(&a)),
+            RobloxOptimizer::fingerprint_of(&[a.clone(), a]),
+            "duplicate launcher registrations must not trigger reapplication"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_install_fingerprint_ignores_windows_path_casing_and_separator_style() {
+        assert_eq!(
+            RobloxOptimizer::fingerprint_of(&[PathBuf::from(r"D:\Fishstrap\Versions\version-aaa")]),
+            RobloxOptimizer::fingerprint_of(&[PathBuf::from("d:/FISHSTRAP/versions/version-aaa")]),
+        );
+    }
+
+    /// A Bloxstrap player's Roblox must be found.
+    ///
+    /// From a real ticket: "fps not increased". Their log showed us creating
+    /// ClientSettings under three `\Roblox\Versions\` folders while the game
+    /// they launched lived under `\Bloxstrap\Versions\`. Every write landed
+    /// somewhere their Roblox never reads, and nothing reported a problem
+    /// because nothing had failed.
+    #[test]
+    fn a_bootstrapper_install_is_found() {
+        let base = std::env::temp_dir().join(format!(
+            "swifttunnel-roots-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let make = |root: &str, version: &str| {
+            let dir = base.join(root).join("Versions").join(version);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("RobloxPlayerBeta.exe"), b"stub").unwrap();
+            dir
+        };
+
+        let bloxstrap = make("Bloxstrap", "version-aaaa");
+        let found = RobloxOptimizer::find_roblox_version_folders_in(&base);
+
+        assert!(
+            found.contains(&bloxstrap),
+            "a Bloxstrap install must be found, got {found:?}"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A plain install still works, and both are found when both exist.
+    #[test]
+    fn a_plain_install_is_still_found_alongside_a_launcher() {
+        let base = std::env::temp_dir().join(format!(
+            "swifttunnel-roots-both-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let make = |root: &str, version: &str| {
+            let dir = base.join(root).join("Versions").join(version);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("RobloxPlayerBeta.exe"), b"stub").unwrap();
+            dir
+        };
+
+        let vanilla = make("Roblox", "version-bbbb");
+        let fishstrap = make("Fishstrap", "version-cccc");
+
+        let found = RobloxOptimizer::find_roblox_version_folders_in(&base);
+        assert!(
+            found.contains(&vanilla),
+            "the plain install must still count"
+        );
+        assert!(found.contains(&fishstrap), "Fishstrap must count too");
+        assert_eq!(found.len(), 2);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A directory without the executable is not a Roblox install.
+    #[test]
+    fn a_version_folder_without_roblox_is_ignored() {
+        let base = std::env::temp_dir().join(format!(
+            "swifttunnel-roots-empty-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(base.join("Bloxstrap").join("Versions").join("version-dddd")).unwrap();
+
+        assert!(
+            RobloxOptimizer::find_roblox_version_folders_in(&base).is_empty(),
+            "a version folder with no RobloxPlayerBeta.exe is not an install"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Removal must not need a working Roblox to remove from.
+    ///
+    /// From the render-distance ticket: the player reset their Roblox files and
+    /// uninstalled SwiftTunnel, and the flags stayed. Cleanup reused the
+    /// writing path, which only counts a version folder that still has
+    /// `RobloxPlayerBeta.exe` beside it, so it walked past the settings file it
+    /// existed to delete and logged success. The flags then survived into the
+    /// next Roblox install, with the app that wrote them already gone.
+    #[test]
+    fn removal_finds_settings_in_a_version_folder_with_no_executable() {
+        let base = std::env::temp_dir().join(format!(
+            "swifttunnel-removal-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let versions = base.join("Roblox").join("Versions");
+
+        // Gutted by a Roblox reset: settings still there, executable gone.
+        let orphaned = versions.join("version-dead").join("ClientSettings");
+        fs::create_dir_all(&orphaned).unwrap();
+        fs::write(orphaned.join("ClientAppSettings.json"), "{}").unwrap();
+
+        // A live install, which the writing path would also have found.
+        let live_version = versions.join("version-live");
+        let live = live_version.join("ClientSettings");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live_version.join("RobloxPlayerBeta.exe"), b"stub").unwrap();
+
+        // Not ours, and not a version folder.
+        fs::create_dir_all(versions.join("Downloads").join("ClientSettings")).unwrap();
+
+        let mut found = Vec::new();
+        RobloxOptimizer::collect_removal_client_settings_in(&versions, &mut found);
+
+        assert!(
+            found.contains(&orphaned),
+            "a version folder with no executable must still be cleaned, got {found:?}"
+        );
+        assert!(
+            found.contains(&live),
+            "a live install must still be cleaned"
+        );
+        assert_eq!(found.len(), 2, "only version- folders count, got {found:?}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// No ClientSettings folder means nothing to remove, and nothing to create.
+    ///
+    /// Removal must never bring a settings directory into existence: an empty
+    /// `ClientSettings` in a Roblox install is not harmless, it is a folder the
+    /// player did not ask for in software we are in the middle of uninstalling.
+    #[test]
+    fn removal_does_not_create_missing_settings_folders() {
+        let base = std::env::temp_dir().join(format!(
+            "swifttunnel-removal-empty-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let versions = base.join("Roblox").join("Versions");
+        let version = versions.join("version-bare");
+        fs::create_dir_all(&version).unwrap();
+
+        let mut found = Vec::new();
+        RobloxOptimizer::collect_removal_client_settings_in(&versions, &mut found);
+
+        assert!(found.is_empty(), "nothing to clean, got {found:?}");
+        assert!(
+            !version.join("ClientSettings").exists(),
+            "removal must not create a ClientSettings folder"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A missing Versions directory is normal, not an error.
+    #[test]
+    fn removal_tolerates_a_launcher_that_is_not_installed() {
+        let mut found = Vec::new();
+        RobloxOptimizer::collect_removal_client_settings_in(
+            &std::env::temp_dir().join("swifttunnel-removal-absent-launcher-root"),
+            &mut found,
+        );
+        assert!(found.is_empty());
+    }
+
+    use std::fs;
+
+    /// Helper: create a RobloxOptimizer pointing at a specific path
+    fn optimizer_with_path(settings_path: PathBuf) -> RobloxOptimizer {
+        let backup_path = settings_path.with_extension("backup.xml");
+        RobloxOptimizer {
+            settings_path,
+            backup_path,
+        }
+    }
+
+    #[test]
+    fn full_reset_does_not_silently_replace_an_unreadable_original_with_defaults() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Fixture(std::env::temp_dir().join(format!(
+            "swift-reset-failure-{:016x}",
+            rand::random::<u64>()
+        )));
+        fs::create_dir(&dir.0).unwrap();
+        let settings = dir.0.join("GlobalBasicSettings.xml");
+        let original = r#"<Properties><int name="FramerateCap">400</int></Properties>"#;
+        fs::write(&settings, original).unwrap();
+        let optimizer = optimizer_with_path(settings.clone());
+        fs::create_dir(&optimizer.backup_path).unwrap();
+        assert!(optimizer.restore_global_basic_settings().is_err());
+        assert_eq!(fs::read_to_string(&settings).unwrap(), original);
+
+        fs::remove_dir(&optimizer.backup_path).unwrap();
+        fs::write(&settings, [0xff]).unwrap();
+        assert!(optimizer.restore_global_basic_settings().is_err());
+        assert_eq!(fs::read(&settings).unwrap(), [0xff]);
+
+        fs::write(&settings, original).unwrap();
+        assert!(optimizer.restore_global_basic_settings().unwrap());
+        assert!(
+            fs::read_to_string(&settings)
+                .unwrap()
+                .contains(r#"<int name="FramerateCap">60</int>"#)
+        );
+    }
+
+    #[test]
+    fn backup_restore_keeps_other_hardlinked_files_and_rejects_oversized_backups() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Fixture(std::env::temp_dir().join(format!(
+            "swift-restore-isolation-{:016x}",
+            rand::random::<u64>()
+        )));
+        fs::create_dir(&dir.0).unwrap();
+        let settings = dir.0.join("GlobalBasicSettings.xml");
+        let other = dir.0.join("keep.xml");
+        fs::write(&other, b"keep this file").unwrap();
+        fs::hard_link(&other, &settings).unwrap();
+        let optimizer = optimizer_with_path(settings.clone());
+        fs::write(&optimizer.backup_path, b"saved originals").unwrap();
+        optimizer
+            .reset_swifttunnel_changes_in_paths(vec![], || Ok(()))
+            .unwrap();
+        assert_eq!(fs::read(&other).unwrap(), b"keep this file");
+        assert_eq!(fs::read(&settings).unwrap(), b"saved originals");
+
+        let oversized = fs::File::create(&optimizer.backup_path).unwrap();
+        oversized.set_len(4 * 1024 * 1024 + 1).unwrap();
+        drop(oversized);
+        assert!(
+            optimizer
+                .reset_swifttunnel_changes_in_paths(vec![], || Ok(()))
+                .is_err()
+        );
+        assert_eq!(fs::read(&settings).unwrap(), b"saved originals");
+        assert_eq!(fs::read(&other).unwrap(), b"keep this file");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn xml_and_flag_edits_keep_live_bytes_when_atomic_replacement_is_blocked() {
+        use std::os::windows::fs::OpenOptionsExt;
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Fixture(std::env::temp_dir().join(format!(
+            "swift-roblox-edit-preserve-{:016x}",
+            rand::random::<u64>()
+        )));
+        fs::create_dir(&dir.0).unwrap();
+        let xml = dir.0.join("GlobalBasicSettings.xml");
+        let original = br#"<roblox><int name="FramerateCap">60</int></roblox>"#;
+        fs::write(&xml, original).unwrap();
+        let optimizer = optimizer_with_path(xml.clone());
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&xml)
+            .unwrap();
+        let config = RobloxSettingsConfig {
+            target_fps: 400,
+            window_width: 1280,
+            window_height: 720,
+            ..Default::default()
+        };
+        assert!(optimizer.apply_xml_settings(&xml, &config).is_err());
+        assert_eq!(fs::read(&xml).unwrap(), original);
+        assert!(optimizer.reapply_window_size(&config).is_err());
+        assert_eq!(fs::read(&xml).unwrap(), original);
+        drop(held);
+
+        let flags_dir = dir.0.join("ClientSettings");
+        fs::create_dir(&flags_dir).unwrap();
+        let flags = flags_dir.join("ClientAppSettings.json");
+        let original = format!(
+            r#"{{"UserFlag":true,"{}":"400"}}"#,
+            RobloxOptimizer::FPS_UNLOCK_FFLAG
+        );
+        fs::write(&flags, &original).unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&flags)
+            .unwrap();
+        let config = RobloxSettingsConfig {
+            custom_fflags_enabled: true,
+            custom_fflags_json: r#"{"FFlagDebugSkyGray":true}"#.into(),
+            ..Default::default()
+        };
+        assert!(
+            optimizer
+                .apply_client_fflags_in_path(&config, &flags_dir)
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(&flags).unwrap(), original);
+        assert!(
+            optimizer
+                .remove_all_fflags_in_paths(vec![flags_dir])
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(&flags).unwrap(), original);
+        drop(held);
+    }
+
+    #[test]
+    fn settings_edits_reject_oversized_output_and_keep_unmanaged_bom_flags() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Fixture(std::env::temp_dir().join(format!(
+            "swift-roblox-edit-bound-{:016x}",
+            rand::random::<u64>()
+        )));
+        fs::create_dir(&dir.0).unwrap();
+        let xml = dir.0.join("GlobalBasicSettings.xml");
+        let original = format!("<roblox>{}</roblox>", " ".repeat(4 * 1024 * 1024 - 17));
+        assert_eq!(original.len(), 4 * 1024 * 1024);
+        fs::write(&xml, &original).unwrap();
+        let optimizer = optimizer_with_path(xml.clone());
+        assert!(
+            optimizer
+                .apply_xml_settings(&xml, &RobloxSettingsConfig::default())
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(&xml).unwrap(), original);
+
+        let flags_dir = dir.0.join("ClientSettings");
+        fs::create_dir(&flags_dir).unwrap();
+        let flags = flags_dir.join("ClientAppSettings.json");
+        fs::write(&flags, "\u{feff}{\"UserFlag\":true}").unwrap();
+        let config = RobloxSettingsConfig {
+            custom_fflags_enabled: true,
+            custom_fflags_json: r#"{"FFlagDebugSkyGray":true}"#.into(),
+            ..Default::default()
+        };
+        optimizer
+            .apply_client_fflags_in_path(&config, &flags_dir)
+            .unwrap();
+        let written = RobloxOptimizer::read_client_app_settings(&flags).unwrap();
+        assert_eq!(written.get("UserFlag"), Some(&serde_json::json!(true)));
+        assert!(written.contains_key("FFlagDebugSkyGray"));
+    }
+
+    #[test]
+    fn global_reset_finishes_temporary_recovery_before_publishing_a_matching_value() {
+        use std::cell::Cell;
+        let fps = Cell::new(400);
+        let pending = Cell::new(true);
+        RobloxOptimizer::prepare_global_settings_reset_with(
+            || true,
+            || {
+                // The old temporary 400 FPS would restore to 600. A global
+                // reset also choosing 400 must happen after this record clears.
+                if pending.replace(false) && fps.get() == 400 {
+                    fps.set(600);
+                }
+                Ok(true)
+            },
+            || pending.get(),
+        )
+        .unwrap();
+        assert_eq!(fps.get(), 600);
+        fps.set(400);
+        if pending.get() && fps.get() == 400 {
+            fps.set(600);
+        }
+        assert_eq!(
+            fps.get(),
+            400,
+            "later recovery must not undo the user's reset"
+        );
+    }
+
+    #[test]
+    fn global_reset_stops_before_mutations_when_player_or_recovery_is_not_ready() {
+        assert!(
+            RobloxOptimizer::prepare_global_settings_reset_with(
+                || false,
+                || panic!("do not restore under a running player"),
+                || panic!("no recovery was started"),
+            )
+            .is_err()
+        );
+        let failure = RobloxOptimizer::prepare_global_settings_reset_with(
+            || true,
+            || Err("fixture unreadable recovery".into()),
+            || panic!("keep the recovery error"),
+        )
+        .unwrap_err();
+        assert_eq!(failure.to_string(), "fixture unreadable recovery");
+        assert!(
+            RobloxOptimizer::prepare_global_settings_reset_with(|| true, || Ok(false), || true,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn repair_reset_reports_failed_steps_and_continues_other_cleanup() {
+        let dir = std::env::temp_dir().join(format!(
+            "st-repair-reports_failed_steps_and_continues_other_cleanup-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let settings = dir.join("GlobalBasicSettings.xml");
+        fs::write(&settings, "changed").unwrap();
+        let opt = optimizer_with_path(settings.clone());
+        fs::write(&opt.backup_path, "original").unwrap();
+        let flags = dir.join("ClientSettings");
+        fs::create_dir(&flags).unwrap();
+        fs::write(flags.join("ClientAppSettings.json"), "invalid JSON").unwrap();
+        let error = opt
+            .reset_swifttunnel_changes_in_paths(vec![flags], || {
+                anyhow::bail!("registry unavailable")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Could not remove FFlags"));
+        assert!(error.contains("registry unavailable"));
+        assert_eq!(fs::read_to_string(settings).unwrap(), "original");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repair_reset_reports_backup_copy_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "st-repair-reports_backup_copy_failure-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let settings = dir.join("GlobalBasicSettings.xml");
+        fs::create_dir(&settings).unwrap(); // An existing directory cannot be replaced by copy.
+        let opt = optimizer_with_path(settings);
+        fs::write(&opt.backup_path, "original").unwrap();
+        let mut gpu_attempted = false;
+        let result = opt.reset_swifttunnel_changes_in_paths(vec![], || {
+            gpu_attempted = true;
+            Ok(())
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Could not restore settings backup")
+        );
+        assert!(gpu_attempted);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repair_reset_restores_backup_and_removes_only_owned_flags() {
+        let dir = std::env::temp_dir().join(format!(
+            "st-repair-restores_backup_and_removes_only_owned_flags-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let settings = dir.join("GlobalBasicSettings.xml");
+        fs::write(&settings, "changed").unwrap();
+        let opt = optimizer_with_path(settings.clone());
+        fs::write(&opt.backup_path, "original").unwrap();
+        let flags = dir.join("ClientSettings");
+        fs::create_dir(&flags).unwrap();
+        let file = flags.join("ClientAppSettings.json");
+        fs::write(
+            &file,
+            serde_json::json!({
+                RobloxOptimizer::FPS_UNLOCK_FFLAG: "240",
+                "UserFlag": "keep"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        opt.reset_swifttunnel_changes_in_paths(vec![flags], || Ok(()))
+            .unwrap();
+        assert_eq!(fs::read_to_string(settings).unwrap(), "original");
+        let remaining: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(file).unwrap()).unwrap();
+        assert_eq!(remaining, serde_json::json!({"UserFlag": "keep"}));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_settings_are_rejected_before_creating_a_backup() {
+        use std::io::Write;
+        let dir =
+            std::env::temp_dir().join(format!("swift-backup-bound-{:016x}", rand::random::<u64>()));
+        fs::create_dir(&dir).unwrap();
+        let settings = dir.join("GlobalBasicSettings_13.xml");
+        let mut source = fs::File::create(&settings).unwrap();
+        source.write_all(b"<roblox>").unwrap();
+        source.set_len(4 * 1024 * 1024 + 1).unwrap();
+        drop(source);
+        let optimizer = optimizer_with_path(settings.clone());
+        let result = optimizer.backup_settings_for(&settings);
+        let backup_exists = optimizer.backup_path.exists();
+        let unchanged_size = fs::metadata(&settings).unwrap().len();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            result.is_err(),
+            "Oversized settings must fail before taking a backup"
+        );
+        assert!(!backup_exists);
+        assert_eq!(unchanged_size, 4 * 1024 * 1024 + 1);
+    }
+
+    /// The backup is the original, not the previous apply.
+    ///
+    /// Uninstall restores from this file. While every apply overwrote it, the
+    /// second apply captured the first one's forced quality level, so restoring
+    /// handed the player SwiftTunnel's own settings back and called them their
+    /// originals. Undoing has to reach past everything we did, not just the
+    /// last of it.
+    #[test]
+    fn the_backup_keeps_the_settings_from_before_swifttunnel_touched_them() {
+        let dir = std::env::temp_dir().join(format!(
+            "swifttunnel-backup-once-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let settings = dir.join("GlobalBasicSettings_13.xml");
+
+        let original = r#"<roblox><token name="SavedQualityLevel">10</token></roblox>"#;
+        fs::write(&settings, original).unwrap();
+
+        let optimizer = optimizer_with_path(settings.clone());
+        optimizer.backup_settings_for(&settings).unwrap();
+
+        // SwiftTunnel forces the quality down, then applies a second time.
+        fs::write(
+            &settings,
+            r#"<roblox><token name="SavedQualityLevel">1</token></roblox>"#,
+        )
+        .unwrap();
+        optimizer.backup_settings_for(&settings).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&optimizer.backup_path).unwrap(),
+            original,
+            "the second apply must not overwrite the original with its own output"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A full reset puts the forced values back to Roblox's own defaults.
+    ///
+    /// Without a backup there is nothing to restore, and the file still holds
+    /// a graphics level something forced down. These three are the ones any
+    /// performance preset writes, so these three are the ones that go back.
+    #[test]
+    fn a_reset_puts_the_forced_values_back_to_roblox_defaults() {
+        let optimizer = optimizer_with_path(PathBuf::from("unused.xml"));
+        let forced = r#"<roblox><int name="FramerateCap">650</int><int name="GraphicsQualityLevel">1</int><token name="SavedQualityLevel">1</token><int name="MasterVolume">3</int></roblox>"#;
+
+        let reset = RobloxOptimizer::reset_forced_xml_values(forced, &optimizer);
+
+        assert_eq!(
+            RobloxOptimizer::extract_int_value(&reset, "FramerateCap"),
+            Some(60)
+        );
+        assert_eq!(
+            RobloxOptimizer::extract_int_value(&reset, "GraphicsQualityLevel"),
+            Some(0)
+        );
+        assert_eq!(
+            RobloxOptimizer::extract_int_value(&reset, "SavedQualityLevel"),
+            Some(0)
+        );
+        // Volume, sensitivity and keybinds live in the same file and are none
+        // of our business. Deleting the file to be thorough would take them.
+        assert_eq!(
+            RobloxOptimizer::extract_int_value(&reset, "MasterVolume"),
+            Some(3),
+            "a reset must not touch settings nothing forced"
+        );
+    }
+
+    /// Closing Roblox ends more than detecting it looks for.
+    ///
+    /// The crash handler is the reason "I closed Roblox" is so often untrue, so
+    /// a reset has to end it. It must not count as the client though: if
+    /// `is_roblox_running` returned true for a leftover helper, the app would
+    /// offer to restart a game that is not running and the boost bar would
+    /// insist on a restart nobody needs.
+    #[test]
+    fn closing_roblox_ends_the_crash_handler_but_it_is_not_the_client() {
+        assert!(!RobloxOptimizer::ROBLOX_CLIENT_PROCESSES.contains(&"Windows10Universal.exe"));
+        assert!(!RobloxOptimizer::ROBLOX_PROCESSES_TO_KILL.contains(&"Windows10Universal.exe"));
+        assert!(!RobloxOptimizer::ROBLOX_PROCESSES_TO_KILL.contains(&"RobloxStudioBeta.exe"));
+        for name in RobloxOptimizer::ROBLOX_CLIENT_PROCESSES {
+            assert!(
+                RobloxOptimizer::ROBLOX_PROCESSES_TO_KILL.contains(name),
+                "{name} counts as Roblox running but would be left alive"
+            );
+        }
+        assert!(
+            RobloxOptimizer::ROBLOX_PROCESSES_TO_KILL.contains(&"RobloxCrashHandler.exe"),
+            "the crash handler outlives the client and must be ended with it"
+        );
+        assert!(
+            !RobloxOptimizer::ROBLOX_CLIENT_PROCESSES.contains(&"RobloxCrashHandler.exe"),
+            "a leftover crash handler is not a game in progress"
+        );
+    }
+
+    /// The report names the launcher, because that is what the player installed.
+    #[test]
+    fn a_reset_names_the_launcher_each_file_came_from() {
+        assert_eq!(
+            RobloxOptimizer::describe_client_settings_source(&PathBuf::from(
+                r"C:\Users\evelyn\AppData\Local\Bloxstrap\Modifications\ClientSettings"
+            )),
+            Some("Bloxstrap".to_string())
+        );
+        assert_eq!(
+            RobloxOptimizer::describe_client_settings_source(&PathBuf::from(
+                r"C:\Users\evelyn\AppData\Local\Roblox\Versions\version-aaa\ClientSettings"
+            )),
+            Some("Roblox".to_string()),
+            "a plain install is still worth naming"
+        );
+    }
+
+    // ── extract_int_value ───────────────────────────────────────────
+
+    #[test]
+    fn extract_int_value_parses_int_tag() {
+        let xml = r#"<roblox><int name="FramerateCap">144</int></roblox>"#;
+        assert_eq!(
+            RobloxOptimizer::extract_int_value(xml, "FramerateCap"),
+            Some(144)
+        );
+    }
+
+    #[test]
+    fn extract_int_value_returns_none_for_missing_field() {
+        let xml = r#"<roblox><int name="FramerateCap">60</int></roblox>"#;
+        assert_eq!(RobloxOptimizer::extract_int_value(xml, "NonExistent"), None);
+    }
+
+    #[test]
+    fn extract_int_value_parses_token_tag() {
+        let xml = r#"<roblox><token name="SavedQualityLevel">7</token></roblox>"#;
+        assert_eq!(
+            RobloxOptimizer::extract_int_value(xml, "SavedQualityLevel"),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn extract_int_value_returns_none_for_non_numeric() {
+        let xml = r#"<roblox><int name="FramerateCap">abc</int></roblox>"#;
+        assert_eq!(
+            RobloxOptimizer::extract_int_value(xml, "FramerateCap"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_int_value_handles_whitespace() {
+        let xml = r#"<roblox><int name="FramerateCap">  240  </int></roblox>"#;
+        assert_eq!(
+            RobloxOptimizer::extract_int_value(xml, "FramerateCap"),
+            Some(240)
+        );
+    }
+
+    // ── extract_bool_value ──────────────────────────────────────────
+
+    #[test]
+    fn extract_bool_value_parses_true() {
+        let xml = r#"<roblox><bool name="Fullscreen">true</bool></roblox>"#;
+        assert_eq!(
+            RobloxOptimizer::extract_bool_value(xml, "Fullscreen"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn extract_bool_value_parses_false() {
+        let xml = r#"<roblox><bool name="Fullscreen">false</bool></roblox>"#;
+        assert_eq!(
+            RobloxOptimizer::extract_bool_value(xml, "Fullscreen"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn extract_bool_value_case_insensitive() {
+        let xml = r#"<roblox><bool name="Fullscreen">True</bool></roblox>"#;
+        assert_eq!(
+            RobloxOptimizer::extract_bool_value(xml, "Fullscreen"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn extract_bool_value_returns_none_for_missing() {
+        let xml = r#"<roblox><bool name="Fullscreen">true</bool></roblox>"#;
+        assert_eq!(RobloxOptimizer::extract_bool_value(xml, "Missing"), None);
+    }
+
+    // ── extract_vector2_value ───────────────────────────────────────
+
+    #[test]
+    fn extract_vector2_value_parses_window_size() {
+        let xml = r#"<roblox>
+            <Vector2 name="StartScreenSize">
+                <X>1920</X>
+                <Y>1080</Y>
+            </Vector2>
+        </roblox>"#;
+        assert_eq!(
+            RobloxOptimizer::extract_vector2_value(xml, "StartScreenSize"),
+            Some((1920, 1080))
+        );
+    }
+
+    #[test]
+    fn extract_vector2_value_returns_none_for_malformed_vector() {
+        let xml = r#"<roblox><Vector2 name="StartScreenSize"><X>1920</X></Vector2></roblox>"#;
+        assert_eq!(
+            RobloxOptimizer::extract_vector2_value(xml, "StartScreenSize"),
+            None
+        );
+    }
+
+    #[test]
+    fn overflowing_frame_caps_do_not_modify_settings_or_create_a_backup() {
+        for target in [i32::MAX as u32 + 1, u32::MAX] {
+            let dir = std::env::temp_dir()
+                .join(format!("swift-fps-overflow-{:016x}", rand::random::<u64>()));
+            fs::create_dir(&dir).unwrap();
+            let settings = dir.join("GlobalBasicSettings_13.xml");
+            let original = br#"<roblox><int name="FramerateCap">600</int></roblox>"#;
+            fs::write(&settings, original).unwrap();
+            let optimizer = optimizer_with_path(settings.clone());
+            let result = optimizer.apply_xml_settings(
+                &settings,
+                &RobloxSettingsConfig {
+                    unlock_fps: true,
+                    target_fps: target,
+                    ..Default::default()
+                },
+            );
+            let contents = fs::read(&settings).unwrap();
+            let backup_created = optimizer.backup_path.exists();
+            fs::remove_dir_all(&dir).unwrap();
+            assert!(
+                result.is_err(),
+                "FPS limit {target} must not wrap into a negative XML value"
+            );
+            assert_eq!(contents, original);
+            assert!(!backup_created);
+        }
+    }
+
+    #[test]
+    fn a_disabled_frame_cap_does_not_write_its_unused_large_value() {
+        let dir =
+            std::env::temp_dir().join(format!("swift-fps-disabled-{:016x}", rand::random::<u64>()));
+        fs::create_dir(&dir).unwrap();
+        let settings = dir.join("GlobalBasicSettings_13.xml");
+        fs::write(
+            &settings,
+            br#"<roblox><int name="FramerateCap">600</int></roblox>"#,
+        )
+        .unwrap();
+        let optimizer = optimizer_with_path(settings.clone());
+        let result = optimizer.apply_xml_settings(
+            &settings,
+            &RobloxSettingsConfig {
+                unlock_fps: false,
+                target_fps: u32::MAX,
+                ..Default::default()
+            },
+        );
+        let contents = fs::read_to_string(&settings).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(result.is_ok());
+        assert_eq!(
+            RobloxOptimizer::extract_int_value(&contents, "FramerateCap"),
+            Some(600)
+        );
+    }
+
+    /// The Cap field works in both directions.
+    ///
+    /// A version of this asserted the opposite, that applying must never lower
+    /// an existing higher cap. That guard was aimed at the on-by-default cap
+    /// writing its 300 over a machine already running 650, but it also meant
+    /// somebody typing 500 while sitting at 600 was silently ignored, which
+    /// makes the control a lie. Protecting the existing cap is
+    /// `sync_roblox_window_settings`' job, at startup, before anyone has typed
+    /// anything.
+    #[test]
+    fn applying_the_frame_cap_writes_exactly_what_was_asked_for() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fps_both_ways");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let settings_path = dir.join("GlobalBasicSettings_13.xml");
+        let opt = optimizer_with_path(settings_path.clone());
+
+        let cap_after = |target: u32| {
+            fs::write(
+                &settings_path,
+                r#"<roblox><int name="FramerateCap">600</int></roblox>"#,
+            )
+            .unwrap();
+            opt.apply_xml_settings(
+                &settings_path,
+                &RobloxSettingsConfig {
+                    unlock_fps: true,
+                    target_fps: target,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            RobloxOptimizer::extract_int_value(
+                &fs::read_to_string(&settings_path).unwrap(),
+                "FramerateCap",
+            )
+        };
+
+        assert_eq!(cap_after(30), Some(30));
+        assert_eq!(cap_after(99999), Some(99999));
+        assert_eq!(cap_after(900), Some(900), "raising must work");
+        assert_eq!(
+            cap_after(500),
+            Some(500),
+            "lowering must work too: 600 down to 500 is a player asking for 500"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── set_xml_int_value ───────────────────────────────────────────
+
+    #[test]
+    fn set_xml_int_value_replaces_existing() {
+        let xml = r#"<roblox><int name="FramerateCap">60</int></roblox>"#;
+        let opt = optimizer_with_path(PathBuf::from("dummy"));
+        let result = opt.set_xml_int_value(xml, "FramerateCap", 999);
+        assert_eq!(
+            result,
+            r#"<roblox><int name="FramerateCap">999</int></roblox>"#
+        );
+    }
+
+    #[test]
+    fn set_xml_int_value_returns_original_if_not_found() {
+        let xml = r#"<roblox><int name="FramerateCap">60</int></roblox>"#;
+        let opt = optimizer_with_path(PathBuf::from("dummy"));
+        let result = opt.set_xml_int_value(xml, "NonExistent", 123);
+        assert_eq!(result, xml);
+    }
+
+    #[test]
+    fn set_xml_vector2_value_upserts_start_screen_size() {
+        let xml = r#"<roblox><int name="FramerateCap">60</int></roblox>"#;
+        let opt = optimizer_with_path(PathBuf::from("dummy"));
+        let result = opt.set_xml_vector2_value(xml, "StartScreenSize", 1280, 720);
+        assert!(
+            result.contains(r#"<Vector2 name="StartScreenSize"><X>1280</X><Y>720</Y></Vector2>"#)
+        );
+    }
+
+    #[test]
+    fn reapply_window_size_overwrites_what_roblox_saved() {
+        // The reported bug: the Boost tab sets a size, Roblox writes its own
+        // window geometry back on exit, and the next launch uses Roblox's
+        // number. A real machine was found sitting at 1938x1038, which nothing
+        // in this app would ever write.
+        let dir = std::env::temp_dir().join(format!("st-reapply-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("GlobalBasicSettings_13.xml");
+        fs::write(
+            &path,
+            r#"<roblox><Vector2 name="StartScreenSize"><X>1938</X><Y>1038</Y></Vector2></roblox>"#,
+        )
+        .unwrap();
+
+        let opt = optimizer_with_path(path.clone());
+        let config = RobloxSettingsConfig {
+            window_width: 1280,
+            window_height: 720,
+            ..Default::default()
+        };
+
+        opt.reapply_window_size(&config).unwrap();
+
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains(r#"<Vector2 name="StartScreenSize"><X>1280</X><Y>720</Y></Vector2>"#),
+            "the configured size should replace whatever Roblox saved, got: {after}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reapply_window_size_is_silent_when_nothing_changed() {
+        // Runs on every Roblox exit, so it must not rewrite a file that already
+        // holds the right value and churn the disk for no reason.
+        let dir = std::env::temp_dir().join(format!("st-reapply-noop-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("GlobalBasicSettings_13.xml");
+        let opt = optimizer_with_path(path.clone());
+        let config = RobloxSettingsConfig {
+            window_width: 1280,
+            window_height: 720,
+            window_fullscreen: false,
+            ..Default::default()
+        };
+
+        fs::write(
+            &path,
+            r#"<roblox><Vector2 name="StartScreenSize"><X>1280</X><Y>720</Y></Vector2><bool name="Fullscreen">false</bool></roblox>"#,
+        )
+        .unwrap();
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+
+        opt.reapply_window_size(&config).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "an unchanged file should not be rewritten"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reapply_window_size_does_nothing_without_a_settings_file() {
+        // Roblox not installed, or never run. Must not error on a background
+        // thread that fires after every Roblox exit.
+        let opt = optimizer_with_path(std::env::temp_dir().join("st-does-not-exist.xml"));
+        assert!(
+            opt.reapply_window_size(&RobloxSettingsConfig::default())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn set_xml_bool_value_upserts_when_missing() {
+        let xml = r#"<roblox><int name="FramerateCap">60</int></roblox>"#;
+        let opt = optimizer_with_path(PathBuf::from("dummy"));
+        let result = opt.set_xml_bool_value(xml, "Fullscreen", true);
+        assert!(result.contains(r#"<bool name="Fullscreen">true</bool>"#));
+    }
+
+    // ── graphics_quality_to_int ─────────────────────────────────────
+
+    #[test]
+    fn graphics_quality_to_int_all_variants() {
+        let opt = optimizer_with_path(PathBuf::from("dummy"));
+        assert_eq!(opt.graphics_quality_to_int(&GraphicsQuality::Automatic), 0);
+        assert_eq!(opt.graphics_quality_to_int(&GraphicsQuality::Manual), 0);
+        assert_eq!(opt.graphics_quality_to_int(&GraphicsQuality::Level1), 1);
+        assert_eq!(opt.graphics_quality_to_int(&GraphicsQuality::Level2), 2);
+        assert_eq!(opt.graphics_quality_to_int(&GraphicsQuality::Level3), 3);
+        assert_eq!(opt.graphics_quality_to_int(&GraphicsQuality::Level4), 4);
+        assert_eq!(opt.graphics_quality_to_int(&GraphicsQuality::Level5), 5);
+        assert_eq!(opt.graphics_quality_to_int(&GraphicsQuality::Level6), 6);
+        assert_eq!(opt.graphics_quality_to_int(&GraphicsQuality::Level7), 7);
+        assert_eq!(opt.graphics_quality_to_int(&GraphicsQuality::Level8), 8);
+        assert_eq!(opt.graphics_quality_to_int(&GraphicsQuality::Level9), 9);
+        assert_eq!(opt.graphics_quality_to_int(&GraphicsQuality::Level10), 10);
+    }
+
+    // ── sanitize_window_dimensions ──────────────────────────────────
+
+    #[test]
+    fn sanitize_window_dimensions_clamps_and_even_rounds() {
+        assert_eq!(
+            RobloxOptimizer::sanitize_window_dimensions(799, 2159),
+            (800, 2160)
+        );
+        assert_eq!(
+            RobloxOptimizer::sanitize_window_dimensions(3841, 601),
+            (3840, 602)
+        );
+    }
+
+    // ── find_settings_file ──────────────────────────────────────────
+
+    #[test]
+    fn find_settings_file_picks_highest_numbered() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_find");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Create files 5 and 10
+        fs::write(dir.join("GlobalBasicSettings_5.xml"), "a").unwrap();
+        fs::write(dir.join("GlobalBasicSettings_10.xml"), "b").unwrap();
+
+        let result = RobloxOptimizer::find_settings_file(&dir);
+        assert_eq!(result, dir.join("GlobalBasicSettings_10.xml"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_settings_file_falls_back_to_default() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fallback");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // No settings files exist
+        let result = RobloxOptimizer::find_settings_file(&dir);
+        assert_eq!(result, dir.join("GlobalBasicSettings_13.xml"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── read_current_settings ───────────────────────────────────────
+
+    #[test]
+    fn temporary_game_caps_do_not_become_global_preferences_during_reconciliation() {
+        let dir =
+            std::env::temp_dir().join(format!("swift-reconcile-profile-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.xml");
+        let opt = optimizer_with_path(path.clone());
+        let saved = RobloxSettingsConfig {
+            unlock_fps: true,
+            target_fps: 300,
+            ..Default::default()
+        };
+        for fps in [60, 144] {
+            fs::write(
+                &path,
+                format!("<roblox><int name=\"FramerateCap\">{fps}</int></roblox>"),
+            )
+            .unwrap();
+            assert_eq!(opt.reconcile_roblox_config(&saved, true), saved);
+            let external = opt.reconcile_roblox_config(&saved, false);
+            if fps == 60 {
+                assert!(!external.unlock_fps);
+            } else {
+                assert_eq!(external.target_fps, fps);
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_current_settings_parses_xml() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_read");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let xml = r#"<roblox>
+            <int name="FramerateCap">240</int>
+            <int name="GraphicsQualityLevel">8</int>
+            <bool name="Fullscreen">true</bool>
+            <Vector2 name="StartScreenSize">
+                <X>1919</X>
+                <Y>1081</Y>
+            </Vector2>
+        </roblox>"#;
+
+        let path = dir.join("settings.xml");
+        fs::write(&path, xml).unwrap();
+
+        let opt = optimizer_with_path(path);
+        let settings = opt.read_current_settings().unwrap();
+
+        assert_eq!(settings.fps_cap, 240);
+        assert_eq!(settings.graphics_quality, 8);
+        assert!(settings.fullscreen);
+        assert_eq!(settings.window_size, Some((1920, 1082)));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_current_settings_uses_defaults_for_missing() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_defaults");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let xml = r#"<roblox></roblox>"#;
+        let path = dir.join("settings.xml");
+        fs::write(&path, xml).unwrap();
+
+        let opt = optimizer_with_path(path);
+        let settings = opt.read_current_settings().unwrap();
+
+        assert_eq!(settings.fps_cap, 60);
+        assert_eq!(settings.graphics_quality, 5);
+        assert!(!settings.fullscreen);
+        assert_eq!(settings.window_size, None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_current_settings_never_wraps_a_negative_frame_cap() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-read-frame-cap-{:032x}",
+            rand::random::<u128>()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("settings.xml");
+        let opt = optimizer_with_path(path.clone());
+        let results: Vec<_> = [
+            (-1, 60),
+            (i32::MIN, 60),
+            (0, 0),
+            (240, 240),
+            (99999, 99999),
+            (i32::MAX, i32::MAX as u32),
+        ]
+        .into_iter()
+        .map(|(stored, expected)| {
+            fs::write(
+                &path,
+                format!(r#"<roblox><int name="FramerateCap">{stored}</int></roblox>"#),
+            )
+            .unwrap();
+            (
+                stored,
+                expected,
+                opt.read_current_settings().unwrap().fps_cap,
+            )
+        })
+        .collect();
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&dir).unwrap();
+        for (stored, expected, actual) in results {
+            assert_eq!(actual, expected, "stored frame cap {stored}");
+        }
+    }
+
+    #[test]
+    fn current_settings_use_the_saved_menu_quality_instead_of_the_engine_level() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-saved-quality-{:032x}",
+            rand::random::<u128>()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("settings.xml");
+        let opt = optimizer_with_path(path.clone());
+        let results: Vec<_> = [(0, 11), (10, 21), (5, 10), (7, 14)]
+            .into_iter()
+            .map(|(saved, engine)| {
+                fs::write(&path, format!(
+                    r#"<roblox><int name="GraphicsQualityLevel">{engine}</int><token name="SavedQualityLevel">{saved}</token></roblox>"#
+                )).unwrap();
+                (saved, opt.read_current_settings().unwrap().graphics_quality)
+            }).collect();
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&dir).unwrap();
+        for (saved, actual) in results {
+            assert_eq!(actual, saved, "saved quality preference must win");
+            assert_eq!(GraphicsQuality::from_level(actual).to_level(), saved);
+        }
+    }
+
+    #[test]
+    fn invalid_saved_quality_falls_back_to_supported_legacy_values() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-legacy-quality-{:032x}",
+            rand::random::<u128>()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("settings.xml");
+        let opt = optimizer_with_path(path.clone());
+        let mut results = Vec::new();
+        for (saved, engine, expected) in [(11, 8, 8), (-2, 0, 0), (99, 21, 5)] {
+            fs::write(&path, format!(
+                r#"<roblox><int name="GraphicsQualityLevel">{engine}</int><token name="SavedQualityLevel">{saved}</token></roblox>"#
+            )).unwrap();
+            results.push((
+                opt.read_current_settings().unwrap().graphics_quality,
+                expected,
+            ));
+        }
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&dir).unwrap();
+        for (actual, expected) in results {
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn read_current_settings_errors_if_path_is_not_file() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_unreadable_settings_path");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let missing_settings_path = dir.join("missing-settings.xml");
+        fs::create_dir_all(&missing_settings_path).unwrap();
+
+        let opt = optimizer_with_path(missing_settings_path);
+        assert!(opt.read_current_settings().is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_xml_settings_inserts_and_sanitizes_window_settings() {
+        let dir = std::env::temp_dir().join(format!(
+            "roblox-opt-test-apply-window-{:032x}",
+            rand::random::<u128>()
+        ));
+        fs::create_dir(&dir).unwrap();
+
+        let path = dir.join("settings.xml");
+        let xml = r#"<roblox>
+            <int name="FramerateCap">60</int>
+            <int name="GraphicsQualityLevel">5</int>
+            <token name="SavedQualityLevel">5</token>
+        </roblox>"#;
+        fs::write(&path, xml).unwrap();
+
+        let opt = optimizer_with_path(path.clone());
+        let config = RobloxSettingsConfig {
+            graphics_quality: GraphicsQuality::Level3,
+            unlock_fps: true,
+            target_fps: 240,
+            window_width: 799,
+            window_height: 601,
+            window_fullscreen: true,
+            ultraboost: false,
+            ..Default::default()
+        };
+
+        // Exercise only the private XML fixture. The full optimization entry
+        // point also updates installed FastFlags files and GPU preferences.
+        opt.apply_xml_settings(&path, &config).unwrap();
+
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.contains(r#"<int name="FramerateCap">240</int>"#));
+        assert!(updated.contains(r#"<int name="GraphicsQualityLevel">3</int>"#));
+        assert!(updated.contains(r#"<token name="SavedQualityLevel">3</token>"#));
+        assert!(
+            updated.contains(r#"<Vector2 name="StartScreenSize"><X>800</X><Y>602</Y></Vector2>"#)
+        );
+        assert!(updated.contains(r#"<bool name="Fullscreen">true</bool>"#));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_cleanup_skips_missing_roblox_version_when_ultraboost_off() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_missing_skip");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: false,
+            ..Default::default()
+        };
+
+        let outcome = opt.apply_client_fflags_for_local_app_data(&config, &dir);
+
+        assert_eq!(
+            outcome.unwrap(),
+            FFlagApplyOutcome::SkippedMissingRobloxVersion
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_apply_reports_missing_version_when_ultraboost_requested() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_missing_requested");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: true,
+            ..Default::default()
+        };
+
+        let result = opt.apply_client_fflags_for_local_app_data(&config, &dir);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("supported bootstrapper ClientSettings path")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_fflags_apply_allowlisted_json() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_custom_fflag_apply");
+        let _ = fs::remove_dir_all(&dir);
+        let client_settings = dir
+            .join("Bloxstrap")
+            .join("Modifications")
+            .join("ClientSettings");
+        fs::create_dir_all(&client_settings).unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            custom_fflags_enabled: true,
+            custom_fflags_json: r#"{
+                "FFlagDebugSkyGray": true,
+                "DFIntTextureQualityOverride": 0
+            }"#
+            .to_string(),
+            ..Default::default()
+        };
+
+        opt.apply_client_fflags_for_local_app_data(&config, &dir)
+            .unwrap();
+
+        let content = fs::read_to_string(client_settings.join("ClientAppSettings.json")).unwrap();
+        let settings: HashMap<String, serde_json::Value> = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            settings.get("FFlagDebugSkyGray"),
+            Some(&serde_json::json!("True"))
+        );
+        assert_eq!(
+            settings.get("DFIntTextureQualityOverride"),
+            Some(&serde_json::json!("0"))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editor_removes_stale_supported_overrides_but_keeps_unmanaged_flags() {
+        let dir =
+            std::env::temp_dir().join(format!("st-editor-flags-reset-{}", std::process::id()));
+        let client = dir.join("ClientSettings");
+        fs::create_dir_all(&client).unwrap();
+        let file = client.join("ClientAppSettings.json");
+        fs::write(
+            &file,
+            r#"{"DFFlagDisableDPIScale":"True","FFlagDebugSkyGray":"True","UserOtherFlag":"keep"}"#,
+        )
+        .unwrap();
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            custom_fflags_enabled: true,
+            custom_fflags_json: r#"{"FFlagDebugSkyGray":false}"#.into(),
+            ..Default::default()
+        };
+        opt.apply_client_fflags_in_path(&config, &client).unwrap();
+        let flags: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert!(flags.get("DFFlagDisableDPIScale").is_none());
+        assert_eq!(flags["FFlagDebugSkyGray"], "False");
+        assert_eq!(flags["UserOtherFlag"], "keep");
+        opt.apply_client_fflags_in_path(&RobloxSettingsConfig::default(), &client)
+            .unwrap();
+        let flags: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(flags, serde_json::json!({"UserOtherFlag":"keep"}));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn custom_fflags_reject_unknown_keys() {
+        let config = RobloxSettingsConfig {
+            custom_fflags_enabled: true,
+            custom_fflags_json: r#"{ "FFlagTotallyUnsafe": true }"#.to_string(),
+            ..Default::default()
+        };
+
+        let err = RobloxOptimizer::parse_custom_fflags(&config).unwrap_err();
+
+        // The list is SwiftTunnel's, not Roblox's. Saying otherwise sent
+        // somebody looking for the flag in Roblox's documentation, where it is
+        // perfectly legitimate.
+        let message = err.to_string();
+        assert!(message.contains("SwiftTunnel"), "{message}");
+        assert!(message.contains("FFlagTotallyUnsafe"), "{message}");
+    }
+
+    #[test]
+    fn custom_fflags_name_every_rejected_key() {
+        let config = RobloxSettingsConfig {
+            custom_fflags_enabled: true,
+            custom_fflags_json:
+                r#" { "FFlagNopeOne": true, "FFlagNopeTwo": true, "FFlagNopeThree": true } "#
+                    .to_string(),
+            ..Default::default()
+        };
+
+        let message = RobloxOptimizer::parse_custom_fflags(&config)
+            .unwrap_err()
+            .to_string();
+
+        // Reporting only the first meant correcting a file one key at a time,
+        // and alphabetical order rarely matched the order they were written in.
+        for key in ["FFlagNopeOne", "FFlagNopeThree", "FFlagNopeTwo"] {
+            assert!(message.contains(key), "{key} missing from: {message}");
+        }
+    }
+
+    #[test]
+    fn custom_fflags_explain_the_frame_cap_is_reserved() {
+        let config = RobloxSettingsConfig {
+            custom_fflags_enabled: true,
+            custom_fflags_json: r#" { "DFIntTaskSchedulerTargetFps": 240 } "#.to_string(),
+            ..Default::default()
+        };
+
+        let message = RobloxOptimizer::parse_custom_fflags(&config)
+            .unwrap_err()
+            .to_string();
+
+        // This one is refused because SwiftTunnel writes it from the Cap field,
+        // not because it is unsafe, and the wording has to say so or the advice
+        // reads as "your flag is bad" for a flag that plainly works.
+        assert!(message.contains("frame rate controls"), "{message}");
+        assert!(!message.contains("allowlist"), "{message}");
+    }
+
+    #[test]
+    fn custom_flag_json_numbers_and_boolean_text_match_the_editor() {
+        for raw in ["100.0", "1e2", "-1000000.0"] {
+            let config = RobloxSettingsConfig {
+                custom_fflags_enabled: true,
+                custom_fflags_json: format!(
+                    r#"{{"FIntGrassMovementReducedMotionFactor":{raw},"FFlagDebugSkyGray":" True "}}"#
+                ),
+                ..Default::default()
+            };
+            let flags = RobloxOptimizer::native_launch_flags(&config).unwrap();
+            assert_eq!(flags["FFlagDebugSkyGray"], "True");
+            assert_eq!(
+                flags["FIntGrassMovementReducedMotionFactor"],
+                if raw == "-1000000.0" {
+                    "-1000000"
+                } else {
+                    "100"
+                }
+            );
+        }
+        for raw in [
+            r#""1.0""#,
+            r#""1e2""#,
+            r#""0x10""#,
+            "1.5",
+            "1e30",
+            "-1000001.0",
+        ] {
+            assert!(
+                RobloxOptimizer::validate_custom_fflags(&format!(
+                    r#"{{"FIntGrassMovementReducedMotionFactor":{raw}}}"#
+                ))
+                .is_err(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_fflags_accept_official_allowlisted_dpi_scale_flag() {
+        let config = RobloxSettingsConfig {
+            custom_fflags_enabled: true,
+            custom_fflags_json: r#"{ "DFFlagDisableDPIScale": true }"#.to_string(),
+            ..Default::default()
+        };
+
+        let parsed = RobloxOptimizer::parse_custom_fflags(&config).unwrap();
+
+        assert_eq!(
+            parsed.get("DFFlagDisableDPIScale"),
+            Some(&"True".to_string())
+        );
+    }
+
+    #[test]
+    fn custom_fflags_reject_empty_json_when_enabled() {
+        let config = RobloxSettingsConfig {
+            custom_fflags_enabled: true,
+            custom_fflags_json: String::new(),
+            ..Default::default()
+        };
+
+        let err = RobloxOptimizer::parse_custom_fflags(&config).unwrap_err();
+
+        assert!(err.to_string().contains("Paste a JSON object"));
+    }
+
+    #[test]
+    fn custom_fflags_reject_ultraboost_overlap() {
+        let config = RobloxSettingsConfig {
+            ultraboost: true,
+            custom_fflags_enabled: true,
+            custom_fflags_json: r#"{ "FFlagDebugSkyGray": true }"#.to_string(),
+            ..Default::default()
+        };
+
+        let err = RobloxOptimizer::parse_custom_fflags(&config).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("either Ultraboost or Custom FFlag")
+        );
+    }
+
+    #[test]
+    fn fflag_apply_skips_missing_path_when_only_fps_unlock_requested() {
+        // FPS unlock no longer writes any FFlag (it uses GlobalBasicSettings
+        // `FramerateCap`), so requesting it with no Roblox version present is a
+        // graceful cleanup skip, not a hard error.
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_missing_fps");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            unlock_fps: true,
+            target_fps: 165,
+            ..Default::default()
+        };
+
+        let outcome = opt.apply_client_fflags_for_local_app_data(&config, &dir);
+
+        assert_eq!(
+            outcome.unwrap(),
+            FFlagApplyOutcome::SkippedMissingRobloxVersion
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_apply_strips_retired_fps_flag_but_keeps_user_flags() {
+        // Positive + negative: applying Ultraboost must remove a pre-existing
+        // retired FPS scheduler flag, while leaving unrelated user flags intact.
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_retired_fps");
+        let _ = fs::remove_dir_all(&dir);
+        let client_settings = dir
+            .join("Bloxstrap")
+            .join("Modifications")
+            .join("ClientSettings");
+        fs::create_dir_all(&client_settings).unwrap();
+        fs::write(
+            client_settings.join("ClientAppSettings.json"),
+            r#"{
+  "DFIntTaskSchedulerTargetFps": 240,
+  "FStringUserOwnedFlag": "keep-me"
+}"#,
+        )
+        .unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: true,
+            unlock_fps: true,
+            target_fps: 240,
+            ..Default::default()
+        };
+
+        opt.apply_client_fflags_for_local_app_data(&config, &dir)
+            .unwrap();
+
+        let content = fs::read_to_string(client_settings.join("ClientAppSettings.json")).unwrap();
+        let settings: HashMap<String, serde_json::Value> = serde_json::from_str(&content).unwrap();
+        assert!(
+            !settings.contains_key(RobloxOptimizer::FPS_UNLOCK_FFLAG),
+            "retired FPS scheduler flag must be stripped on apply"
+        );
+        assert_eq!(
+            settings.get("FStringUserOwnedFlag"),
+            Some(&serde_json::json!("keep-me")),
+            "unrelated user flags must be preserved"
+        );
+        assert_eq!(
+            settings.get("FFlagDebugGraphicsPreferD3D11"),
+            Some(&serde_json::json!("True"))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_apply_updates_bloxstrap_persistent_client_settings() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_bloxstrap");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("Bloxstrap")).unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: true,
+            unlock_fps: true,
+            target_fps: 165,
+            ..Default::default()
+        };
+
+        let outcome = opt.apply_client_fflags_for_local_app_data(&config, &dir);
+
+        assert_eq!(outcome.unwrap(), FFlagApplyOutcome::Applied);
+        let settings_path = dir
+            .join("Bloxstrap")
+            .join("Modifications")
+            .join("ClientSettings")
+            .join("ClientAppSettings.json");
+        let content = fs::read_to_string(settings_path).unwrap();
+        let settings: HashMap<String, serde_json::Value> = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            settings.get("FFlagDebugGraphicsPreferD3D11"),
+            Some(&serde_json::json!("True"))
+        );
+        assert!(
+            !settings.contains_key(RobloxOptimizer::FPS_UNLOCK_FFLAG),
+            "retired FPS scheduler flag must not be written"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_apply_removes_empty_bootstrapper_client_settings_folder_when_disabled() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_disable_empty_bootstrapper");
+        let _ = fs::remove_dir_all(&dir);
+        let client_settings = dir
+            .join("Bloxstrap")
+            .join("Modifications")
+            .join("ClientSettings");
+        fs::create_dir_all(&client_settings).unwrap();
+        fs::write(
+            client_settings.join("ClientAppSettings.json"),
+            r#"{
+  "FFlagDebugGraphicsPreferD3D11": "True",
+  "DFIntTaskSchedulerTargetFps": 165
+}"#,
+        )
+        .unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: false,
+            unlock_fps: false,
+            ..Default::default()
+        };
+
+        opt.apply_client_fflags_for_local_app_data(&config, &dir)
+            .unwrap();
+
+        assert!(!client_settings.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_apply_updates_known_non_bloxstrap_layouts() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_strap_layouts");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("Froststrap")).unwrap();
+        fs::create_dir_all(dir.join("Voidstrap")).unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: true,
+            ..Default::default()
+        };
+
+        opt.apply_client_fflags_for_local_app_data(&config, &dir)
+            .unwrap();
+
+        let froststrap_settings = dir
+            .join("Froststrap")
+            .join("ClientSettings")
+            .join("ClientAppSettings.json");
+        let voidstrap_settings = dir
+            .join("Voidstrap")
+            .join("VoidstrapMods")
+            .join("ClientSettings")
+            .join("ClientAppSettings.json");
+
+        assert!(
+            fs::read_to_string(froststrap_settings)
+                .unwrap()
+                .contains("FFlagDebugGraphicsPreferD3D11")
+        );
+        assert!(
+            fs::read_to_string(voidstrap_settings)
+                .unwrap()
+                .contains("FFlagDebugGraphicsPreferD3D11")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_apply_does_not_create_unknown_bootstrapper_paths() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_unknown_strap");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("MaybeStrap").join("Modifications")).unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: true,
+            ..Default::default()
+        };
+
+        let result = opt.apply_client_fflags_for_local_app_data(&config, &dir);
+
+        assert!(result.is_err());
+        assert!(
+            !dir.join("MaybeStrap")
+                .join("Modifications")
+                .join("ClientSettings")
+                .exists(),
+            "unsupported bootstrapper-looking folders must not be created"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_apply_keeps_roblox_version_when_bootstrapper_path_is_malformed() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_bad_strap_good_roblox");
+        let _ = fs::remove_dir_all(&dir);
+        let version_dir = dir.join("Roblox").join("Versions").join("version-good");
+        fs::create_dir_all(&version_dir).unwrap();
+        fs::write(version_dir.join("RobloxPlayerBeta.exe"), "").unwrap();
+        fs::create_dir_all(dir.join("Bloxstrap").join("Modifications")).unwrap();
+        fs::write(
+            dir.join("Bloxstrap")
+                .join("Modifications")
+                .join("ClientSettings"),
+            "not a directory",
+        )
+        .unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: true,
+            ..Default::default()
+        };
+
+        let outcome = opt.apply_client_fflags_for_local_app_data(&config, &dir);
+
+        assert_eq!(outcome.unwrap(), FFlagApplyOutcome::Applied);
+        let content = fs::read_to_string(
+            version_dir
+                .join("ClientSettings")
+                .join("ClientAppSettings.json"),
+        )
+        .unwrap();
+        assert!(content.contains("FFlagDebugGraphicsPreferD3D11"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_apply_reports_missing_when_only_roblox_path_is_malformed() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_clientsettings_file");
+        let _ = fs::remove_dir_all(&dir);
+        let version_dir = dir.join("Roblox").join("Versions").join("version-bad");
+        fs::create_dir_all(&version_dir).unwrap();
+        fs::write(version_dir.join("RobloxPlayerBeta.exe"), "").unwrap();
+        fs::write(version_dir.join("ClientSettings"), "not a directory").unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: true,
+            ..Default::default()
+        };
+
+        let result = opt.apply_client_fflags_for_local_app_data(&config, &dir);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("supported bootstrapper ClientSettings path")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_apply_keeps_bootstrapper_path_when_roblox_version_is_malformed() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_bad_roblox_good_strap");
+        let _ = fs::remove_dir_all(&dir);
+        let version_dir = dir.join("Roblox").join("Versions").join("version-bad");
+        fs::create_dir_all(&version_dir).unwrap();
+        fs::write(version_dir.join("RobloxPlayerBeta.exe"), "").unwrap();
+        fs::write(version_dir.join("ClientSettings"), "not a directory").unwrap();
+        fs::create_dir_all(dir.join("Bloxstrap")).unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: true,
+            ..Default::default()
+        };
+
+        let outcome = opt.apply_client_fflags_for_local_app_data(&config, &dir);
+
+        assert_eq!(outcome.unwrap(), FFlagApplyOutcome::Applied);
+        let content = fs::read_to_string(
+            dir.join("Bloxstrap")
+                .join("Modifications")
+                .join("ClientSettings")
+                .join("ClientAppSettings.json"),
+        )
+        .unwrap();
+        assert!(content.contains("FFlagDebugGraphicsPreferD3D11"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_apply_preserves_malformed_client_app_settings() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_malformed_json_apply");
+        let _ = fs::remove_dir_all(&dir);
+        let client_settings = dir
+            .join("Bloxstrap")
+            .join("Modifications")
+            .join("ClientSettings");
+        fs::create_dir_all(&client_settings).unwrap();
+        let settings_path = client_settings.join("ClientAppSettings.json");
+        fs::write(&settings_path, "{ this is not valid json").unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: true,
+            ..Default::default()
+        };
+
+        let result = opt.apply_client_fflags_for_local_app_data(&config, &dir);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Failed to parse"));
+        assert_eq!(
+            fs::read_to_string(settings_path).unwrap(),
+            "{ this is not valid json"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_apply_updates_all_valid_version_folders() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_all_versions");
+        let _ = fs::remove_dir_all(&dir);
+        let versions_dir = dir.join("Roblox").join("Versions");
+        let old_version = versions_dir.join("version-old");
+        let new_version = versions_dir.join("version-new");
+        fs::create_dir_all(&old_version).unwrap();
+        fs::create_dir_all(&new_version).unwrap();
+        fs::write(old_version.join("RobloxPlayerBeta.exe"), "").unwrap();
+        fs::write(new_version.join("RobloxPlayerBeta.exe"), "").unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: true,
+            ..Default::default()
+        };
+
+        let outcome = opt.apply_client_fflags_for_local_app_data(&config, &dir);
+
+        assert_eq!(outcome.unwrap(), FFlagApplyOutcome::Applied);
+        for version in [&old_version, &new_version] {
+            let settings_path = version
+                .join("ClientSettings")
+                .join("ClientAppSettings.json");
+            let content = fs::read_to_string(settings_path).unwrap();
+            assert!(content.contains("FFlagDebugGraphicsPreferD3D11"));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_apply_removes_retired_ultraboost_flags_when_enabled() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_retired_ultraboost");
+        let _ = fs::remove_dir_all(&dir);
+        let version = dir.join("Roblox").join("Versions").join("version-active");
+        let client_settings = version.join("ClientSettings");
+        fs::create_dir_all(&client_settings).unwrap();
+        fs::write(version.join("RobloxPlayerBeta.exe"), "").unwrap();
+        fs::write(
+            client_settings.join("ClientAppSettings.json"),
+            r#"{
+  "DFFlagDisableDPIScale": "True",
+  "FStringUserOwnedFlag": "keep-me"
+}"#,
+        )
+        .unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: true,
+            ..Default::default()
+        };
+
+        opt.apply_client_fflags_for_local_app_data(&config, &dir)
+            .unwrap();
+
+        let content = fs::read_to_string(client_settings.join("ClientAppSettings.json")).unwrap();
+        let settings: HashMap<String, serde_json::Value> = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            settings.get("FFlagDebugGraphicsPreferD3D11"),
+            Some(&serde_json::json!("True"))
+        );
+        assert!(!settings.contains_key("DFFlagDisableDPIScale"));
+        assert_eq!(
+            settings.get("FStringUserOwnedFlag"),
+            Some(&serde_json::json!("keep-me"))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_apply_upgrades_existing_ultraboost_texture_preset() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_upgrade_potato_preset");
+        let _ = fs::remove_dir_all(&dir);
+        let version = dir.join("Roblox").join("Versions").join("version-active");
+        let client_settings = version.join("ClientSettings");
+        fs::create_dir_all(&client_settings).unwrap();
+        fs::write(version.join("RobloxPlayerBeta.exe"), "").unwrap();
+        fs::write(
+            client_settings.join("ClientAppSettings.json"),
+            r#"{
+  "FFlagDebugGraphicsPreferD3D11": "True",
+  "FIntDebugForceMSAASamples": "0",
+  "FStringUserOwnedFlag": "keep-me"
+}"#,
+        )
+        .unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: true,
+            ..Default::default()
+        };
+
+        opt.apply_client_fflags_for_local_app_data(&config, &dir)
+            .unwrap();
+
+        let content = fs::read_to_string(client_settings.join("ClientAppSettings.json")).unwrap();
+        let settings: HashMap<String, serde_json::Value> = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            settings.get("DFFlagTextureQualityOverrideEnabled"),
+            Some(&serde_json::json!("True")),
+            "startup reapply must add the low-texture override for existing Ultraboost users"
+        );
+        assert_eq!(
+            settings.get("DFIntTextureQualityOverride"),
+            Some(&serde_json::json!("0")),
+            "startup reapply must pin Roblox to its lowest texture-quality preset"
+        );
+        assert_eq!(
+            settings.get("FIntDebugForceMSAASamples"),
+            Some(&serde_json::json!("1")),
+            "older Ultraboost installs using the ignored 0x MSAA value must migrate to 1x"
+        );
+        assert_eq!(
+            settings.get("FStringUserOwnedFlag"),
+            Some(&serde_json::json!("keep-me")),
+            "user-owned flags must survive the Ultraboost preset upgrade"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_apply_ignores_version_like_folder_without_player_exe() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_ignore_nearmiss");
+        let _ = fs::remove_dir_all(&dir);
+        let versions_dir = dir.join("Roblox").join("Versions");
+        let valid_version = versions_dir.join("version-valid");
+        let near_miss = versions_dir.join("version-without-player");
+        fs::create_dir_all(&valid_version).unwrap();
+        fs::create_dir_all(&near_miss).unwrap();
+        fs::write(valid_version.join("RobloxPlayerBeta.exe"), "").unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: true,
+            ..Default::default()
+        };
+
+        opt.apply_client_fflags_for_local_app_data(&config, &dir)
+            .unwrap();
+
+        assert!(
+            valid_version
+                .join("ClientSettings")
+                .join("ClientAppSettings.json")
+                .exists()
+        );
+        assert!(
+            !near_miss.join("ClientSettings").exists(),
+            "version-like folders without RobloxPlayerBeta.exe must not be repaired"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_apply_skips_broken_legacy_version_folder() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_skip_broken_legacy");
+        let _ = fs::remove_dir_all(&dir);
+        let versions_dir = dir.join("Roblox").join("Versions");
+        let broken_version = versions_dir.join("version-broken");
+        let good_version = versions_dir.join("version-good");
+
+        for version in [&broken_version, &good_version] {
+            fs::create_dir_all(version).unwrap();
+            fs::write(version.join("RobloxPlayerBeta.exe"), "").unwrap();
+        }
+        fs::write(broken_version.join("ClientSettings"), "not a directory").unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: true,
+            ..Default::default()
+        };
+
+        let outcome = opt.apply_client_fflags_for_local_app_data(&config, &dir);
+
+        assert_eq!(outcome.unwrap(), FFlagApplyOutcome::Applied);
+        let good_settings_path = good_version
+            .join("ClientSettings")
+            .join("ClientAppSettings.json");
+        let content = fs::read_to_string(good_settings_path).unwrap();
+        assert!(content.contains("FFlagDebugGraphicsPreferD3D11"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_apply_reports_success_when_only_older_version_write_fails() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_apply_secondary_error");
+        let _ = fs::remove_dir_all(&dir);
+        let active_settings = dir.join("active").join("ClientSettings");
+        let old_settings = dir.join("old").join("ClientSettings");
+        fs::create_dir_all(&active_settings).unwrap();
+        fs::create_dir_all(old_settings.join("ClientAppSettings.json")).unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: true,
+            ..Default::default()
+        };
+
+        let outcome =
+            opt.apply_client_fflags_in_paths(&config, vec![active_settings.clone(), old_settings]);
+
+        assert_eq!(outcome.unwrap(), FFlagApplyOutcome::Applied);
+        let content = fs::read_to_string(active_settings.join("ClientAppSettings.json")).unwrap();
+        assert!(content.contains("FFlagDebugGraphicsPreferD3D11"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fflag_apply_does_not_mask_active_version_write_failure() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_apply_primary_error");
+        let _ = fs::remove_dir_all(&dir);
+        let active_settings = dir.join("active").join("ClientSettings");
+        let old_settings = dir.join("old").join("ClientSettings");
+        fs::create_dir_all(active_settings.join("ClientAppSettings.json")).unwrap();
+        fs::create_dir_all(&old_settings).unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let config = RobloxSettingsConfig {
+            ultraboost: true,
+            ..Default::default()
+        };
+
+        let result = opt.apply_client_fflags_in_paths(&config, vec![active_settings, old_settings]);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("primary"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_all_fflags_cleans_every_version_and_preserves_user_flags() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_remove_all_versions");
+        let _ = fs::remove_dir_all(&dir);
+        let versions_dir = dir.join("Roblox").join("Versions");
+        let first_version = versions_dir.join("version-first");
+        let second_version = versions_dir.join("version-second");
+
+        for version in [&first_version, &second_version] {
+            let client_settings = version.join("ClientSettings");
+            fs::create_dir_all(&client_settings).unwrap();
+            fs::write(version.join("RobloxPlayerBeta.exe"), "").unwrap();
+            fs::write(
+                client_settings.join("ClientAppSettings.json"),
+                r#"{
+  "FFlagDebugGraphicsPreferD3D11": "True",
+  "FStringUserOwnedFlag": "keep-me"
+}"#,
+            )
+            .unwrap();
+        }
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        opt.remove_all_fflags_for_local_app_data(&dir).unwrap();
+
+        for version in [&first_version, &second_version] {
+            let settings_path = version
+                .join("ClientSettings")
+                .join("ClientAppSettings.json");
+            let content = fs::read_to_string(settings_path).unwrap();
+            assert!(!content.contains("FFlagDebugGraphicsPreferD3D11"));
+            assert!(content.contains("FStringUserOwnedFlag"));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_all_fflags_continues_after_folder_error() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_remove_partial_error");
+        let _ = fs::remove_dir_all(&dir);
+        let versions_dir = dir.join("Roblox").join("Versions");
+        let broken_version = versions_dir.join("version-broken");
+        let good_version = versions_dir.join("version-good");
+
+        for version in [&broken_version, &good_version] {
+            fs::create_dir_all(version.join("ClientSettings")).unwrap();
+            fs::write(version.join("RobloxPlayerBeta.exe"), "").unwrap();
+        }
+
+        fs::create_dir_all(
+            broken_version
+                .join("ClientSettings")
+                .join("ClientAppSettings.json"),
+        )
+        .unwrap();
+        fs::write(
+            good_version
+                .join("ClientSettings")
+                .join("ClientAppSettings.json"),
+            r#"{
+  "FFlagDebugGraphicsPreferD3D11": "True",
+  "FStringUserOwnedFlag": "keep-me"
+}"#,
+        )
+        .unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let result = opt.remove_all_fflags_in_paths(vec![
+            broken_version.join("ClientSettings"),
+            good_version.join("ClientSettings"),
+        ]);
+
+        assert!(result.is_err());
+        let good_settings_path = good_version
+            .join("ClientSettings")
+            .join("ClientAppSettings.json");
+        let content = fs::read_to_string(good_settings_path).unwrap();
+        assert!(!content.contains("FFlagDebugGraphicsPreferD3D11"));
+        assert!(content.contains("FStringUserOwnedFlag"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_all_fflags_cleans_bootstrapper_settings_and_preserves_user_flags() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_remove_bootstrapper");
+        let _ = fs::remove_dir_all(&dir);
+        let client_settings = dir
+            .join("Fishstrap")
+            .join("Modifications")
+            .join("ClientSettings");
+        fs::create_dir_all(&client_settings).unwrap();
+        fs::write(
+            client_settings.join("ClientAppSettings.json"),
+            r#"{
+  "FFlagDebugGraphicsPreferD3D11": "True",
+  "DFIntTaskSchedulerTargetFps": 240,
+  "FStringUserOwnedFlag": "keep-me"
+}"#,
+        )
+        .unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        opt.remove_all_fflags_for_local_app_data(&dir).unwrap();
+
+        let content = fs::read_to_string(client_settings.join("ClientAppSettings.json")).unwrap();
+        assert!(!content.contains("FFlagDebugGraphicsPreferD3D11"));
+        assert!(!content.contains(RobloxOptimizer::FPS_UNLOCK_FFLAG));
+        assert!(content.contains("FStringUserOwnedFlag"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_all_fflags_removes_empty_bootstrapper_client_settings_folder() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_remove_empty_bootstrapper");
+        let _ = fs::remove_dir_all(&dir);
+        let client_settings = dir
+            .join("Bloxstrap")
+            .join("Modifications")
+            .join("ClientSettings");
+        fs::create_dir_all(&client_settings).unwrap();
+        fs::write(
+            client_settings.join("ClientAppSettings.json"),
+            r#"{
+  "FFlagDebugGraphicsPreferD3D11": "True",
+  "DFIntTaskSchedulerTargetFps": 240
+}"#,
+        )
+        .unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        opt.remove_all_fflags_for_local_app_data(&dir).unwrap();
+
+        assert!(!client_settings.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_all_fflags_keeps_unknown_empty_client_settings_folder() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_keep_unknown_empty_folder");
+        let _ = fs::remove_dir_all(&dir);
+        let client_settings = dir.join("Unknownstrap").join("ClientSettings");
+        fs::create_dir_all(&client_settings).unwrap();
+        fs::write(
+            client_settings.join("ClientAppSettings.json"),
+            r#"{
+  "FFlagDebugGraphicsPreferD3D11": "True",
+  "DFIntTaskSchedulerTargetFps": 240
+}"#,
+        )
+        .unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        opt.remove_all_fflags_in_paths(vec![client_settings.clone()])
+            .unwrap();
+
+        assert!(client_settings.exists());
+        assert!(!client_settings.join("ClientAppSettings.json").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_all_fflags_preserves_malformed_client_app_settings() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_fflag_malformed_json_remove");
+        let _ = fs::remove_dir_all(&dir);
+        let client_settings = dir
+            .join("Bloxstrap")
+            .join("Modifications")
+            .join("ClientSettings");
+        fs::create_dir_all(&client_settings).unwrap();
+        let settings_path = client_settings.join("ClientAppSettings.json");
+        fs::write(&settings_path, "{ this is not valid json").unwrap();
+
+        let opt = optimizer_with_path(dir.join("settings.xml"));
+        let result = opt.remove_all_fflags_for_local_app_data(&dir);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Failed to parse"));
+        assert_eq!(
+            fs::read_to_string(settings_path).unwrap(),
+            "{ this is not valid json"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_global_basic_settings_permissions_removes_readonly() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_repair_perms");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("settings.xml");
+        fs::write(&path, "<roblox></roblox>").unwrap();
+
+        // Use the cross-platform set_readonly_path helper
+        RobloxOptimizer::set_readonly_path(&path).unwrap();
+        assert!(RobloxOptimizer::is_readonly_path(&path));
+
+        let opt = optimizer_with_path(path.clone());
+        opt.repair_global_basic_settings_permissions().unwrap();
+
+        assert!(!RobloxOptimizer::is_readonly_path(&path));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_global_basic_settings_permissions_noop_when_missing() {
+        let dir = std::env::temp_dir().join("roblox_opt_test_repair_noop");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("settings.xml");
+        // File doesn't exist — should return Ok(()) without error
+        let opt = optimizer_with_path(path);
+        opt.repair_global_basic_settings_permissions().unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── ultraboost FFlag constants ────────────────────────────────────
+
+    #[test]
+    fn ultraboost_fflags_count() {
+        // 10 originals + Vulkan/OpenGL defensive negations + 5 new allowlisted
+        // perf flags (DFFlagDebugPauseVoxelizer + 4 CSG LOD distance entries).
+        assert_eq!(
+            RobloxOptimizer::ULTRABOOST_FFLAGS.len(),
+            17,
+            "Expected 17 ultraboost FFlags"
+        );
+    }
+
+    #[test]
+    fn legacy_blocked_fflags_count() {
+        // DFFlagDebugPauseVoxelizer moved out of LEGACY_BLOCKED_FFLAGS because
+        // it is now an active Ultraboost flag (allowlisted and useful).
+        assert_eq!(
+            RobloxOptimizer::LEGACY_BLOCKED_FFLAGS.len(),
+            4,
+            "Expected 4 legacy blocked FFlags"
+        );
+    }
+
+    #[test]
+    fn removed_ultraboost_fflags_count() {
+        assert_eq!(
+            RobloxOptimizer::REMOVED_ULTRABOOST_FFLAGS.len(),
+            1,
+            "Expected 1 retired ultraboost FFlag"
+        );
+    }
+
+    #[test]
+    fn gpu_preference_restore_action_restores_snapshot_values() {
+        let original = Some("GpuPreference=1;".to_string());
+        assert_eq!(
+            RobloxOptimizer::gpu_preference_restore_action(Some(&original)),
+            GpuPreferenceRestoreAction::Restore("GpuPreference=1;".to_string())
+        );
+    }
+
+    #[test]
+    fn gpu_preference_restore_action_deletes_only_snapshot_absent_values() {
+        let originally_absent = None;
+        assert_eq!(
+            RobloxOptimizer::gpu_preference_restore_action(Some(&originally_absent)),
+            GpuPreferenceRestoreAction::Delete
+        );
+        assert_eq!(
+            RobloxOptimizer::gpu_preference_restore_action(None),
+            GpuPreferenceRestoreAction::LeaveUntouched
+        );
+    }
+
+    #[test]
+    fn gpu_preference_snapshot_preserves_absent_original_values() {
+        let mut snapshot = GpuPreferenceSnapshot::default();
+        snapshot.values.insert(
+            r"C:\Users\evelyn\AppData\Local\Roblox\Versions\version-aaa111\RobloxPlayerBeta.exe"
+                .to_string(),
+            None,
+        );
+        snapshot.values.insert(
+            r"C:\Users\evelyn\AppData\Local\Roblox\Versions\version-bbb222\RobloxStudioBeta.exe"
+                .to_string(),
+            Some("GpuPreference=1;".to_string()),
+        );
+
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let roundtrip: GpuPreferenceSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip, snapshot);
+    }
+
+    #[test]
+    fn gpu_changes_preserve_other_windows_graphics_fields_and_later_user_choices() {
+        let original = Some("AutoHDREnable=1;GpuPreference=1;VRROptimizeEnable=0;".into());
+        let applied = RobloxOptimizer::high_performance_gpu_value(original.as_deref());
+        assert_eq!(
+            applied,
+            "AutoHDREnable=1;VRROptimizeEnable=0;GpuPreference=2;"
+        );
+        assert_eq!(
+            RobloxOptimizer::gpu_restore_for_current(&original, Some(&applied), &applied),
+            GpuPreferenceRestoreAction::Restore(original.clone().unwrap())
+        );
+        assert_eq!(
+            RobloxOptimizer::gpu_restore_for_current(&original, Some("GpuPreference=0;"), &applied),
+            GpuPreferenceRestoreAction::LeaveUntouched
+        );
+        assert_eq!(
+            RobloxOptimizer::gpu_restore_for_current(&original, None, &applied),
+            GpuPreferenceRestoreAction::LeaveUntouched
+        );
+        assert_eq!(
+            RobloxOptimizer::gpu_restore_for_current(
+                &None,
+                Some("GpuPreference=2;"),
+                "GpuPreference=2;"
+            ),
+            GpuPreferenceRestoreAction::Delete
+        );
+        assert_eq!(
+            RobloxOptimizer::high_performance_gpu_value(Some("GpuPreference=2;")),
+            "GpuPreference=2;"
+        );
+    }
+
+    #[test]
+    fn gpu_recovery_refuses_corruption_and_loads_legacy_records_without_replacing_them() {
+        let root =
+            std::env::temp_dir().join(format!("swift-gpu-audit-{:032x}", rand::random::<u128>()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("gpu.json");
+        assert_eq!(
+            RobloxOptimizer::read_gpu_preference_snapshot(&path).unwrap(),
+            GpuPreferenceSnapshot::default()
+        );
+        fs::write(&path, "bad recovery record").unwrap();
+        assert!(RobloxOptimizer::read_gpu_preference_snapshot(&path).is_err());
+        let mut snapshot = GpuPreferenceSnapshot::default();
+        snapshot.values.insert(
+            r"C:\Roblox\Versions\version-a\RobloxPlayerBeta.exe".into(),
+            Some(String::new()),
+        );
+        assert!(RobloxOptimizer::write_gpu_preference_snapshot(&path, &snapshot).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "bad recovery record");
+        fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert_eq!(
+            RobloxOptimizer::read_gpu_preference_snapshot(&path).unwrap(),
+            snapshot
+        );
+        snapshot
+            .values
+            .insert(r"C:\Discord\Discord.exe".into(), None);
+        fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert!(RobloxOptimizer::read_gpu_preference_snapshot(&path).is_err());
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gpu_recovery_replacement_is_atomic_and_unchanged_records_do_not_write() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root =
+            std::env::temp_dir().join(format!("swift-gpu-atomic-{:032x}", rand::random::<u128>()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("gpu.json");
+        let value = r"C:\RobloxPCVNG\Versions\version-a\RobloxPlayerBeta.exe";
+        let mut original = GpuPreferenceSnapshot::default();
+        original
+            .values
+            .insert(value.into(), Some("GpuPreference=1;".into()));
+        original
+            .applied
+            .insert(value.into(), "GpuPreference=2;".into());
+        RobloxOptimizer::write_gpu_preference_snapshot(&path, &original).unwrap();
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        RobloxOptimizer::write_gpu_preference_snapshot(&path, &original).unwrap();
+        let mut next = original.clone();
+        next.values.insert(value.into(), None);
+        assert!(RobloxOptimizer::write_gpu_preference_snapshot(&path, &next).is_err());
+        assert_eq!(
+            RobloxOptimizer::read_gpu_preference_snapshot(&path).unwrap(),
+            original
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        drop(locked);
+        RobloxOptimizer::write_gpu_preference_snapshot(&path, &next).unwrap();
+        assert_eq!(
+            RobloxOptimizer::read_gpu_preference_snapshot(&path).unwrap(),
+            next
+        );
+        RobloxOptimizer::write_gpu_preference_snapshot(&path, &GpuPreferenceSnapshot::default())
+            .unwrap();
+        assert!(!path.exists());
+        fs::remove_dir(root).unwrap();
+    }
+}

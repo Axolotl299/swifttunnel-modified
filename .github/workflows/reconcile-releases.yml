@@ -1,0 +1,89 @@
+name: Reconcile Releases
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: reconcile-github-releases
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure bot identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Dispatch Release for newest GitHub tag without a release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin main --tags --force
+
+          mapfile -t github_tags < <(
+            git for-each-ref \
+              --merged=origin/main \
+              --format='%(refname:strip=2)' \
+              refs/tags/v*
+          )
+
+          target_tag="$(
+            printf '%s\n' "${github_tags[@]}" |
+              python3 scripts/select_latest_semver_tag.py
+          )"
+
+          if [[ -z "${target_tag}" ]]; then
+            echo "No GitHub release tags found."
+            exit 0
+          fi
+
+          in_progress_release_count="$(
+            gh run list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --workflow Release \
+              --json status \
+              --limit 20 \
+              --jq '[.[] | select(.status != "completed")] | length'
+          )"
+
+          if [[ "${in_progress_release_count}" != "0" ]]; then
+            echo "A GitHub Release workflow is already in progress; skipping reconciliation."
+            exit 0
+          fi
+
+          if ! git show-ref --verify --quiet "refs/tags/${target_tag}"; then
+            echo "Latest tag ${target_tag} is not present on GitHub yet; nothing else to reconcile."
+            exit 0
+          fi
+
+          release_commit="$(git rev-list -n 1 "${target_tag}")"
+          if ! git merge-base --is-ancestor "${release_commit}" "origin/main"; then
+            echo "::error::Refusing to publish ${target_tag} because ${release_commit} is not on origin/main"
+            exit 1
+          fi
+
+          if gh release view "${target_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "GitHub tag ${target_tag} already has a release entry."
+            exit 0
+          fi
+
+          echo "Dispatching Release workflow for existing GitHub tag ${target_tag}"
+          gh workflow run Release --repo "${GITHUB_REPOSITORY}" -f tag="${target_tag}"

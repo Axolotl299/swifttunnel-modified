@@ -1,0 +1,367 @@
+import { useEffect, useState, type ReactNode } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { useSettingsStore } from "../../stores/settingsStore";
+import { useVpnStore } from "../../stores/vpnStore";
+import { useBoostStore } from "../../stores/boostStore";
+import { useFocusAwareInterval } from "../../lib/useFocusAwareInterval";
+import { useLiveUpdates } from "../../lib/useLiveUpdates";
+import { useAuthStore } from "../../stores/authStore";
+import { StatusChip } from "./StatusChip";
+import { LanguageSelector } from "./LanguageSelector";
+import { navItemFor } from "./nav";
+import { Icon } from "../ui/Icon";
+
+/** `2h 14m` / `47m` / `<1m`, compact enough for a top-bar pill. */
+function formatFreeTier(seconds: number): string {
+  if (seconds < 60) return "<1m";
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+}
+
+/** Escalates as the budget runs down, so it stops being decorative. */
+function freeTierColor(seconds: number): string {
+  if (seconds <= 600) return "var(--color-danger, #f87171)";
+  if (seconds <= 1800) return "var(--color-warning, #fbbf24)";
+  return "var(--color-text-secondary, #a1a1aa)";
+}
+
+export function TopBar() {
+  const activeTab = useSettingsStore((s) => s.activeTab);
+  const setTab = useSettingsStore((s) => s.setTab);
+  const vpnState = useVpnStore((s) => s.state);
+  const ping = useVpnStore((s) => s.ping);
+  const robloxRunning = useBoostStore((s) => s.robloxRunning);
+  const fetchMetrics = useBoostStore((s) => s.fetchMetrics);
+  const email = useAuthStore((s) => s.email);
+
+  const item = navItemFor(activeTab);
+  const isConnected = vpnState === "connected";
+  const initial = email?.[0]?.toUpperCase() || "?";
+  const [isMaximized, setIsMaximized] = useState(false);
+
+  // Keep the game-status indicator live on every tab (metrics is a cheap local
+  // call). 4s is plenty for a "is Roblox open yet" signal.
+  useEffect(() => {
+    void fetchMetrics();
+  }, [fetchMetrics]);
+  useFocusAwareInterval(() => void fetchMetrics(), 4000);
+
+  useEffect(() => {
+    const appWindow = getCurrentWindow();
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+
+    const syncMaximizedState = () => {
+      void appWindow
+        .isMaximized()
+        .then((maximized) => { if (!disposed) setIsMaximized(maximized); })
+        .catch(() => undefined);
+    };
+
+    syncMaximizedState();
+    void appWindow.onResized(syncMaximizedState).then((stopListening) => {
+      if (disposed) stopListening();
+      else unlisten = stopListening;
+    }).catch(() => undefined);
+
+    return () => { disposed = true; unlisten?.(); };
+  }, []);
+
+  const minimizeWindow = async () => {
+    // Just minimize. The previous version called center() first, which forces
+    // the window to show/position itself and races the minimize, so it never
+    // fully dropped to the taskbar. Windows already remembers a maximized
+    // window's state across a minimize, so no unmaximize dance is needed.
+    await getCurrentWindow().minimize();
+  };
+
+  const toggleMaximize = async () => {
+    const appWindow = getCurrentWindow();
+    if (await appWindow.isMaximized()) {
+      await appWindow.unmaximize();
+      await appWindow.center();
+      setIsMaximized(false);
+      return;
+    }
+
+    await appWindow.maximize();
+    setIsMaximized(true);
+  };
+
+  return (
+    <header
+      data-tauri-drag-region
+      className="flex shrink-0 items-center justify-between gap-4 px-5"
+      style={{
+        height: "var(--spacing-topbar)",
+        backgroundColor: "var(--color-bg-sidebar)",
+      }}
+    >
+      <div data-tauri-drag-region className="flex min-w-0 items-center gap-3.5">
+        <div className="min-w-0">
+          <h1
+            className="truncate text-[13.5px] font-semibold leading-none text-text-primary"
+            style={{ letterSpacing: "-0.01em" }}
+          >
+            {item.label}
+          </h1>
+          <p className="mt-1.5 truncate text-[10.5px] leading-none text-text-muted">
+            {item.description}
+          </p>
+        </div>
+        {/* Game-status chip, Medal's "Waiting For Game": solid gamepad, no
+            border, subtle inset pill. */}
+        <div
+          className="hidden shrink-0 items-center gap-2 rounded-[9px] px-3 py-1.5 min-[900px]:flex"
+          style={{ backgroundColor: "var(--color-bg-base)" }}
+        >
+          <Icon
+            name="games"
+            size={17}
+            active={robloxRunning}
+            style={{
+              color: robloxRunning
+                ? "var(--color-text-primary)"
+                : "var(--color-text-muted)",
+            }}
+          />
+          <span
+            className="whitespace-nowrap text-[11px] font-medium leading-none"
+            style={{
+              color: robloxRunning
+                ? "var(--color-text-secondary)"
+                : "var(--color-text-muted)",
+            }}
+          >
+            {robloxRunning ? "Roblox running" : "Waiting for Roblox"}
+          </span>
+        </div>
+      </div>
+
+      <div className="flex shrink-0 items-center gap-2">
+        {/* Search, opens the command palette (same Ctrl+K target). */}
+        <button
+          title="Search (Ctrl+K)"
+          aria-label="Search"
+          onClick={() =>
+            window.dispatchEvent(new Event("toggle-command-palette"))
+          }
+          className="flex h-9 w-9 items-center justify-center rounded-full transition-[background-color] duration-150 hover:bg-[color:var(--color-bg-hover)]"
+          style={{ color: "var(--color-text-muted)" }}
+        >
+          <Icon name="search" size={19} />
+        </button>
+
+        <FreeTierBadge />
+
+        {isConnected && ping !== null && (
+          <div
+            className="flex items-center gap-1.5 rounded-[5px] px-2.5 py-1.5"
+            style={{
+              backgroundColor: "var(--color-bg-base)",
+              border: "1px solid var(--color-border-subtle)",
+            }}
+          >
+            <span
+              className="lcd-readout text-[11px] font-medium leading-none"
+              style={{ color: "var(--color-text-primary)" }}
+            >
+              {ping}
+            </span>
+            <span className="text-[9.5px] leading-none text-text-dimmed">
+              ms
+            </span>
+          </div>
+        )}
+        <StatusChip state={vpnState} />
+
+        {/* Language, translate the whole UI to any language (Medal-style). */}
+        {/* Lite ships one language. Translation pulls a dictionary per switch
+            and re-applies it on every tab change, which is work a lightweight
+            client should not be doing. */}
+        <LanguageSelector />
+
+        {/* Profile avatar, moved from the sidebar to the top-right (Medal). */}
+        <button
+          onClick={() => setTab("settings")}
+          title={email ?? "Account"}
+          aria-label="Account settings"
+          className="neon-edge ml-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[12px] font-semibold transition-[filter] duration-150 hover:brightness-110"
+          style={{
+            background:
+              "linear-gradient(135deg, var(--color-bg-elevated), var(--color-bg-active))",
+            color: "var(--color-text-primary)",
+            border: "1px solid var(--color-border-default)",
+          }}
+        >
+          {initial}
+        </button>
+
+        {/* Window controls, custom titlebar (window is frameless, Medal-style). */}
+        <div
+          className="-mr-5 ml-1 flex items-stretch"
+          style={{ height: "var(--spacing-topbar)" }}
+        >
+          <span
+            className="mx-1.5 self-center"
+            style={{
+              width: 1,
+              height: 18,
+              backgroundColor: "var(--color-border-strong)",
+            }}
+          />
+          <WindowButton
+            label="Minimize"
+            onClick={() => void minimizeWindow()}
+          >
+            <svg
+              width="11"
+              height="11"
+              viewBox="0 0 12 12"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.1"
+              strokeLinecap="round"
+            >
+              <path d="M2 6h8" />
+            </svg>
+          </WindowButton>
+          <WindowButton
+            label={isMaximized ? "Restore" : "Maximize"}
+            onClick={() => void toggleMaximize()}
+          >
+            {isMaximized ? (
+              <svg
+                width="11"
+                height="11"
+                viewBox="0 0 12 12"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.05"
+              >
+                <rect x="2.5" y="3.5" width="6" height="6" rx="0.5" />
+                <path d="M4 3.5V2.5h5.5V8H8.5" />
+              </svg>
+            ) : (
+              <svg
+                width="11"
+                height="11"
+                viewBox="0 0 12 12"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.05"
+              >
+                <rect x="2.25" y="2.25" width="7.5" height="7.5" rx="0.6" />
+              </svg>
+            )}
+          </WindowButton>
+          <WindowButton
+            label="Close"
+            danger
+            onClick={() => void getCurrentWindow().close()}
+          >
+            <svg
+              width="11"
+              height="11"
+              viewBox="0 0 12 12"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.15"
+              strokeLinecap="round"
+            >
+              <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" />
+            </svg>
+          </WindowButton>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+function FreeTierBadge() {
+  const state = useVpnStore((s) => s.state);
+  const freeTierRemaining = useVpnStore((s) => s.freeTierRemaining);
+  const freeTierGraceRemaining = useVpnStore((s) => s.freeTierGraceRemaining);
+  const fetchFreeTier = useVpnStore((s) => s.fetchFreeTier);
+  const tickFreeTier = useVpnStore((s) => s.tickFreeTier);
+  const live = useLiveUpdates();
+  useEffect(() => { void fetchFreeTier(); }, [state, fetchFreeTier]);
+  useFocusAwareInterval(() => void fetchFreeTier(), 60_000, { idleMs: 60_000 });
+  useEffect(() => {
+    if (!live || state !== "connected") return;
+    tickFreeTier();
+    const timer = window.setInterval(tickFreeTier, 1000);
+    return () => window.clearInterval(timer);
+  }, [live, state, tickFreeTier]);
+  return (<>
+    {freeTierGraceRemaining !== null ? (
+      <div
+        className="flex items-center gap-1.5 rounded-[5px] px-2.5 py-1.5"
+        title={`Free time used up. SwiftTunnel disconnects in ${formatFreeTier(freeTierGraceRemaining)}.`}
+        style={{
+          backgroundColor: "var(--color-bg-base)",
+          border: "1px solid var(--color-status-error-soft-20)",
+        }}
+      >
+        <span
+          className="lcd-readout text-[11px] font-medium leading-none"
+          style={{ color: "var(--color-status-error)" }}
+        >
+          {formatFreeTier(freeTierGraceRemaining)}
+        </span>
+        <span className="text-[9.5px] leading-none text-text-dimmed">
+          extra
+        </span>
+      </div>
+    ) : freeTierRemaining !== null ? (
+      <div
+        className="flex items-center gap-1.5 rounded-[5px] px-2.5 py-1.5"
+        title={`${formatFreeTier(freeTierRemaining)} of free SwiftTunnel time left.`}
+        style={{
+          backgroundColor: "var(--color-bg-base)",
+          border: `1px solid color-mix(in srgb, ${freeTierColor(freeTierRemaining)} 20%, transparent)`,
+        }}
+      >
+        <span
+          className="lcd-readout text-[11px] font-medium leading-none"
+          style={{ color: freeTierColor(freeTierRemaining) }}
+        >
+          {formatFreeTier(freeTierRemaining)}
+        </span>
+        <span className="text-[9.5px] leading-none text-text-dimmed">
+          free
+        </span>
+      </div>
+    ) : null}
+  </>);
+}
+
+function WindowButton({
+  children,
+  onClick,
+  label,
+  danger,
+}: {
+  children: ReactNode;
+  onClick: () => void;
+  label: string;
+  danger?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={label}
+      aria-label={label}
+      className={`flex h-full w-[44px] items-center justify-center transition-colors duration-100 ${
+        danger
+          ? "hover:bg-[#e5484d] hover:text-white"
+          : "hover:bg-[color:var(--color-bg-hover)]"
+      }`}
+      style={{ color: "var(--color-text-muted)" }}
+    >
+      {children}
+    </button>
+  );
+}

@@ -1,0 +1,1475 @@
+use crate::firewall_fixer::FirewallFixer;
+use crate::structs::*;
+use log::{info, warn};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+const LEGACY_ROBLOX_PRIORITY_POLICY: &str = "RobloxPriority";
+// QoS policies written by previous SwiftTunnel versions. The feature is gone,
+// but cleanup still removes SwiftTunnel-owned policies so upgrades do not
+// strand stale DSCP tagging rules on user machines.
+const REMOVED_QOS_POLICY_NAMES: &[&str] = &[
+    "SwiftTunnel_QoS_RobloxPlayerBeta",
+    "SwiftTunnel_QoS_RobloxStudioBeta",
+    "SwiftTunnel_QoS_RobloxCrashHandler",
+    "SwiftTunnel_QoS_Relay_SwiftTunnel",
+    "SwiftTunnel_QoS_Relay_swifttunnel-desktop",
+    "SwiftTunnel_QoS_Windows10Universal",
+];
+// Replacement for the removed Gaming QoS boost: scope DSCP marking to
+// SwiftTunnel's relay UDP traffic only. Do not reintroduce Roblox executable or
+// Windows10Universal policies; intercepted game packets leave Windows through
+// SwiftTunnel's relay UDP socket.
+const RELAY_QOS_EXECUTABLES: &[&str] = &["SwiftTunnel.exe", "swifttunnel-desktop.exe"];
+const RELAY_QOS_POLICY_PREFIX: &str = "SwiftTunnel_RelaySocketQoS_";
+// Relay ports come from the server-list API; keep the policy process+UDP scoped
+// instead of hardcoding a port here. The socket-level IP_TOS mark still applies
+// to the exact relay socket used for the session.
+const RELAY_QOS_REMOTE_PORT: &str = "*";
+const RELAY_QOS_DSCP_VALUE: &str = "46";
+const NETWORK_SYSTEM_PROFILE_KEY: &str =
+    r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile";
+const REG_VALUE_TCP_ACK_FREQUENCY: &str = "TcpAckFrequency";
+const REG_VALUE_TCP_NO_DELAY: &str = "TCPNoDelay";
+const REG_VALUE_NETWORK_THROTTLING_INDEX: &str = "NetworkThrottlingIndex";
+const REG_VALUE_SYSTEM_RESPONSIVENESS: &str = "SystemResponsiveness";
+const TCPIP_QOS_KEY: &str = r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\QoS";
+const TCPIP_PARAMETERS_KEY: &str = r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters";
+const REG_VALUE_DO_NOT_USE_NLA: &str = "Do not use NLA";
+const REG_VALUE_DISABLE_USER_TOS_SETTING: &str = "DisableUserTOSSetting";
+const ADAPTER_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn parse_adapter_guids(output: crate::BoundedCommandOutput) -> Result<Vec<String>> {
+    if output.timed_out {
+        return Err(anyhow::anyhow!("Adapter enumeration timed out"));
+    }
+    if !output.success {
+        return Err(anyhow::anyhow!("Adapter enumeration failed"));
+    }
+    let mut guids = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in output
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let raw = line
+            .strip_prefix('{')
+            .and_then(|inner| inner.strip_suffix('}'))
+            .unwrap_or(line);
+        let normalized = crate::utils::normalize_guid_ascii_lowercase(raw)
+            .filter(|_| raw.len() == 36)
+            .ok_or_else(|| anyhow::anyhow!("Adapter enumeration returned an invalid GUID"))?;
+        if seen.insert(normalized) {
+            // Keep PowerShell's original representation for existing snapshot
+            // keys. Validate the entire result before returning registry targets.
+            guids.push(line.to_string());
+        }
+    }
+    Ok(guids)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct NagleRegistrySnapshot {
+    tcp_ack_frequency: Option<u32>,
+    tcp_no_delay: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct NetworkThrottlingSnapshot {
+    network_throttling_index: Option<u32>,
+    system_responsiveness: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct QosRegistrySnapshot {
+    do_not_use_nla: Option<u32>,
+    disable_user_tos_setting: Option<u32>,
+}
+
+/// On-disk snapshot of pre-modification values for crash/uninstall recovery.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistentSnapshot {
+    nagle_registry_snapshot: HashMap<String, NagleRegistrySnapshot>,
+    network_throttling_snapshot: Option<NetworkThrottlingSnapshot>,
+    #[serde(default)]
+    qos_registry_snapshot: Option<QosRegistrySnapshot>,
+}
+
+impl PersistentSnapshot {
+    fn is_empty(&self) -> bool {
+        self.nagle_registry_snapshot.is_empty()
+            && self.network_throttling_snapshot.is_none()
+            && self.qos_registry_snapshot.is_none()
+    }
+}
+
+const MAX_NETWORK_SNAPSHOT_BYTES: usize = 1024 * 1024;
+
+fn read_network_snapshot(path: &Path) -> Result<PersistentSnapshot> {
+    match crate::utils::read_file_bounded(
+        path,
+        MAX_NETWORK_SNAPSHOT_BYTES,
+        "Network recovery record",
+    ) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+            anyhow::anyhow!("Network rollback record is unreadable; preserve it for recovery: {e}")
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PersistentSnapshot::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn save_network_snapshot(path: &Path, snapshot: &PersistentSnapshot) -> Result<()> {
+    use std::io::Write;
+    // Do not replace a damaged recovery record with freshly captured settings.
+    read_network_snapshot(path)?;
+    if snapshot.is_empty() {
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        };
+    }
+    let payload = serde_json::to_vec_pretty(snapshot)?;
+    if payload.len() > MAX_NETWORK_SNAPSHOT_BYTES {
+        anyhow::bail!(
+            "Network recovery record is too large to save safely; settings were left unchanged."
+        );
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("No snapshot directory"))?;
+    std::fs::create_dir_all(parent)?;
+    let staged = parent.join(format!(".network-{:032x}.tmp", rand::random::<u128>()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)?;
+    let result: Result<()> = (|| {
+        file.write_all(&payload)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows::Win32::Storage::FileSystem::{
+                MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+            };
+            let from: Vec<u16> = staged.as_os_str().encode_wide().chain(Some(0)).collect();
+            let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            unsafe {
+                MoveFileExW(
+                    windows::core::PCWSTR(from.as_ptr()),
+                    windows::core::PCWSTR(to.as_ptr()),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            }?;
+        }
+        #[cfg(not(windows))]
+        std::fs::rename(&staged, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    result
+}
+
+fn change_with_network_snapshot<T>(
+    path: &Path,
+    snapshot: &PersistentSnapshot,
+    change: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    save_network_snapshot(path, snapshot)?;
+    change()
+}
+
+const SNAPSHOT_FILE: &str = "network_snapshots.json";
+
+fn snapshot_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| p.join("SwiftTunnel").join(SNAPSHOT_FILE))
+}
+
+// Only an absent value is a safe "delete on restore" snapshot. Access denial,
+// an unexpected type and other read failures must stop capture before writes.
+fn optional_registry_read<T>(read: std::io::Result<T>) -> Result<Option<T>> {
+    match read {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn run_network_migration(
+    completed: &mut bool,
+    force: bool,
+    cleanup: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if *completed && !force {
+        return Ok(());
+    }
+    *completed = false;
+    cleanup()?;
+    *completed = true;
+    Ok(())
+}
+
+fn network_registry_subkey(path: &str) -> Result<&str> {
+    path.strip_prefix("HKLM\\")
+        .filter(|key| !key.is_empty() && !key.contains('\0') && !key.ends_with('\\'))
+        .ok_or_else(|| anyhow::anyhow!("Unsupported network registry path"))
+}
+
+#[cfg(windows)]
+fn create_network_registry_key(path: &str) -> Result<winreg::RegKey> {
+    use winreg::{
+        RegKey,
+        enums::{HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY, KEY_WRITE},
+    };
+    let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .create_subkey_with_flags(network_registry_subkey(path)?, KEY_WRITE | KEY_WOW64_64KEY)?;
+    Ok(key)
+}
+
+#[cfg(windows)]
+fn delete_network_registry_value(path: &str, name: &str) -> Result<()> {
+    use winreg::{
+        RegKey,
+        enums::{HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_WOW64_64KEY},
+    };
+    if let Some(key) =
+        optional_registry_read(RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(
+            network_registry_subkey(path)?,
+            KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY,
+        ))?
+    {
+        optional_registry_read(key.delete_value(name))?;
+        if crate::registry_value::exists(&key, name)? {
+            anyhow::bail!("{path}\\{name} was not removed");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn delete_network_registry_value(_path: &str, _name: &str) -> Result<()> {
+    anyhow::bail!("Network registry changes require Windows")
+}
+
+#[cfg(windows)]
+fn delete_network_registry_key(path: &str) -> Result<()> {
+    use winreg::{
+        RegKey,
+        enums::{HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY},
+    };
+    // Our QoS records are flat value-only keys. Unexpected child keys must
+    // fail cleanup instead of starting an unbounded recursive delete.
+    optional_registry_read(
+        RegKey::predef(HKEY_LOCAL_MACHINE)
+            .delete_subkey_with_flags(qos_registry_subkey(path)?, KEY_WOW64_64KEY),
+    )?;
+    Ok(())
+}
+
+fn qos_registry_subkey(path: &str) -> Result<&str> {
+    let subkey = network_registry_subkey(path)?;
+    let name = subkey
+        .strip_prefix(r"SOFTWARE\Policies\Microsoft\Windows\QoS\")
+        .ok_or_else(|| anyhow::anyhow!("Unsupported QoS policy path"))?;
+    if !REMOVED_QOS_POLICY_NAMES.contains(&name)
+        && !RELAY_QOS_EXECUTABLES
+            .iter()
+            .any(|exe| NetworkBooster::relay_qos_policy_name(exe) == name)
+    {
+        anyhow::bail!("Unsupported QoS policy name");
+    }
+    Ok(subkey)
+}
+
+#[cfg(not(windows))]
+fn delete_network_registry_key(_path: &str) -> Result<()> {
+    anyhow::bail!("Network registry changes require Windows")
+}
+
+pub struct NetworkBooster {
+    nagle_registry_snapshot: HashMap<String, NagleRegistrySnapshot>,
+    network_throttling_snapshot: Option<NetworkThrottlingSnapshot>,
+    qos_registry_snapshot: Option<QosRegistrySnapshot>,
+    firewall_fixer: FirewallFixer,
+    legacy_qos_cleanup_done: bool,
+}
+
+pub struct NetworkApplyOutcome {
+    pub applied_config: NetworkConfig,
+    pub warnings: Vec<String>,
+}
+
+impl NetworkBooster {
+    pub fn new() -> Self {
+        Self {
+            nagle_registry_snapshot: HashMap::new(),
+            network_throttling_snapshot: None,
+            qos_registry_snapshot: None,
+            firewall_fixer: FirewallFixer::new(),
+            legacy_qos_cleanup_done: false,
+        }
+    }
+
+    /// Apply network optimizations
+    ///
+    /// Individual optimizations are non-fatal: if one fails, the remaining
+    /// optimizations still run.
+    pub fn apply_optimizations(&mut self, config: &NetworkConfig) -> Result<()> {
+        self.reconcile_optimizations(config)
+    }
+
+    /// Reconcile network optimizations to exactly match the provided config.
+    ///
+    /// This makes per-toggle behavior deterministic without relying on a global
+    /// "boost on/off" switch.
+    pub fn reconcile_optimizations(&mut self, config: &NetworkConfig) -> Result<()> {
+        info!("Reconciling network optimizations");
+        let outcome = self.reconcile_optimizations_checked(config);
+        if !outcome.warnings.is_empty() {
+            warn!(
+                "Network optimizations applied with warnings: {}",
+                outcome.warnings.join("; ")
+            );
+        }
+        Ok(())
+    }
+
+    /// Reconcile network optimizations and report which toggles actually applied.
+    ///
+    /// This is used by the desktop UI so a toggle only persists as "on" after
+    /// the backing registry operation succeeds.
+    pub fn reconcile_optimizations_checked(
+        &mut self,
+        config: &NetworkConfig,
+    ) -> NetworkApplyOutcome {
+        info!("Reconciling network optimizations");
+
+        let mut requested_config = config.clone();
+        requested_config.normalize_legacy_master_boost();
+
+        let mut applied_config = requested_config.clone();
+        let mut warnings = Vec::new();
+
+        // Existing records contain the originals, even if a prior restore
+        // failed. Never capture the already-modified values over those records.
+        if let Err(e) = self.load_saved_snapshot() {
+            applied_config.disable_nagle = false;
+            applied_config.disable_network_throttling = false;
+            applied_config.firewall_fix = false;
+            applied_config.normalize_legacy_master_boost();
+            return NetworkApplyOutcome {
+                applied_config,
+                warnings: vec![format!(
+                    "Network changes skipped because rollback data could not be read: {e}"
+                )],
+            };
+        }
+
+        self.cleanup_removed_qos_policies(false);
+
+        let relay_qos_requested = Self::relay_qos_requested(&requested_config);
+        if relay_qos_requested {
+            if let Err(e) = self.enable_relay_socket_qos_policy() {
+                if let Err(cleanup_error) = self.remove_relay_socket_qos_policy() {
+                    warnings.push(format!(
+                        "Enable relay DSCP policy cleanup after failure: {}",
+                        cleanup_error
+                    ));
+                }
+                warnings.push(format!("Enable relay DSCP policy: {}", e));
+            }
+        } else if let Err(e) = self.remove_relay_socket_qos_policy() {
+            warnings.push(format!("Remove relay DSCP policy: {}", e));
+        }
+
+        // Tier 1 (Safe) Network Boosts
+        if requested_config.disable_nagle {
+            if let Err(e) = self.disable_nagle_algorithm() {
+                applied_config.disable_nagle = false;
+                warnings.push(format!("Disable Nagle's algorithm: {}", e));
+            }
+        } else if let Err(e) = self.restore_nagle_algorithm() {
+            warnings.push(format!("Restore Nagle's algorithm defaults: {}", e));
+        }
+
+        if requested_config.disable_network_throttling {
+            if let Err(e) = self.disable_network_throttling() {
+                applied_config.disable_network_throttling = false;
+                warnings.push(format!("Disable network throttling: {}", e));
+            }
+        } else if let Err(e) = self.restore_network_throttling() {
+            warnings.push(format!("Restore network throttling defaults: {}", e));
+        }
+
+        if requested_config.firewall_fix {
+            if let Err(e) = self.firewall_fixer.apply() {
+                applied_config.firewall_fix = false;
+                warnings.push(format!("Apply Roblox firewall fix: {}", e));
+            }
+        } else if let Err(e) = self.firewall_fixer.restore() {
+            warnings.push(format!("Restore Roblox firewall rules: {}", e));
+        }
+
+        if let Err(e) = self.persist_snapshot() {
+            warnings.push(format!("Could not update network rollback record: {e}"));
+        }
+        applied_config.normalize_legacy_master_boost();
+
+        let mut effective_config = self.effective_network_config(&applied_config);
+        effective_config.normalize_legacy_master_boost();
+        if applied_config.disable_nagle && !effective_config.disable_nagle {
+            warnings.push("Disable Nagle's algorithm did not verify after apply".to_string());
+        }
+        if applied_config.disable_network_throttling && !effective_config.disable_network_throttling
+        {
+            warnings.push("Disable network throttling did not verify after apply".to_string());
+        }
+        NetworkApplyOutcome {
+            applied_config: effective_config,
+            warnings,
+        }
+    }
+
+    pub(crate) fn list_adapter_guids(&self) -> Result<Vec<String>> {
+        parse_adapter_guids(crate::run_hidden_command_with_timeout(
+            "powershell",
+            &[
+                "-Command",
+                "$ErrorActionPreference = 'Stop'; Get-NetAdapter | Select-Object -ExpandProperty InterfaceGuid",
+            ],
+            ADAPTER_QUERY_TIMEOUT,
+        ))
+    }
+
+    fn query_registry_dword(key_path: &str, value_name: &str) -> Option<u32> {
+        Self::query_registry_dword_checked(key_path, value_name)
+            .ok()
+            .flatten()
+    }
+
+    #[cfg(windows)]
+    fn query_registry_dword_checked(key_path: &str, value_name: &str) -> Result<Option<u32>> {
+        use winreg::RegKey;
+        use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
+        let subkey = network_registry_subkey(key_path)?;
+        let key = optional_registry_read(
+            RegKey::predef(HKEY_LOCAL_MACHINE)
+                .open_subkey_with_flags(subkey, KEY_READ | KEY_WOW64_64KEY),
+        )?;
+        match key {
+            Some(key) => crate::registry_value::read(&key, value_name).map_err(Into::into),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn query_registry_dword_checked(_key_path: &str, _value_name: &str) -> Result<Option<u32>> {
+        Err(anyhow::anyhow!("Network registry capture requires Windows"))
+    }
+
+    pub fn effective_network_config(&self, desired: &NetworkConfig) -> NetworkConfig {
+        let mut effective = desired.clone();
+        effective.normalize_legacy_master_boost();
+        let requested = effective.clone();
+
+        if requested.disable_nagle {
+            let adapter_guids = self.list_adapter_guids().unwrap_or_else(|error| {
+                warn!("Cannot verify adapter TCP settings: {error}");
+                Vec::new()
+            });
+            effective.disable_nagle = !adapter_guids.is_empty()
+                && adapter_guids.iter().all(|guid| {
+                    let key_path = format!(
+                        r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{}",
+                        guid
+                    );
+                    Self::query_registry_dword(&key_path, REG_VALUE_TCP_ACK_FREQUENCY) == Some(1)
+                        && Self::query_registry_dword(&key_path, REG_VALUE_TCP_NO_DELAY) == Some(1)
+                });
+        }
+
+        if requested.disable_network_throttling {
+            effective.disable_network_throttling = Self::query_registry_dword(
+                NETWORK_SYSTEM_PROFILE_KEY,
+                REG_VALUE_NETWORK_THROTTLING_INDEX,
+            ) == Some(u32::MAX)
+                && Self::query_registry_dword(
+                    NETWORK_SYSTEM_PROFILE_KEY,
+                    REG_VALUE_SYSTEM_RESPONSIVENESS,
+                ) == Some(0);
+        }
+
+        effective.normalize_legacy_master_boost();
+        effective
+    }
+
+    fn set_registry_dword(key_path: &str, value_name: &str, value: u32) -> Result<()> {
+        #[cfg(windows)]
+        create_network_registry_key(key_path)?.set_value(value_name, &value)?;
+        #[cfg(not(windows))]
+        anyhow::bail!("Network registry changes require Windows");
+
+        match Self::query_registry_dword(key_path, value_name) {
+            Some(actual) if actual == value => Ok(()),
+            Some(actual) => Err(anyhow::anyhow!(
+                "{}\\{} was {}, expected {}",
+                key_path,
+                value_name,
+                actual,
+                value
+            )),
+            None => Err(anyhow::anyhow!(
+                "{}\\{} was not readable after write",
+                key_path,
+                value_name
+            )),
+        }
+    }
+
+    fn restore_registry_dword(key_path: &str, value_name: &str, value: Option<u32>) -> Result<()> {
+        match value {
+            Some(saved) => Self::set_registry_dword(key_path, value_name, saved),
+            None => delete_network_registry_value(key_path, value_name),
+        }
+    }
+
+    fn remove_legacy_roblox_priority_policy() -> Result<()> {
+        let script = Self::legacy_qos_policy_removal_script(LEGACY_ROBLOX_PRIORITY_POLICY);
+        let output = crate::run_hidden_command_with_timeout(
+            "powershell",
+            &["-Command", &script],
+            std::time::Duration::from_secs(60),
+        );
+
+        if !output.success {
+            return Err(anyhow::anyhow!(
+                "failed to remove removed RobloxPriority QoS policy"
+            ));
+        }
+        Ok(())
+    }
+
+    fn cleanup_removed_qos_policies(&mut self, force: bool) {
+        let result = run_network_migration(&mut self.legacy_qos_cleanup_done, force, || {
+            let mut failures = Vec::new();
+            for policy_name in REMOVED_QOS_POLICY_NAMES {
+                let policy_path = Self::qos_policy_path(policy_name);
+                if let Err(error) = delete_network_registry_key(&policy_path) {
+                    failures.push(format!("{policy_name}: {error}"));
+                }
+            }
+            if let Err(error) = Self::remove_legacy_roblox_priority_policy() {
+                failures.push(error.to_string());
+            }
+            if !failures.is_empty() {
+                anyhow::bail!("{}", failures.join("; "));
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            warn!("Old QoS cleanup did not finish and will be retried: {error}");
+        }
+    }
+
+    fn qos_policy_path(policy_name: &str) -> String {
+        format!(
+            r"HKLM\SOFTWARE\Policies\Microsoft\Windows\QoS\{}",
+            policy_name
+        )
+    }
+
+    fn relay_qos_policy_name(exe: &str) -> String {
+        format!(
+            "{}{}",
+            RELAY_QOS_POLICY_PREFIX,
+            exe.trim_end_matches(".exe")
+        )
+    }
+
+    fn cleanup_relay_socket_qos_policies() -> Result<()> {
+        let mut errors = Vec::new();
+        for exe in RELAY_QOS_EXECUTABLES {
+            let policy_name = Self::relay_qos_policy_name(exe);
+            let policy_path = Self::qos_policy_path(&policy_name);
+            if let Err(error) = delete_network_registry_key(&policy_path) {
+                errors.push(format!("{policy_name}: {error}"));
+            }
+        }
+        if !errors.is_empty() {
+            anyhow::bail!("Could not remove relay QoS policies: {}", errors.join("; "));
+        }
+        Ok(())
+    }
+
+    fn set_registry_string(key_path: &str, value_name: &str, value: &str) -> Result<()> {
+        #[cfg(windows)]
+        {
+            create_network_registry_key(key_path)?.set_value(value_name, &value)?;
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        anyhow::bail!("Network registry changes require Windows")
+    }
+
+    fn write_relay_qos_policy(policy_name: &str, exe: &str) -> Result<()> {
+        let policy_path = Self::qos_policy_path(policy_name);
+        for (value_name, value) in [
+            ("Version", "1.0"),
+            ("Application Name", exe),
+            ("Protocol", "UDP"),
+            ("DSCP Value", RELAY_QOS_DSCP_VALUE),
+            ("Throttle Rate", "-1"),
+            ("Local Port", "*"),
+            ("Local IP", "*"),
+            ("Local IP Prefix Length", "*"),
+            ("Remote Port", RELAY_QOS_REMOTE_PORT),
+            ("Remote IP", "*"),
+            ("Remote IP Prefix Length", "*"),
+        ] {
+            Self::set_registry_string(&policy_path, value_name, value)?;
+        }
+        Ok(())
+    }
+
+    fn relay_qos_requested(config: &NetworkConfig) -> bool {
+        config.disable_network_throttling
+    }
+
+    fn enable_relay_socket_qos_policy(&mut self) -> Result<()> {
+        info!("Enabling relay-scoped DSCP EF policy for SwiftTunnel UDP traffic");
+
+        if self.qos_registry_snapshot.is_none() {
+            self.qos_registry_snapshot = Some(QosRegistrySnapshot {
+                do_not_use_nla: Self::query_registry_dword_checked(
+                    TCPIP_QOS_KEY,
+                    REG_VALUE_DO_NOT_USE_NLA,
+                )?,
+                disable_user_tos_setting: Self::query_registry_dword_checked(
+                    TCPIP_PARAMETERS_KEY,
+                    REG_VALUE_DISABLE_USER_TOS_SETTING,
+                )?,
+            });
+        }
+
+        // Make Windows policy/user TOS marking deterministic on all network profiles,
+        // then scope the DSCP policy to only SwiftTunnel's relay UDP endpoint.
+        self.with_saved_snapshot(|| {
+            Self::set_registry_dword(TCPIP_QOS_KEY, REG_VALUE_DO_NOT_USE_NLA, 1)?;
+            Self::set_registry_dword(TCPIP_PARAMETERS_KEY, REG_VALUE_DISABLE_USER_TOS_SETTING, 0)?;
+            for exe in RELAY_QOS_EXECUTABLES {
+                let policy_name = Self::relay_qos_policy_name(exe);
+                Self::write_relay_qos_policy(&policy_name, exe)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn remove_relay_socket_qos_policy(&mut self) -> Result<()> {
+        Self::cleanup_relay_socket_qos_policies()?;
+        self.restore_qos_registry_snapshot()
+    }
+
+    fn powershell_single_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    fn legacy_qos_policy_removal_script(policy_name: &str) -> String {
+        let quoted_policy = Self::powershell_single_quote(policy_name);
+        format!(
+            "$ErrorActionPreference = 'Stop'; \
+             $policy = Get-NetQosPolicy -ErrorAction Stop | Where-Object {{ $_.Name -eq {quoted_policy} }}; \
+             if ($null -eq $policy) {{ Write-Output 'SwiftTunnel:LegacyQoSAbsent'; exit 0; }} \
+             Remove-NetQosPolicy -Name {quoted_policy} -Confirm:$false -ErrorAction Stop; \
+             Write-Output 'SwiftTunnel:LegacyQoSRemoved'"
+        )
+    }
+
+    // ===== TIER 1 (SAFE) NETWORK BOOSTS =====
+
+    /// Disable Nagle's algorithm for lower latency on small packets
+    /// Nagle's algorithm batches small packets to reduce overhead, but adds latency
+    /// This is especially beneficial for games that send many small packets
+    fn disable_nagle_algorithm(&mut self) -> Result<()> {
+        info!("Disabling Nagle's algorithm for all adapters");
+
+        let adapter_guids = self.list_adapter_guids()?;
+        if adapter_guids.is_empty() {
+            return Err(anyhow::anyhow!("no network adapters found"));
+        }
+
+        for guid in adapter_guids {
+            let key_path = format!(
+                r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{}",
+                guid
+            );
+            if !self.nagle_registry_snapshot.contains_key(&guid) {
+                let snapshot = NagleRegistrySnapshot {
+                    tcp_ack_frequency: Self::query_registry_dword_checked(
+                        &key_path,
+                        REG_VALUE_TCP_ACK_FREQUENCY,
+                    )?,
+                    tcp_no_delay: Self::query_registry_dword_checked(
+                        &key_path,
+                        REG_VALUE_TCP_NO_DELAY,
+                    )?,
+                };
+                self.nagle_registry_snapshot.insert(guid, snapshot);
+            }
+
+            self.with_saved_snapshot(|| {
+                Self::set_registry_dword(&key_path, REG_VALUE_TCP_ACK_FREQUENCY, 1)?;
+                Self::set_registry_dword(&key_path, REG_VALUE_TCP_NO_DELAY, 1)
+            })?;
+        }
+        info!("Nagle's algorithm disabled on all adapters");
+
+        Ok(())
+    }
+
+    fn restore_nagle_algorithm(&mut self) -> Result<()> {
+        info!("Restoring Nagle settings to adapter snapshots");
+
+        if self.nagle_registry_snapshot.is_empty() {
+            info!("No Nagle snapshot captured in this session; skipping restore");
+            return Ok(());
+        }
+
+        for (guid, snapshot) in self.nagle_registry_snapshot.clone() {
+            let key_path = format!(
+                r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{}",
+                guid
+            );
+
+            Self::restore_registry_dword(
+                &key_path,
+                REG_VALUE_TCP_ACK_FREQUENCY,
+                snapshot.tcp_ack_frequency,
+            )?;
+            Self::restore_registry_dword(&key_path, REG_VALUE_TCP_NO_DELAY, snapshot.tcp_no_delay)?;
+        }
+
+        self.nagle_registry_snapshot.clear();
+        Ok(())
+    }
+
+    /// Disable Windows network throttling for full bandwidth to games
+    /// Windows throttles network for multimedia apps, this gives games full bandwidth
+    fn disable_network_throttling(&mut self) -> Result<()> {
+        info!("Disabling Windows network throttling");
+
+        if self.network_throttling_snapshot.is_none() {
+            self.network_throttling_snapshot = Some(NetworkThrottlingSnapshot {
+                network_throttling_index: Self::query_registry_dword_checked(
+                    NETWORK_SYSTEM_PROFILE_KEY,
+                    REG_VALUE_NETWORK_THROTTLING_INDEX,
+                )?,
+                system_responsiveness: Self::query_registry_dword_checked(
+                    NETWORK_SYSTEM_PROFILE_KEY,
+                    REG_VALUE_SYSTEM_RESPONSIVENESS,
+                )?,
+            });
+        }
+
+        self.with_saved_snapshot(|| {
+            Self::set_registry_dword(
+                NETWORK_SYSTEM_PROFILE_KEY,
+                REG_VALUE_NETWORK_THROTTLING_INDEX,
+                u32::MAX, // 0xFFFFFFFF
+            )?;
+            Self::set_registry_dword(
+                NETWORK_SYSTEM_PROFILE_KEY,
+                REG_VALUE_SYSTEM_RESPONSIVENESS,
+                0,
+            )
+        })?;
+        info!("Network throttling disabled");
+        Ok(())
+    }
+
+    fn restore_network_throttling(&mut self) -> Result<()> {
+        info!("Restoring Windows network throttling from snapshot");
+
+        let Some(snapshot) = self.network_throttling_snapshot.clone() else {
+            info!("No network throttling snapshot captured in this session; skipping restore");
+            return Ok(());
+        };
+
+        Self::restore_registry_dword(
+            NETWORK_SYSTEM_PROFILE_KEY,
+            REG_VALUE_NETWORK_THROTTLING_INDEX,
+            snapshot.network_throttling_index,
+        )?;
+        Self::restore_registry_dword(
+            NETWORK_SYSTEM_PROFILE_KEY,
+            REG_VALUE_SYSTEM_RESPONSIVENESS,
+            snapshot.system_responsiveness,
+        )?;
+
+        self.network_throttling_snapshot = None;
+        Ok(())
+    }
+
+    fn restore_qos_registry_snapshot(&mut self) -> Result<()> {
+        let Some(snapshot) = self.qos_registry_snapshot.clone() else {
+            return Ok(());
+        };
+
+        Self::restore_registry_dword(
+            TCPIP_QOS_KEY,
+            REG_VALUE_DO_NOT_USE_NLA,
+            snapshot.do_not_use_nla,
+        )?;
+        Self::restore_registry_dword(
+            TCPIP_PARAMETERS_KEY,
+            REG_VALUE_DISABLE_USER_TOS_SETTING,
+            snapshot.disable_user_tos_setting,
+        )?;
+        self.qos_registry_snapshot = None;
+        Ok(())
+    }
+
+    /// Restore original DNS settings
+    pub fn restore(&mut self) -> Result<()> {
+        info!("Restoring original network settings");
+        // Direct shutdown/cleanup callers must not discard an existing record
+        // just because this instance has not performed startup recovery yet.
+        self.load_saved_snapshot()?;
+
+        let mut errors = Vec::new();
+
+        // Restore low-latency registry overrides.
+        if let Err(e) = self.restore_nagle_algorithm() {
+            errors.push(format!("Nagle registry restore: {}", e));
+        }
+        if let Err(e) = self.restore_network_throttling() {
+            errors.push(format!("network throttling registry restore: {}", e));
+        }
+
+        self.cleanup_removed_qos_policies(true);
+        if let Err(e) = self.remove_relay_socket_qos_policy() {
+            errors.push(format!("relay DSCP policy restore: {}", e));
+        }
+
+        // Remove firewall rules
+        if let Err(e) = self.firewall_fixer.restore() {
+            errors.push(format!("firewall rule restore: {}", e));
+        }
+
+        if !errors.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Network restore incomplete: {}",
+                errors.join("; ")
+            ));
+        }
+
+        self.persist_snapshot()
+    }
+
+    /// Save pre-modification values to disk for crash/uninstall recovery.
+    fn snapshot(&self) -> PersistentSnapshot {
+        PersistentSnapshot {
+            nagle_registry_snapshot: self.nagle_registry_snapshot.clone(),
+            network_throttling_snapshot: self.network_throttling_snapshot.clone(),
+            qos_registry_snapshot: self.qos_registry_snapshot.clone(),
+        }
+    }
+
+    fn persist_snapshot(&self) -> Result<()> {
+        let path =
+            snapshot_path().ok_or_else(|| anyhow::anyhow!("No network rollback directory"))?;
+        save_network_snapshot(&path, &self.snapshot())
+    }
+
+    fn with_saved_snapshot<T>(&self, change: impl FnOnce() -> Result<T>) -> Result<T> {
+        let path =
+            snapshot_path().ok_or_else(|| anyhow::anyhow!("No network rollback directory"))?;
+        change_with_network_snapshot(&path, &self.snapshot(), change)
+    }
+
+    fn load_saved_snapshot(&mut self) -> Result<()> {
+        let path =
+            snapshot_path().ok_or_else(|| anyhow::anyhow!("No network rollback directory"))?;
+        self.merge_saved_snapshot(read_network_snapshot(&path)?);
+        Ok(())
+    }
+
+    fn merge_saved_snapshot(&mut self, snapshot: PersistentSnapshot) {
+        self.nagle_registry_snapshot
+            .extend(snapshot.nagle_registry_snapshot);
+        if snapshot.network_throttling_snapshot.is_some() {
+            self.network_throttling_snapshot = snapshot.network_throttling_snapshot;
+        }
+        if snapshot.qos_registry_snapshot.is_some() {
+            self.qos_registry_snapshot = snapshot.qos_registry_snapshot;
+        }
+    }
+
+    fn recover_from_snapshot_checked(&mut self) -> Result<()> {
+        self.load_saved_snapshot()?;
+        if self.snapshot().is_empty() {
+            return Ok(());
+        }
+        info!("Recovering network settings from persisted snapshot");
+        self.restore()
+    }
+
+    pub fn recover_from_snapshot(&mut self) {
+        if let Err(e) = self.recover_from_snapshot_checked() {
+            warn!("Network recovery incomplete; keeping rollback data: {e}");
+        }
+    }
+}
+
+/// Stateless cleanup of ALL SwiftTunnel system modifications.
+///
+/// Does not rely on in-memory snapshots — scans the system for known
+/// SwiftTunnel artifacts and removes them. Used by `--cleanup` (NSIS
+/// uninstaller) and the `system_cleanup` Tauri command.
+pub fn cleanup_all_system_state() -> Result<()> {
+    if let Err(error) = crate::vpn::process_performance::recover_gpu_preferences() {
+        warn!("Cleanup: runtime GPU originals remain for recovery: {error}");
+    }
+    info!("Running full stateless system cleanup");
+
+    let mut booster = NetworkBooster::new();
+    let network_recovery = booster.recover_from_snapshot_checked();
+
+    // 1. Remove hosts file entries
+    if let Err(e) = crate::roblox_proxy::hosts::remove_overrides() {
+        warn!("Cleanup: failed to remove hosts overrides: {e}");
+    }
+
+    // 1b. Stop/remove leftovers from the removed v2.1.9 GoodbyeDPI helper.
+    if let Err(e) = crate::roblox_proxy::legacy_goodbyedpi::cleanup_for_uninstall() {
+        warn!("Cleanup: legacy GoodbyeDPI cleanup failed (non-fatal): {e}");
+    }
+
+    // 2. Delete SwiftTunnel QoS policies from older releases and the current
+    // relay-scoped DSCP policy.
+    booster.cleanup_removed_qos_policies(true);
+    if let Err(error) = NetworkBooster::cleanup_relay_socket_qos_policies() {
+        warn!("Cleanup: relay QoS policy removal failed: {error}");
+    }
+
+    info!(
+        "Cleanup: leaving global TCP/QoS registry values untouched unless a persisted SwiftTunnel snapshot restored them"
+    );
+
+    // 3. Remove firewall rules.
+    let mut firewall = FirewallFixer::new();
+    let _ = firewall.restore();
+
+    // 7. Remove the startup entries.
+    //
+    // Both clients write their own at runtime, so Windows Installer does not
+    // know they exist and leaves them behind pointing at a deleted exe.
+    crate::autostart::remove_all_run_entries();
+
+    // Only successful restoration removes its rollback record. Failed or
+    // unreadable records must survive uninstall cleanup for a recovery retry.
+
+    // 9. Restore system optimizer settings (MMCSS, Game Bar, fullscreen opts, Game Mode, power plan)
+    crate::system_optimizer::cleanup_for_uninstall();
+
+    // 10. Recover TSO/IPv6 adapter settings if they were left disabled by a crash
+    crate::vpn::recover_tso_on_startup();
+    crate::vpn::recover_ipv6_on_startup();
+
+    // 11. Remove stale WFP block filters left by older non-dynamic sessions.
+    crate::vpn::wfp_block::cleanup_stale();
+
+    // 12. Reset any adapter left in WinpkFilter tunnel mode.
+    crate::vpn::SplitTunnelDriver::cleanup_stale_state();
+
+    // 13. Remove the WinpkFilter driver package and NDISRD service during
+    // uninstall/explicit cleanup so the app does not leave kernel artifacts
+    // behind. Best-effort: if this fails we log it and continue rather than
+    // aborting the uninstall. Blocking uninstall entirely leaves the user
+    // permanently stuck (often the reason they are uninstalling in the first
+    // place), which is worse than a stale driver that a subsequent install
+    // will replace.
+    if let Err(e) = crate::vpn::split_tunnel::SplitTunnelDriver::remove_driver_for_uninstall() {
+        warn!("Cleanup: driver removal failed (non-fatal): {}", e);
+    }
+
+    // 14. Remove Roblox FFlag entries from ClientAppSettings.json
+    crate::roblox_optimizer::RobloxOptimizer::cleanup_for_uninstall();
+
+    // Step 7 already removed the startup entries, and it is the only place
+    // that should. A second `reg delete` used to run here naming "SwiftTunnel"
+    // outright, so whichever client was being uninstalled, the full app's
+    // entry went with it. That defeated the check in step 7 silently: the log
+    // said the entry was being kept because the other client is installed, and
+    // it was deleted moments later anyway.
+
+    info!("Full system cleanup completed");
+    network_recovery
+}
+
+impl Default for NetworkBooster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_registry_targets_keep_the_expected_hive_and_reject_malformed_paths() {
+        for path in [
+            NETWORK_SYSTEM_PROFILE_KEY,
+            TCPIP_QOS_KEY,
+            TCPIP_PARAMETERS_KEY,
+            &NetworkBooster::qos_policy_path("SwiftTunnel_RelaySocketQoS_SwiftTunnel"),
+        ] {
+            assert_eq!(
+                network_registry_subkey(path).unwrap(),
+                path.strip_prefix("HKLM\\").unwrap()
+            );
+        }
+        for path in [
+            "",
+            "HKLM",
+            "HKLM\\",
+            "HKCU\\Software\\SwiftTunnel",
+            "HKLM\\SOFTWARE\\",
+            "HKLM\\SOFT\0WARE",
+        ] {
+            assert!(network_registry_subkey(path).is_err(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn qos_key_removal_cannot_select_an_unrelated_or_parent_key() {
+        for policy in [
+            REMOVED_QOS_POLICY_NAMES[0],
+            "SwiftTunnel_RelaySocketQoS_SwiftTunnel",
+        ] {
+            let path = NetworkBooster::qos_policy_path(policy);
+            assert!(qos_registry_subkey(&path).is_ok());
+        }
+        for path in [
+            TCPIP_PARAMETERS_KEY,
+            r"HKLM\SOFTWARE\Policies\Microsoft\Windows\QoS",
+            r"HKLM\SOFTWARE\Policies\Microsoft\Windows\QoS\OtherApp",
+            r"HKLM\SOFTWARE\Policies\Microsoft\Windows\QoS\SwiftTunnel_RelaySocketQoS_SwiftTunnel\nested",
+        ] {
+            assert!(qos_registry_subkey(path).is_err(), "{path}");
+        }
+    }
+
+    fn adapter_query_result(stdout: &str) -> crate::BoundedCommandOutput {
+        crate::BoundedCommandOutput {
+            success: true,
+            timed_out: false,
+            exit_code: Some(0),
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn adapter_query_rejects_partial_results_on_failure_or_timeout() {
+        let guid = "{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}";
+        let mut failed = adapter_query_result(guid);
+        failed.success = false;
+        failed.exit_code = Some(1);
+        assert!(parse_adapter_guids(failed).is_err());
+        let mut timed_out = adapter_query_result(guid);
+        timed_out.timed_out = true;
+        assert!(parse_adapter_guids(timed_out).is_err());
+    }
+
+    #[test]
+    fn adapter_query_validates_the_entire_result_before_returning_targets() {
+        let guid = "{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}";
+        for invalid in ["Wi-Fi", "Warning: failed", "..\\Other", "{bad}", ""] {
+            if invalid.is_empty() {
+                assert!(
+                    parse_adapter_guids(adapter_query_result(invalid))
+                        .unwrap()
+                        .is_empty()
+                );
+                continue;
+            }
+            let output = adapter_query_result(&format!("{guid}\r\n{invalid}"));
+            assert!(parse_adapter_guids(output).is_err());
+        }
+        let output = adapter_query_result(&format!("\r\n {guid} \r\n{}\n", guid.to_lowercase()));
+        assert_eq!(parse_adapter_guids(output).unwrap(), vec![guid]);
+    }
+
+    fn snapshot_test_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-network-test-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    fn example_snapshot() -> PersistentSnapshot {
+        PersistentSnapshot {
+            network_throttling_snapshot: Some(NetworkThrottlingSnapshot {
+                network_throttling_index: Some(10),
+                system_responsiveness: Some(20),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn oversized_network_originals_are_refused_and_cannot_be_overwritten() {
+        let dir = snapshot_test_dir();
+        let path = dir.join(SNAPSHOT_FILE);
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(1024 * 1024 + 1).unwrap();
+        drop(file);
+        assert!(read_network_snapshot(&path).is_err());
+        assert!(save_network_snapshot(&path, &PersistentSnapshot::default()).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 1024 * 1024 + 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_snapshot_save_preserves_the_readable_previous_originals() {
+        let dir = snapshot_test_dir();
+        let path = dir.join(SNAPSHOT_FILE);
+        save_network_snapshot(&path, &example_snapshot()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut snapshot = example_snapshot();
+        snapshot.nagle_registry_snapshot.insert(
+            "x".repeat(MAX_NETWORK_SNAPSHOT_BYTES),
+            NagleRegistrySnapshot::default(),
+        );
+        assert!(
+            save_network_snapshot(&path, &snapshot)
+                .unwrap_err()
+                .to_string()
+                .contains("too large")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn network_changes_require_saved_originals_and_keep_them_after_failure() {
+        let dir = snapshot_test_dir();
+        let path = dir.join(SNAPSHOT_FILE);
+        let snapshot = example_snapshot();
+        let mut changed = false;
+        let result: Result<()> = change_with_network_snapshot(&path, &snapshot, || {
+            assert_eq!(read_network_snapshot(&path).unwrap(), snapshot);
+            changed = true;
+            Err(anyhow::anyhow!("injected operation failure"))
+        });
+        assert!(result.is_err());
+        assert!(changed);
+        assert_eq!(read_network_snapshot(&path).unwrap(), snapshot);
+
+        let invalid_path = path.join("not-a-directory.json");
+        changed = false;
+        let result = change_with_network_snapshot(&invalid_path, &snapshot, || {
+            changed = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(
+            !changed,
+            "must not mutate settings if originals cannot be saved"
+        );
+        assert_eq!(read_network_snapshot(&path).unwrap(), snapshot);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_network_recovery_record_is_never_overwritten_or_deleted() {
+        let dir = snapshot_test_dir();
+        let path = dir.join(SNAPSHOT_FILE);
+        std::fs::write(&path, b"interrupted old snapshot").unwrap();
+        assert!(read_network_snapshot(&path).is_err());
+        let mut changed = false;
+        assert!(
+            change_with_network_snapshot(&path, &example_snapshot(), || {
+                changed = true;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!changed);
+        assert!(save_network_snapshot(&path, &PersistentSnapshot::default()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"interrupted old snapshot");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_network_snapshot_replace_preserves_the_previous_record() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = snapshot_test_dir();
+        let path = dir.join(SNAPSHOT_FILE);
+        let old = example_snapshot();
+        save_network_snapshot(&path, &old).unwrap();
+        let mut next = old.clone();
+        next.qos_registry_snapshot = Some(QosRegistrySnapshot::default());
+        {
+            let _lock = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&path)
+                .unwrap();
+            let mut changed = false;
+            assert!(
+                change_with_network_snapshot(&path, &next, || {
+                    changed = true;
+                    Ok(())
+                })
+                .is_err()
+            );
+            assert!(!changed);
+            assert_eq!(read_network_snapshot(&path).unwrap(), old);
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        }
+        save_network_snapshot(&path, &next).unwrap();
+        assert_eq!(read_network_snapshot(&path).unwrap(), next);
+        save_network_snapshot(&path, &PersistentSnapshot::default()).unwrap();
+        assert!(!path.exists());
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn persisted_network_originals_survive_partial_in_memory_state() {
+        let mut booster = NetworkBooster::new();
+        booster.network_throttling_snapshot = Some(NetworkThrottlingSnapshot::default());
+        booster
+            .nagle_registry_snapshot
+            .insert("new-adapter".into(), NagleRegistrySnapshot::default());
+        let mut saved = example_snapshot();
+        saved.nagle_registry_snapshot.insert(
+            "old-adapter".into(),
+            NagleRegistrySnapshot {
+                tcp_ack_frequency: Some(2),
+                tcp_no_delay: None,
+            },
+        );
+        booster.merge_saved_snapshot(saved.clone());
+        assert_eq!(
+            booster.network_throttling_snapshot,
+            saved.network_throttling_snapshot
+        );
+        assert_eq!(
+            booster.nagle_registry_snapshot["old-adapter"].tcp_ack_frequency,
+            Some(2)
+        );
+        assert!(booster.nagle_registry_snapshot.contains_key("new-adapter"));
+    }
+
+    #[test]
+    fn registry_capture_distinguishes_absent_values_from_failed_reads() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            optional_registry_read(Ok(u32::MAX)).unwrap(),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            optional_registry_read::<u32>(Err(Error::from(ErrorKind::NotFound))).unwrap(),
+            None
+        );
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData,
+            ErrorKind::Interrupted,
+        ] {
+            assert!(optional_registry_read::<u32>(Err(Error::from(kind))).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_qos_removal_script_treats_missing_exact_policy_as_success() {
+        let script = NetworkBooster::legacy_qos_policy_removal_script("RobloxPriority");
+
+        assert!(script.contains("Get-NetQosPolicy -ErrorAction Stop"));
+        assert!(script.contains("$_.Name -eq 'RobloxPriority'"));
+        assert!(!script.contains("SilentlyContinue"));
+        assert!(script.contains("SwiftTunnel:LegacyQoSAbsent"));
+        assert!(script.contains("exit 0"));
+        assert!(!script.contains("RobloxPriority*"));
+    }
+
+    #[test]
+    fn legacy_qos_removal_script_escapes_policy_names() {
+        let script = NetworkBooster::legacy_qos_policy_removal_script("Roblox'Priority");
+
+        assert!(script.contains("$_.Name -eq 'Roblox''Priority'"));
+        assert!(!script.contains("-Name 'Roblox'Priority'"));
+    }
+
+    #[test]
+    fn network_migration_skips_only_successful_automatic_repeats_and_retries_restore() {
+        let mut completed = false;
+        assert!(
+            run_network_migration(&mut completed, false, || anyhow::bail!("provider failed"))
+                .is_err()
+        );
+        assert!(!completed);
+        run_network_migration(&mut completed, false, || Ok(())).unwrap();
+        assert!(completed);
+        run_network_migration(&mut completed, false, || panic!("already completed")).unwrap();
+        assert!(
+            run_network_migration(&mut completed, true, || anyhow::bail!("restore failed"))
+                .is_err()
+        );
+        assert!(!completed);
+        run_network_migration(&mut completed, false, || Ok(())).unwrap();
+        run_network_migration(&mut completed, true, || Ok(())).unwrap();
+        assert!(completed);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_qos_script_distinguishes_empty_results_from_provider_and_removal_failures() {
+        // Both policy commands are local functions. No real QoS provider,
+        // registry values, policies or network settings are queried or changed.
+        let get_empty = "function Get-NetQosPolicy { [CmdletBinding()] param([string]$Name) @() }";
+        let get_match = "function Get-NetQosPolicy { [CmdletBinding()] param([string]$Name) [pscustomobject]@{Name='OtherApp'}; [pscustomobject]@{Name='RobloxPriority'} }";
+        let get_failed = "function Get-NetQosPolicy { [CmdletBinding()] param([string]$Name) Write-Error -Category PermissionDenied -Message 'fixture provider failed' }";
+        let remove_ok = "function Remove-NetQosPolicy { [CmdletBinding()] param([string]$Name, [bool]$Confirm) Write-Output ('fixture-removed:'+$Name) }";
+        let remove_failed = "function Remove-NetQosPolicy { [CmdletBinding()] param([string]$Name, [bool]$Confirm) Write-Error 'fixture removal failed' }";
+        for (get, remove, success, marker) in [
+            (get_empty, remove_ok, true, "SwiftTunnel:LegacyQoSAbsent"),
+            (get_match, remove_ok, true, "fixture-removed:RobloxPriority"),
+            (get_failed, remove_ok, false, ""),
+            (get_match, remove_failed, false, ""),
+        ] {
+            let script = format!(
+                "$PSModuleAutoLoadingPreference='None'; Import-Module ($PSHOME + '\\Modules\\Microsoft.PowerShell.Utility\\Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop; {get}; {remove}; {}",
+                NetworkBooster::legacy_qos_policy_removal_script("RobloxPriority")
+            );
+            let output = crate::run_hidden_command_with_timeout(
+                "powershell",
+                &["-NoProfile", "-NonInteractive", "-Command", &script],
+                std::time::Duration::from_secs(8),
+            );
+            assert!(!output.timed_out);
+            assert_eq!(
+                output.success, success,
+                "{} / {}",
+                output.stdout, output.stderr
+            );
+            if success {
+                assert!(output.stdout.contains(marker), "{}", output.stdout);
+            } else {
+                assert!(!output.stdout.contains("SwiftTunnel:LegacyQoSAbsent"));
+                assert!(!output.stdout.contains("SwiftTunnel:LegacyQoSRemoved"));
+            }
+            assert!(!output.stdout.contains("fixture-removed:OtherApp"));
+        }
+    }
+
+    #[test]
+    fn persistent_snapshot_accepts_pre_qos_snapshot_files() {
+        let snapshot: PersistentSnapshot = serde_json::from_str(
+            r#"{
+              "nagle_registry_snapshot": {},
+              "network_throttling_snapshot": null
+            }"#,
+        )
+        .expect("old snapshot without QoS fields should still load");
+
+        assert!(snapshot.qos_registry_snapshot.is_none());
+    }
+
+    /// Verify apply_optimizations returns Ok even when individual optimizations
+    /// fail (e.g. no PowerShell, non-Windows host).
+    #[test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mutates real system network settings on elevated Windows runners"
+    )]
+    fn apply_optimizations_succeeds_despite_individual_failures() {
+        let mut booster = NetworkBooster::new();
+        let config = NetworkConfig {
+            disable_nagle: true,
+            disable_network_throttling: true,
+            ..Default::default()
+        };
+
+        // On non-Windows (CI) or without admin, every sub-optimization will
+        // fail — but apply_optimizations must still return Ok(()).
+        let result = booster.apply_optimizations(&config);
+        assert!(
+            result.is_ok(),
+            "apply_optimizations should not abort on individual failures: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mutates real system network settings on elevated Windows runners"
+    )]
+    fn apply_optimizations_with_nothing_enabled() {
+        let mut booster = NetworkBooster::new();
+        let config = NetworkConfig {
+            disable_nagle: false,
+            disable_network_throttling: false,
+            ..Default::default()
+        };
+
+        let result = booster.apply_optimizations(&config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn removed_qos_policy_cleanup_covers_all_swifttunnel_policy_names() {
+        assert!(
+            REMOVED_QOS_POLICY_NAMES.contains(&"SwiftTunnel_QoS_Windows10Universal"),
+            "removed QoS cleanup list must strip the over-broad Store host policy"
+        );
+        assert!(
+            REMOVED_QOS_POLICY_NAMES.contains(&"SwiftTunnel_QoS_RobloxPlayerBeta"),
+            "removed QoS cleanup list must strip the former Roblox player policy"
+        );
+        assert!(
+            REMOVED_QOS_POLICY_NAMES.contains(&"SwiftTunnel_QoS_Relay_swifttunnel-desktop"),
+            "removed QoS cleanup list must strip the former relay policy"
+        );
+    }
+
+    #[test]
+    fn relay_qos_policy_is_relay_scoped_and_not_legacy_cleanup() {
+        for exe in RELAY_QOS_EXECUTABLES {
+            let policy_name = NetworkBooster::relay_qos_policy_name(exe);
+            assert!(policy_name.starts_with(RELAY_QOS_POLICY_PREFIX));
+            assert!(
+                !REMOVED_QOS_POLICY_NAMES.contains(&policy_name.as_str()),
+                "current relay DSCP policy must not be deleted by removed-policy cleanup"
+            );
+        }
+        assert_eq!(RELAY_QOS_REMOTE_PORT, "*");
+        assert_eq!(RELAY_QOS_DSCP_VALUE, "46");
+        assert!(NetworkBooster::relay_qos_requested(&NetworkConfig {
+            disable_network_throttling: true,
+            ..Default::default()
+        }));
+        assert!(!NetworkBooster::relay_qos_requested(&NetworkConfig {
+            disable_nagle: true,
+            ..Default::default()
+        }));
+        assert!(!RELAY_QOS_EXECUTABLES.contains(&"Windows10Universal.exe"));
+        assert!(!RELAY_QOS_EXECUTABLES.contains(&"RobloxPlayerBeta.exe"));
+    }
+}

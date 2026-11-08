@@ -1,0 +1,904 @@
+use serde::{Deserialize, Serialize};
+
+/// Optimization profile presets
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OptimizationProfile {
+    LowEnd,
+    Balanced,
+    HighEnd,
+    Custom,
+}
+
+/// Configuration for the FPS booster
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    pub profile: OptimizationProfile,
+    pub system_optimization: SystemOptimizationConfig,
+    pub roblox_settings: RobloxSettingsConfig,
+    pub network_settings: NetworkConfig,
+    #[serde(default)]
+    pub overlay: OverlayConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            profile: OptimizationProfile::Balanced,
+            system_optimization: SystemOptimizationConfig::default(),
+            roblox_settings: RobloxSettingsConfig::default(),
+            network_settings: NetworkConfig::default(),
+            overlay: OverlayConfig::default(),
+        }
+    }
+}
+
+/// Stats bar settings, surfaced in the Overlay tab.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OverlayConfig {
+    /// Master on/off for the in-game stats overlay.
+    pub enabled: bool,
+    /// Selected metrics, in display order (max 12). Ids: fps, ping, game_ping, time,
+    /// playtime, battery, upload, download, cpu, cpu_temp, gpu, gpu_temp, ram,
+    /// disk.
+    pub metrics: Vec<String>,
+    /// "small" | "medium" | "large".
+    pub size: String,
+    /// "straight" | "layered".
+    pub style: String,
+    /// Hex accent color for the live values.
+    pub color: String,
+    /// One of nine anchors: top-left/top-center/top-right/center-left/center/
+    /// center-right/bottom-left/bottom-center/bottom-right.
+    pub position: String,
+    /// Free-drag override (physical px from the monitor's top-left). When set, takes
+    /// precedence over `position` so users can align the bar anywhere.
+    #[serde(default)]
+    pub custom_x: Option<f64>,
+    #[serde(default)]
+    pub custom_y: Option<f64>,
+    /// Keep the stats window click-through until the player unlocks movement.
+    #[serde(default = "overlay_position_locked")]
+    pub locked: bool,
+    /// Global toggle hotkey, e.g. "Ctrl+Shift+O".
+    pub hotkey: String,
+}
+
+fn overlay_position_locked() -> bool {
+    true
+}
+
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            metrics: vec![
+                "fps".into(),
+                "ping".into(),
+                "time".into(),
+                "playtime".into(),
+                "cpu".into(),
+                "ram".into(),
+                "download".into(),
+            ],
+            size: "small".into(),
+            style: "straight".into(),
+            color: "#fafafa".into(),
+            position: "top-left".into(),
+            custom_x: None,
+            custom_y: None,
+            locked: true,
+            hotkey: "Ctrl+Shift+O".into(),
+        }
+    }
+}
+
+/// System-level optimization settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemOptimizationConfig {
+    pub set_high_priority: bool,
+    pub set_cpu_affinity: bool,
+    pub cpu_cores: Vec<usize>,
+    pub disable_fullscreen_optimization: bool,
+    /// Serialization compatibility for older Lite clients sharing this file.
+    /// This retired setting has no runtime behavior.
+    #[serde(default)]
+    pub clear_standby_memory: bool,
+    pub disable_game_bar: bool,
+    pub power_plan: PowerPlan,
+    #[serde(default)]
+    pub previous_power_plan: Option<PowerPlan>,
+    // Tier 1 (Safe) Boosts
+    #[serde(default)]
+    pub timer_resolution_1ms: bool,
+    #[serde(default)]
+    pub mmcss_gaming_profile: bool,
+    #[serde(default)]
+    pub game_mode_enabled: bool,
+}
+
+fn default_roblox_window_width() -> u32 {
+    1280
+}
+
+fn default_roblox_window_height() -> u32 {
+    720
+}
+
+fn default_roblox_window_fullscreen() -> bool {
+    false
+}
+
+impl Default for SystemOptimizationConfig {
+    fn default() -> Self {
+        Self {
+            set_high_priority: false,
+            set_cpu_affinity: false,
+            cpu_cores: vec![],
+            disable_fullscreen_optimization: false,
+            clear_standby_memory: false,
+            disable_game_bar: false,
+            power_plan: PowerPlan::Balanced,
+            previous_power_plan: None,
+            // Tier 1 boosts are opt-in by default.
+            timer_resolution_1ms: false,
+            mmcss_gaming_profile: false,
+            game_mode_enabled: false,
+        }
+    }
+}
+
+/// Power plan options
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PowerPlan {
+    Balanced,
+    HighPerformance,
+    Ultimate,
+    SwiftTunnel,
+}
+
+/// Roblox-specific settings
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RobloxSettingsConfig {
+    pub graphics_quality: GraphicsQuality,
+    pub unlock_fps: bool,
+    pub target_fps: u32,
+    #[serde(default = "default_roblox_window_width")]
+    pub window_width: u32,
+    #[serde(default = "default_roblox_window_height")]
+    pub window_height: u32,
+    #[serde(default = "default_roblox_window_fullscreen")]
+    pub window_fullscreen: bool,
+    /// Ultraboost: applies curated allowlisted performance FFlags for maximum FPS
+    #[serde(default)]
+    pub ultraboost: bool,
+    /// Custom FFlag import: only keys from SwiftTunnel's curated allowlist are accepted.
+    #[serde(default)]
+    pub custom_fflags_enabled: bool,
+    #[serde(default)]
+    pub custom_fflags_json: String,
+}
+
+impl RobloxSettingsConfig {
+    /// Roblox stores this as a signed XML integer. Do not wrap an edited u32
+    /// into a negative cap, and do not interpret a disabled setting's value.
+    pub fn checked_frame_cap(&self) -> std::result::Result<Option<i32>, String> {
+        if !self.unlock_fps {
+            return Ok(None);
+        }
+        i32::try_from(self.target_fps).map(Some).map_err(|_| {
+            "The saved FPS limit is too large. Choose a new limit in Roblox settings.".into()
+        })
+    }
+}
+
+impl Default for RobloxSettingsConfig {
+    fn default() -> Self {
+        Self {
+            graphics_quality: GraphicsQuality::Automatic,
+            // On by default, so a fresh install lifts Roblox's stock 60 cap
+            // without anyone having to find the switch. A player already
+            // running a higher cap keeps it: `sync_roblox_window_settings`
+            // reads Roblox's current FramerateCap into this config at startup,
+            // the same way it adopts window size and graphics level, so 300
+            // never lands on top of someone's 650.
+            unlock_fps: true,
+            target_fps: 300,
+            window_width: default_roblox_window_width(),
+            window_height: default_roblox_window_height(),
+            window_fullscreen: default_roblox_window_fullscreen(),
+            ultraboost: false,
+            custom_fflags_enabled: false,
+            custom_fflags_json: String::new(),
+        }
+    }
+}
+
+/// Graphics quality levels
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GraphicsQuality {
+    Automatic,
+    Manual,
+    Level1,
+    Level2,
+    Level3,
+    Level4,
+    Level5,
+    Level6,
+    Level7,
+    Level8,
+    Level9,
+    Level10,
+}
+
+impl GraphicsQuality {
+    /// Convert graphics quality to integer level (1-10, 0 for auto/manual)
+    pub fn to_level(&self) -> i32 {
+        match self {
+            GraphicsQuality::Automatic => 0,
+            GraphicsQuality::Manual => 0,
+            GraphicsQuality::Level1 => 1,
+            GraphicsQuality::Level2 => 2,
+            GraphicsQuality::Level3 => 3,
+            GraphicsQuality::Level4 => 4,
+            GraphicsQuality::Level5 => 5,
+            GraphicsQuality::Level6 => 6,
+            GraphicsQuality::Level7 => 7,
+            GraphicsQuality::Level8 => 8,
+            GraphicsQuality::Level9 => 9,
+            GraphicsQuality::Level10 => 10,
+        }
+    }
+
+    /// Create graphics quality from the saved menu level (0 for Automatic, 1-10).
+    pub fn from_level(level: i32) -> Self {
+        match level {
+            0 => GraphicsQuality::Automatic,
+            1 => GraphicsQuality::Level1,
+            2 => GraphicsQuality::Level2,
+            3 => GraphicsQuality::Level3,
+            4 => GraphicsQuality::Level4,
+            5 => GraphicsQuality::Level5,
+            6 => GraphicsQuality::Level6,
+            7 => GraphicsQuality::Level7,
+            8 => GraphicsQuality::Level8,
+            9 => GraphicsQuality::Level9,
+            10 => GraphicsQuality::Level10,
+            _ => GraphicsQuality::Level5, // Default to 5 for invalid values
+        }
+    }
+}
+
+/// Network optimization settings
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+pub struct NetworkConfig {
+    pub enable_network_boost: bool,
+    // Tier 1 (Safe) Network Boosts
+    #[serde(default)]
+    pub disable_nagle: bool,
+    #[serde(default)]
+    pub disable_network_throttling: bool,
+    /// Firewall Fix - Adds Windows Firewall allow rules for Roblox, flushes DNS, resets Winsock
+    #[serde(default)]
+    pub firewall_fix: bool,
+}
+
+impl NetworkConfig {
+    fn any_specific_boost_enabled(&self) -> bool {
+        self.disable_nagle || self.disable_network_throttling || self.firewall_fix
+    }
+
+    pub fn has_enabled_boosts(&self) -> bool {
+        self.any_specific_boost_enabled()
+    }
+
+    pub fn normalize_legacy_master_boost(&mut self) {
+        self.enable_network_boost = self.any_specific_boost_enabled();
+    }
+}
+
+impl<'de> Deserialize<'de> for NetworkConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Default, Deserialize)]
+        struct NetworkConfigWire {
+            enable_network_boost: Option<bool>,
+            // Removed QoS fields are accepted only so legacy settings with
+            // explicit per-toggle state do not get mistaken for old master-only
+            // configs and have unrelated boosts enabled during migration.
+            prioritize_roblox_traffic: Option<bool>,
+            disable_nagle: Option<bool>,
+            disable_network_throttling: Option<bool>,
+            gaming_qos: Option<bool>,
+            firewall_fix: Option<bool>,
+        }
+
+        let wire = NetworkConfigWire::deserialize(deserializer)?;
+        let has_any_specific_field = wire.disable_nagle.is_some()
+            || wire.disable_network_throttling.is_some()
+            || wire.firewall_fix.is_some()
+            || wire.prioritize_roblox_traffic.is_some()
+            || wire.gaming_qos.is_some();
+
+        let mut config = NetworkConfig {
+            enable_network_boost: wire.enable_network_boost.unwrap_or(false),
+            disable_nagle: wire.disable_nagle.unwrap_or(false),
+            disable_network_throttling: wire.disable_network_throttling.unwrap_or(false),
+            firewall_fix: wire.firewall_fix.unwrap_or(false),
+        };
+
+        if config.enable_network_boost && !has_any_specific_field {
+            config.disable_nagle = true;
+            config.disable_network_throttling = true;
+        }
+
+        config.normalize_legacy_master_boost();
+        Ok(config)
+    }
+}
+
+/// Real-time performance metrics
+#[derive(Debug, Clone, Default)]
+pub struct PerformanceMetrics {
+    pub fps: f32,
+    pub cpu_usage: f32,
+    pub ram_usage: f64, // in MB
+    pub ram_total: f64, // in MB
+    pub ping: u32,
+    pub roblox_running: bool,
+    pub process_id: Option<u32>,
+}
+
+/// System Restore Point info
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestorePointInfo {
+    pub created_at: String,
+    pub description: String,
+}
+
+/// Application state
+#[derive(Debug, Default)]
+pub struct AppState {
+    pub config: Config,
+    pub metrics: PerformanceMetrics,
+    pub optimizations_active: bool,
+    pub backup_created: bool,
+    pub last_error: Option<String>,
+    pub restore_point: Option<RestorePointInfo>,
+    pub timer_resolution_active: bool, // Track if 1ms timer is active (needs cleanup)
+}
+
+/// Result type for operations
+pub type Result<T> = anyhow::Result<T>;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  BOOST INFO - Detailed explanations for each optimization toggle
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Detailed information about a boost/optimization setting
+#[derive(Debug, Clone)]
+pub struct BoostInfo {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub short_desc: &'static str,
+    pub long_desc: &'static str,
+    pub impact: &'static str,
+    pub risk_level: RiskLevel,
+    pub requires_admin: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RiskLevel {
+    Safe,
+    LowRisk,
+    MediumRisk,
+}
+
+impl RiskLevel {
+    pub fn label(&self) -> &'static str {
+        match self {
+            RiskLevel::Safe => "Safe",
+            RiskLevel::LowRisk => "Low Risk",
+            RiskLevel::MediumRisk => "Medium Risk",
+        }
+    }
+}
+
+/// All boost info constants
+pub mod boost_info {
+    use super::{BoostInfo, RiskLevel};
+
+    // System Boosts (Tier 1)
+    pub const HIGH_PRIORITY: BoostInfo = BoostInfo {
+        id: "high_priority",
+        title: "High Priority Mode",
+        short_desc: "Boosts game process priority",
+        long_desc: "Sets Roblox process priority to 'High' in Windows Task Manager. This tells the CPU scheduler to give Roblox more processing time over background applications. Reverts automatically when Roblox closes.",
+        impact: "+5-15 FPS in CPU-bound scenarios",
+        risk_level: RiskLevel::Safe,
+        requires_admin: false,
+    };
+
+    pub const TIMER_RESOLUTION: BoostInfo = BoostInfo {
+        id: "timer_resolution",
+        title: "0.5ms Timer Resolution",
+        short_desc: "Max precision frame pacing",
+        long_desc: "Increases Windows system timer precision from ~15.6ms to 0.5ms using NtSetTimerResolution. This allows the most precise frame timing possible and minimizes micro-stuttering. Automatically restored when SwiftTunnel closes.",
+        impact: "Smoother frame delivery, reduced stutter",
+        risk_level: RiskLevel::Safe,
+        requires_admin: false,
+    };
+
+    pub const MMCSS: BoostInfo = BoostInfo {
+        id: "mmcss",
+        title: "MMCSS Gaming Profile",
+        short_desc: "Better thread scheduling",
+        long_desc: "Enables Windows Multimedia Class Scheduler Service for gaming. This prioritizes game threads over background tasks for more consistent CPU time allocation. Built into Windows, fully reversible.",
+        impact: "More stable frame times",
+        risk_level: RiskLevel::Safe,
+        requires_admin: true,
+    };
+
+    pub const GAME_MODE: BoostInfo = BoostInfo {
+        id: "game_mode",
+        title: "Windows Game Mode",
+        short_desc: "System resource prioritization",
+        long_desc: "Enables Windows built-in Game Mode which reduces background activity, pauses Windows Update, and prioritizes game processes. This is a standard Windows feature that can be toggled on/off anytime.",
+        impact: "More consistent performance",
+        risk_level: RiskLevel::Safe,
+        requires_admin: false,
+    };
+
+    pub const SWIFTTUNNEL_POWER_PLAN: BoostInfo = BoostInfo {
+        id: "swifttunnel_power_plan",
+        title: "SwiftTunnel Power Plan",
+        short_desc: "Custom low-latency power profile",
+        long_desc: "Imports and activates SwiftTunnel's custom Windows power plan while boosts are enabled. The previous active power plan is restored automatically when boosts turn off.",
+        impact: "More consistent CPU and device responsiveness",
+        risk_level: RiskLevel::Safe,
+        requires_admin: true,
+    };
+
+    // Network Boosts (Tier 1)
+    pub const DISABLE_NAGLE: BoostInfo = BoostInfo {
+        id: "disable_nagle",
+        title: "Disable Nagle's Algorithm",
+        short_desc: "Faster packet delivery (-5-15ms)",
+        long_desc: "Nagle's algorithm batches small packets together to reduce network overhead. Disabling it sends packets immediately, reducing latency for real-time games. This is a registry tweak that's easily reversible.",
+        impact: "-5-15ms latency reduction",
+        risk_level: RiskLevel::Safe,
+        requires_admin: true,
+    };
+
+    pub const NETWORK_THROTTLING: BoostInfo = BoostInfo {
+        id: "network_throttling",
+        title: "Disable Network Throttling",
+        short_desc: "Full bandwidth for games",
+        long_desc: "Windows throttles network throughput for multimedia applications by default. Disabling this allows games to use full network bandwidth without artificial limits. Registry change, easily reversible.",
+        impact: "Reduced network latency spikes",
+        risk_level: RiskLevel::Safe,
+        requires_admin: true,
+    };
+
+    pub const FIREWALL_FIX: BoostInfo = BoostInfo {
+        id: "firewall_fix",
+        title: "Roblox Firewall Fix",
+        short_desc: "Fix Roblox launch crashes",
+        long_desc: "Adds Windows Firewall allow rules for all Roblox executables, flushes DNS cache, resets Winsock catalog, and clears ARP cache. Fixes 'HttpError: Timedout' crashes on launch caused by firewall or DNS blocking Roblox network access. Winsock reset requires a reboot to fully take effect.",
+        impact: "Fixes Roblox launch failures",
+        risk_level: RiskLevel::LowRisk,
+        requires_admin: true,
+    };
+
+    // Roblox Boosts
+    pub const ULTRABOOST: BoostInfo = BoostInfo {
+        id: "ultraboost",
+        title: "Ultraboost",
+        short_desc: "Lowest visual quality for maximum FPS",
+        // Says what it costs, not just what it buys. The old copy called this a
+        // "max performance preset" and buried the price, so players turned it
+        // on for frames, watched their world flatten, and reported it as a bug
+        // in Roblox or in SwiftTunnel.
+        //
+        // It does NOT lock Roblox's graphics slider, whatever
+        // DFIntDebugFRMQualityLevelOverride looks like it should do. Measured
+        // on a real client: with all of these flags applied, raising the
+        // in-game quality slider restored the scene, the setting persisted, and
+        // it survived a relaunch. Saying otherwise sent one support reply down
+        // the wrong path and very nearly shipped here as product copy.
+        long_desc: "Trades how Roblox looks for frames, heavily. Forces D3D11, minimum texture quality, 1x anti-aliasing, a gray sky, no grass and reduced object detail in the distance, and drops Roblox's quality level. Raising the in-game graphics slider afterwards still works and brings detail back. Turn this off and apply to undo it properly.",
+        impact: "Maximum FPS, lowest detail",
+        risk_level: RiskLevel::Safe,
+        requires_admin: true,
+    };
+
+    /// Get all system boost infos
+    pub fn system_boosts() -> [&'static BoostInfo; 5] {
+        [
+            &HIGH_PRIORITY,
+            &TIMER_RESOLUTION,
+            &MMCSS,
+            &GAME_MODE,
+            &SWIFTTUNNEL_POWER_PLAN,
+        ]
+    }
+
+    /// Get all network boost infos
+    pub fn network_boosts() -> [&'static BoostInfo; 3] {
+        [&DISABLE_NAGLE, &NETWORK_THROTTLING, &FIREWALL_FIX]
+    }
+
+    /// Get all Roblox boost infos
+    pub fn roblox_boosts() -> [&'static BoostInfo; 1] {
+        [&ULTRABOOST]
+    }
+}
+
+/// Profile preset information for tooltips
+#[derive(Debug, Clone)]
+pub struct ProfileInfo {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub settings_summary: &'static str,
+    pub best_for: &'static str,
+    pub graphics_level: &'static str,
+    pub fps_target: &'static str,
+}
+
+pub mod profile_info {
+    use super::ProfileInfo;
+
+    pub const PERFORMANCE: ProfileInfo = ProfileInfo {
+        name: "Performance",
+        description: "Maximum FPS with minimal visual quality",
+        settings_summary: "• All system boosts enabled\n• All network boosts enabled\n• Lowest graphics settings\n• Max FPS unlocked",
+        best_for: "Low-end PCs, competitive play",
+        graphics_level: "Level 1-3",
+        fps_target: "Uncapped",
+    };
+
+    pub const BALANCED: ProfileInfo = ProfileInfo {
+        name: "Balanced",
+        description: "Good FPS with decent visual quality",
+        settings_summary: "• Core system boosts enabled\n• Network boosts enabled\n• Medium graphics settings\n• 144 FPS target",
+        best_for: "Most users, mid-range PCs",
+        graphics_level: "Level 5-7",
+        fps_target: "144 FPS",
+    };
+
+    pub const QUALITY: ProfileInfo = ProfileInfo {
+        name: "Quality",
+        description: "Best visuals with stable performance",
+        settings_summary: "• Essential boosts only\n• Network boosts enabled\n• High graphics settings\n• 60 FPS target",
+        best_for: "High-end PCs, immersive play",
+        graphics_level: "Level 8-10",
+        fps_target: "60 FPS",
+    };
+}
+
+/// Tier explanation for tooltips
+pub mod tier_info {
+    pub const TIER_1_TITLE: &str = "TIER 1 - Safe Optimizations";
+    pub const TIER_1_DESC: &str = "These optimizations have no side effects and are fully reversible. They use standard Windows APIs and registry settings that are commonly used by gaming software. All changes revert when SwiftTunnel closes or when you disable the boost.";
+}
+
+// These tests assert on compile-time constants on purpose: they are guards
+// that fail the build if someone edits a constant that other code depends on.
+// Clippy flags constant assertions as pointless, which is exactly backwards
+// for an invariant test.
+#[allow(clippy::assertions_on_constants)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Config defaults ──
+
+    #[test]
+    fn test_config_default() {
+        let config = Config::default();
+        assert_eq!(config.profile, OptimizationProfile::Balanced);
+        assert!(config.overlay.locked);
+    }
+
+    #[test]
+    fn old_overlay_settings_default_to_click_through_and_keep_saved_position() {
+        let overlay: OverlayConfig = serde_json::from_str(
+            r#"{"enabled":true,"custom_x":125.0,"custom_y":80.0,"metrics":["fps","ping"]}"#,
+        )
+        .unwrap();
+        assert!(overlay.locked);
+        assert_eq!(overlay.custom_x, Some(125.0));
+        assert_eq!(overlay.metrics, vec!["fps", "ping"]);
+        let unlocked: OverlayConfig = serde_json::from_str(r#"{"locked":false}"#).unwrap();
+        assert!(!unlocked.locked);
+    }
+
+    #[test]
+    fn test_system_optimization_config_default() {
+        let cfg = SystemOptimizationConfig::default();
+        assert!(!cfg.set_high_priority);
+        assert!(!cfg.set_cpu_affinity);
+        assert!(cfg.cpu_cores.is_empty());
+        assert!(!cfg.disable_fullscreen_optimization);
+        assert!(!cfg.clear_standby_memory);
+        assert!(!cfg.disable_game_bar);
+        assert_eq!(cfg.power_plan, PowerPlan::Balanced);
+        assert!(!cfg.timer_resolution_1ms);
+        assert!(!cfg.mmcss_gaming_profile);
+        assert!(!cfg.game_mode_enabled);
+    }
+
+    #[test]
+    fn retired_booster_and_overlay_fields_are_ignored_without_losing_active_settings() {
+        let config: Config = serde_json::from_str(r#"{
+            "auto_start_with_roblox":true,"show_overlay":false,
+            "overlay":{"enabled":true,"metrics":["cpu"],"monitor_fps_chart":true,"show_max_fps_message":true}
+        }"#).unwrap();
+        assert!(config.overlay.enabled);
+        assert_eq!(config.overlay.metrics, vec!["cpu"]);
+        let saved = serde_json::to_value(config).unwrap();
+        assert!(saved.get("auto_start_with_roblox").is_none());
+        assert!(saved.get("show_overlay").is_none());
+        assert!(saved["overlay"].get("monitor_fps_chart").is_none());
+        assert!(saved["overlay"].get("show_max_fps_message").is_none());
+        let mut compatibility = serde_json::to_value(SystemOptimizationConfig::default()).unwrap();
+        compatibility
+            .as_object_mut()
+            .unwrap()
+            .remove("clear_standby_memory");
+        let loaded: SystemOptimizationConfig = serde_json::from_value(compatibility).unwrap();
+        assert!(!loaded.clear_standby_memory);
+        assert!(
+            serde_json::to_value(loaded)
+                .unwrap()
+                .get("clear_standby_memory")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn legacy_auto_ram_clean_is_ignored_and_dropped_on_save() {
+        let mut saved = serde_json::to_value(SystemOptimizationConfig::default()).unwrap();
+        saved["auto_ram_clean"] = serde_json::Value::Bool(true);
+        saved["set_high_priority"] = serde_json::Value::Bool(true);
+        let config: SystemOptimizationConfig = serde_json::from_value(saved).unwrap();
+        assert!(config.set_high_priority);
+        assert!(
+            serde_json::to_value(config)
+                .unwrap()
+                .get("auto_ram_clean")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_network_config_default() {
+        let cfg = NetworkConfig::default();
+        assert!(!cfg.enable_network_boost);
+        assert!(!cfg.disable_nagle);
+        assert!(!cfg.disable_network_throttling);
+        assert!(!cfg.firewall_fix);
+    }
+
+    #[test]
+    fn test_network_config_deserializes_legacy_master_boost_to_real_toggles() {
+        let cfg: NetworkConfig = serde_json::from_str(r#"{"enable_network_boost": true}"#).unwrap();
+
+        assert!(cfg.enable_network_boost);
+        assert!(cfg.disable_nagle);
+        assert!(cfg.disable_network_throttling);
+        assert!(!cfg.firewall_fix);
+    }
+
+    #[test]
+    fn test_network_config_does_not_invent_boosts_when_master_is_explicitly_stale() {
+        let cfg: NetworkConfig = serde_json::from_str(
+            r#"{
+              "enable_network_boost": true,
+              "prioritize_roblox_traffic": false,
+              "disable_nagle": false,
+              "disable_network_throttling": false,
+              "gaming_qos": false,
+              "firewall_fix": false
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!cfg.enable_network_boost);
+        assert!(!cfg.has_enabled_boosts());
+    }
+
+    #[test]
+    fn test_network_config_drops_removed_qos_fields_without_inventing_boosts() {
+        let cfg: NetworkConfig = serde_json::from_str(
+            r#"{
+              "enable_network_boost": true,
+              "prioritize_roblox_traffic": true,
+              "gaming_qos": true
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!cfg.enable_network_boost);
+        assert!(!cfg.has_enabled_boosts());
+    }
+
+    #[test]
+    fn test_network_config_master_tracks_specific_boosts() {
+        let mut cfg = NetworkConfig {
+            disable_network_throttling: true,
+            ..Default::default()
+        };
+
+        cfg.normalize_legacy_master_boost();
+
+        assert!(cfg.enable_network_boost);
+        assert!(!cfg.disable_nagle);
+        assert!(cfg.disable_network_throttling);
+    }
+
+    #[test]
+    fn test_roblox_settings_config_default() {
+        let cfg = RobloxSettingsConfig::default();
+        assert_eq!(cfg.graphics_quality, GraphicsQuality::Automatic);
+        // On by default, so a fresh install lifts Roblox's stock 60 cap without
+        // anyone having to find the switch. An existing higher cap is adopted
+        // at startup rather than overwritten, so this default cannot cost
+        // anyone frames.
+        assert!(cfg.unlock_fps);
+        assert_eq!(cfg.target_fps, 300);
+        assert_eq!(cfg.window_width, 1280);
+        assert_eq!(cfg.window_height, 720);
+        assert!(!cfg.window_fullscreen);
+        assert!(!cfg.ultraboost);
+        assert!(!cfg.custom_fflags_enabled);
+        assert!(cfg.custom_fflags_json.is_empty());
+    }
+
+    #[test]
+    fn test_roblox_settings_legacy_json_defaults_window_fields() {
+        let legacy = r#"{
+            "graphics_quality": "Manual",
+            "unlock_fps": true,
+            "target_fps": 144,
+            "ultraboost": false
+        }"#;
+        let cfg: RobloxSettingsConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(cfg.window_width, 1280);
+        assert_eq!(cfg.window_height, 720);
+        assert!(!cfg.window_fullscreen);
+    }
+
+    // ── GraphicsQuality ──
+
+    #[test]
+    fn test_graphics_quality_to_level() {
+        assert_eq!(GraphicsQuality::Automatic.to_level(), 0);
+        assert_eq!(GraphicsQuality::Manual.to_level(), 0);
+        assert_eq!(GraphicsQuality::Level1.to_level(), 1);
+        assert_eq!(GraphicsQuality::Level2.to_level(), 2);
+        assert_eq!(GraphicsQuality::Level3.to_level(), 3);
+        assert_eq!(GraphicsQuality::Level4.to_level(), 4);
+        assert_eq!(GraphicsQuality::Level5.to_level(), 5);
+        assert_eq!(GraphicsQuality::Level6.to_level(), 6);
+        assert_eq!(GraphicsQuality::Level7.to_level(), 7);
+        assert_eq!(GraphicsQuality::Level8.to_level(), 8);
+        assert_eq!(GraphicsQuality::Level9.to_level(), 9);
+        assert_eq!(GraphicsQuality::Level10.to_level(), 10);
+    }
+
+    #[test]
+    fn test_graphics_quality_from_level_valid() {
+        assert_eq!(GraphicsQuality::from_level(0), GraphicsQuality::Automatic);
+        assert_eq!(GraphicsQuality::from_level(1), GraphicsQuality::Level1);
+        assert_eq!(GraphicsQuality::from_level(5), GraphicsQuality::Level5);
+        assert_eq!(GraphicsQuality::from_level(10), GraphicsQuality::Level10);
+    }
+
+    #[test]
+    fn test_graphics_quality_from_level_invalid() {
+        assert_eq!(GraphicsQuality::from_level(-1), GraphicsQuality::Level5);
+        assert_eq!(GraphicsQuality::from_level(11), GraphicsQuality::Level5);
+        assert_eq!(GraphicsQuality::from_level(999), GraphicsQuality::Level5);
+    }
+
+    // ── RiskLevel ──
+
+    #[test]
+    fn test_risk_level_label() {
+        assert_eq!(RiskLevel::Safe.label(), "Safe");
+        assert_eq!(RiskLevel::LowRisk.label(), "Low Risk");
+        assert_eq!(RiskLevel::MediumRisk.label(), "Medium Risk");
+    }
+
+    // ── PerformanceMetrics ──
+
+    #[test]
+    fn test_performance_metrics_default() {
+        let m = PerformanceMetrics::default();
+        assert_eq!(m.fps, 0.0);
+        assert_eq!(m.cpu_usage, 0.0);
+        assert_eq!(m.ram_usage, 0.0);
+        assert_eq!(m.ram_total, 0.0);
+        assert_eq!(m.ping, 0);
+        assert!(!m.roblox_running);
+        assert!(m.process_id.is_none());
+    }
+
+    // ── boost_info ──
+
+    #[test]
+    fn test_system_boosts_count() {
+        assert_eq!(boost_info::system_boosts().len(), 5);
+    }
+
+    #[test]
+    fn test_network_boosts_count() {
+        assert_eq!(boost_info::network_boosts().len(), 3);
+    }
+
+    #[test]
+    fn test_roblox_boosts_count() {
+        assert_eq!(boost_info::roblox_boosts().len(), 1);
+    }
+
+    // ── boost_info requires_admin ──
+
+    #[test]
+    fn test_hklm_boosts_require_admin() {
+        // All boosts that write to HKLM must report requires_admin: true
+        assert!(
+            boost_info::MMCSS.requires_admin,
+            "MMCSS writes to HKLM, must require admin"
+        );
+        assert!(
+            boost_info::DISABLE_NAGLE.requires_admin,
+            "Nagle writes to HKLM, must require admin"
+        );
+        assert!(
+            boost_info::NETWORK_THROTTLING.requires_admin,
+            "Network throttling writes to HKLM, must require admin"
+        );
+        assert!(
+            boost_info::FIREWALL_FIX.requires_admin,
+            "Firewall fix uses netsh, must require admin"
+        );
+        assert!(
+            boost_info::SWIFTTUNNEL_POWER_PLAN.requires_admin,
+            "Power plan import/activation uses powercfg, must require admin"
+        );
+    }
+
+    #[test]
+    fn test_hkcu_boosts_no_admin() {
+        // Boosts that only write to HKCU don't need admin
+        assert!(
+            !boost_info::HIGH_PRIORITY.requires_admin,
+            "High priority uses process handle, no admin needed"
+        );
+        assert!(
+            !boost_info::TIMER_RESOLUTION.requires_admin,
+            "Timer resolution uses ntdll, no admin needed"
+        );
+        assert!(
+            !boost_info::GAME_MODE.requires_admin,
+            "Game mode writes to HKCU, no admin needed"
+        );
+    }
+
+    /// This cited the NVIDIA Profile Inspector import, which was the original
+    /// reason and has been removed. The flag still stands on its own: Ultraboost
+    /// writes ClientAppSettings.json into every Roblox and launcher install it
+    /// finds, and a launcher records its own install location, so those paths
+    /// are not guaranteed to sit inside the user's profile.
+    #[test]
+    fn test_ultraboost_requires_admin_to_write_launcher_install_dirs() {
+        assert!(
+            boost_info::ULTRABOOST.requires_admin,
+            "Ultraboost writes into Roblox and launcher install directories, which can live outside the user profile"
+        );
+    }
+}

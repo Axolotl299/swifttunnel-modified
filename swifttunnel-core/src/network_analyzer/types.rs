@@ -1,0 +1,511 @@
+//! Network Analyzer Types
+//!
+//! State structs, enums, and result types for network analysis
+
+use serde::{Deserialize, Serialize};
+
+/// Overall state of the network analyzer
+#[derive(Clone, Debug, Default)]
+pub struct NetworkAnalyzerState {
+    /// Stability test state
+    pub stability: StabilityTestState,
+    /// Speed test state
+    pub speed: SpeedTestState,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  STABILITY TEST TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// State of the stability test
+#[derive(Clone, Debug)]
+pub struct StabilityTestState {
+    /// Whether a test is currently running
+    pub running: bool,
+    /// Progress 0.0 - 1.0
+    pub progress: f32,
+    /// Ping samples collected so far (in milliseconds)
+    pub ping_samples: Vec<Option<u32>>,
+    /// Results after test completes
+    pub results: Option<StabilityTestResults>,
+}
+
+impl Default for StabilityTestState {
+    fn default() -> Self {
+        Self {
+            running: false,
+            progress: 0.0,
+            ping_samples: Vec::new(),
+            results: None,
+        }
+    }
+}
+
+/// A single ping sample with its timestamp relative to test start
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PingSample {
+    /// Seconds elapsed since test start
+    pub elapsed_secs: f32,
+    /// Latency in ms, or None if the ping timed out (packet loss)
+    pub latency_ms: Option<u32>,
+}
+
+/// Results from a completed stability test
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StabilityTestResults {
+    /// Average ping in milliseconds
+    pub avg_ping: f32,
+    /// Minimum ping in milliseconds
+    pub min_ping: u32,
+    /// Maximum ping in milliseconds
+    pub max_ping: u32,
+    /// Jitter (standard deviation) in milliseconds
+    pub jitter: f32,
+    /// Packet loss percentage (0.0 - 100.0)
+    pub packet_loss: f32,
+    /// Ping spread (max - min) in milliseconds
+    #[serde(default)]
+    pub ping_spread: f32,
+    /// Quality rating based on results
+    pub quality: ConnectionQuality,
+    /// Number of samples collected
+    pub sample_count: usize,
+    /// Individual ping samples with elapsed timestamps
+    #[serde(default)]
+    pub ping_samples: Vec<PingSample>,
+    /// Timestamp when test completed
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// Connection quality rating
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnectionQuality {
+    Excellent, // < 20ms avg, < 0.5% loss, < 2ms jitter, < 10ms spread
+    Good,      // < 40ms avg, < 1% loss, < 5ms jitter, < 25ms spread
+    Fair,      // < 70ms avg, < 3% loss, < 15ms jitter, < 50ms spread
+    Poor,      // < 120ms avg, < 7% loss, < 30ms jitter, < 80ms spread
+    Bad,       // Everything else
+}
+
+impl ConnectionQuality {
+    /// Determine quality from test metrics
+    pub fn from_metrics(avg_ping: f32, packet_loss: f32, jitter: f32, ping_spread: f32) -> Self {
+        if avg_ping < 20.0 && packet_loss < 0.5 && jitter < 2.0 && ping_spread < 10.0 {
+            ConnectionQuality::Excellent
+        } else if avg_ping < 40.0 && packet_loss < 1.0 && jitter < 5.0 && ping_spread < 25.0 {
+            ConnectionQuality::Good
+        } else if avg_ping < 70.0 && packet_loss < 3.0 && jitter < 15.0 && ping_spread < 50.0 {
+            ConnectionQuality::Fair
+        } else if avg_ping < 120.0 && packet_loss < 7.0 && jitter < 30.0 && ping_spread < 80.0 {
+            ConnectionQuality::Poor
+        } else {
+            ConnectionQuality::Bad
+        }
+    }
+
+    /// Get display label
+    pub fn label(&self) -> &'static str {
+        match self {
+            ConnectionQuality::Excellent => "Excellent",
+            ConnectionQuality::Good => "Good",
+            ConnectionQuality::Fair => "Fair",
+            ConnectionQuality::Poor => "Poor",
+            ConnectionQuality::Bad => "Bad",
+        }
+    }
+
+    /// Get emoji for display
+    pub fn emoji(&self) -> &'static str {
+        match self {
+            ConnectionQuality::Excellent => "🟢",
+            ConnectionQuality::Good => "🟢",
+            ConnectionQuality::Fair => "🟡",
+            ConnectionQuality::Poor => "🟠",
+            ConnectionQuality::Bad => "🔴",
+        }
+    }
+}
+
+/// Progress update sent during stability test
+#[derive(Clone, Debug)]
+pub enum StabilityTestProgress {
+    /// New ping sample received (Some = success with ms, None = timeout/loss)
+    PingSample(Option<u32>),
+    /// Test progress update (0.0 - 1.0)
+    Progress(f32),
+    /// Test completed with results
+    Completed(StabilityTestResults),
+    /// Test failed with error message
+    Error(String),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SPEED TEST TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// State of the speed test
+#[derive(Clone, Debug)]
+pub struct SpeedTestState {
+    /// Whether a test is currently running
+    pub running: bool,
+    /// Current phase of the test
+    pub phase: SpeedTestPhase,
+    /// Download speed in Mbps (during/after test)
+    pub download_speed: f32,
+    /// Upload speed in Mbps (during/after test)
+    pub upload_speed: f32,
+    /// Progress 0.0 - 1.0 for current phase
+    pub phase_progress: f32,
+    /// Results after test completes
+    pub results: Option<SpeedTestResults>,
+}
+
+impl Default for SpeedTestState {
+    fn default() -> Self {
+        Self {
+            running: false,
+            phase: SpeedTestPhase::Idle,
+            download_speed: 0.0,
+            upload_speed: 0.0,
+            phase_progress: 0.0,
+            results: None,
+        }
+    }
+}
+
+/// Current phase of the speed test
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpeedTestPhase {
+    Idle,
+    Download,
+    Upload,
+    Complete,
+}
+
+impl SpeedTestPhase {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SpeedTestPhase::Idle => "Ready",
+            SpeedTestPhase::Download => "Testing Download",
+            SpeedTestPhase::Upload => "Testing Upload",
+            SpeedTestPhase::Complete => "Complete",
+        }
+    }
+}
+
+/// Results from a completed speed test
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SpeedTestResults {
+    /// Download speed in Mbps
+    pub download_mbps: f32,
+    /// Upload speed in Mbps
+    pub upload_mbps: f32,
+    /// Server used for test
+    pub server: String,
+    /// Timestamp when test completed
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// Progress update sent during speed test
+#[derive(Clone, Debug)]
+pub enum SpeedTestProgress {
+    /// Download phase started
+    DownloadStarted,
+    /// Download progress (speed_mbps, progress 0.0-1.0)
+    DownloadProgress(f32, f32),
+    /// Download completed with final speed
+    DownloadComplete(f32),
+    /// Upload phase started
+    UploadStarted,
+    /// Upload progress (speed_mbps, progress 0.0-1.0)
+    UploadProgress(f32, f32),
+    /// Upload completed with final speed
+    UploadComplete(f32),
+    /// Full test completed with results
+    Completed(SpeedTestResults),
+    /// Test failed with error
+    Error(String),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  BUFFERBLOAT TEST TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Bufferbloat grade (latency increase under load)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BufferbloatGrade {
+    APlus,
+    A,
+    B,
+    C,
+    D,
+    F,
+}
+
+impl BufferbloatGrade {
+    /// Determine grade from measured bufferbloat (loaded - idle).
+    pub fn from_bufferbloat_ms(bufferbloat_ms: u32) -> Self {
+        match bufferbloat_ms {
+            0..=5 => BufferbloatGrade::APlus,
+            6..=15 => BufferbloatGrade::A,
+            16..=30 => BufferbloatGrade::B,
+            31..=50 => BufferbloatGrade::C,
+            51..=100 => BufferbloatGrade::D,
+            _ => BufferbloatGrade::F,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            BufferbloatGrade::APlus => "A+",
+            BufferbloatGrade::A => "A",
+            BufferbloatGrade::B => "B",
+            BufferbloatGrade::C => "C",
+            BufferbloatGrade::D => "D",
+            BufferbloatGrade::F => "F",
+        }
+    }
+}
+
+/// Results from a completed bufferbloat test
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BufferbloatTestResults {
+    /// Median idle ping in milliseconds
+    pub idle_latency: u32,
+    /// Median ping while load is active in milliseconds
+    pub loaded_latency: u32,
+    /// Loaded - idle (ms)
+    pub bufferbloat_ms: u32,
+    /// Grade derived from bufferbloat_ms
+    pub grade: BufferbloatGrade,
+    /// Timestamp when test completed
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PERSISTENCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Network test results for settings persistence
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NetworkTestResultsCache {
+    /// Last stability test results
+    pub last_stability: Option<StabilityTestResults>,
+    /// Last speed test results
+    pub last_speed: Option<SpeedTestResults>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ConnectionQuality::from_metrics ──
+
+    #[test]
+    fn test_connection_quality_excellent() {
+        // All metrics below excellent thresholds
+        assert_eq!(
+            ConnectionQuality::from_metrics(19.9, 0.4, 1.9, 9.9),
+            ConnectionQuality::Excellent
+        );
+        assert_eq!(
+            ConnectionQuality::from_metrics(0.0, 0.0, 0.0, 0.0),
+            ConnectionQuality::Excellent
+        );
+    }
+
+    #[test]
+    fn test_connection_quality_good() {
+        // At excellent boundary -> falls to Good
+        assert_eq!(
+            ConnectionQuality::from_metrics(20.0, 0.0, 0.0, 0.0),
+            ConnectionQuality::Good
+        );
+        assert_eq!(
+            ConnectionQuality::from_metrics(0.0, 0.5, 0.0, 0.0),
+            ConnectionQuality::Good
+        );
+        assert_eq!(
+            ConnectionQuality::from_metrics(0.0, 0.0, 2.0, 0.0),
+            ConnectionQuality::Good
+        );
+        assert_eq!(
+            ConnectionQuality::from_metrics(0.0, 0.0, 0.0, 10.0),
+            ConnectionQuality::Good
+        );
+        // Just below Good thresholds
+        assert_eq!(
+            ConnectionQuality::from_metrics(39.9, 0.9, 4.9, 24.9),
+            ConnectionQuality::Good
+        );
+    }
+
+    #[test]
+    fn test_connection_quality_fair() {
+        assert_eq!(
+            ConnectionQuality::from_metrics(40.0, 0.0, 0.0, 0.0),
+            ConnectionQuality::Fair
+        );
+        assert_eq!(
+            ConnectionQuality::from_metrics(69.9, 2.9, 14.9, 49.9),
+            ConnectionQuality::Fair
+        );
+    }
+
+    #[test]
+    fn test_connection_quality_poor() {
+        assert_eq!(
+            ConnectionQuality::from_metrics(70.0, 0.0, 0.0, 0.0),
+            ConnectionQuality::Poor
+        );
+        assert_eq!(
+            ConnectionQuality::from_metrics(119.9, 6.9, 29.9, 79.9),
+            ConnectionQuality::Poor
+        );
+    }
+
+    #[test]
+    fn test_connection_quality_bad() {
+        assert_eq!(
+            ConnectionQuality::from_metrics(120.0, 0.0, 0.0, 0.0),
+            ConnectionQuality::Bad
+        );
+        assert_eq!(
+            ConnectionQuality::from_metrics(0.0, 7.0, 0.0, 0.0),
+            ConnectionQuality::Bad
+        );
+        assert_eq!(
+            ConnectionQuality::from_metrics(0.0, 0.0, 30.0, 0.0),
+            ConnectionQuality::Bad
+        );
+        assert_eq!(
+            ConnectionQuality::from_metrics(0.0, 0.0, 0.0, 80.0),
+            ConnectionQuality::Bad
+        );
+        assert_eq!(
+            ConnectionQuality::from_metrics(200.0, 50.0, 100.0, 200.0),
+            ConnectionQuality::Bad
+        );
+    }
+
+    // ── ConnectionQuality labels and emojis ──
+
+    #[test]
+    fn test_connection_quality_labels() {
+        assert_eq!(ConnectionQuality::Excellent.label(), "Excellent");
+        assert_eq!(ConnectionQuality::Good.label(), "Good");
+        assert_eq!(ConnectionQuality::Fair.label(), "Fair");
+        assert_eq!(ConnectionQuality::Poor.label(), "Poor");
+        assert_eq!(ConnectionQuality::Bad.label(), "Bad");
+    }
+
+    #[test]
+    fn test_connection_quality_emojis() {
+        assert_eq!(ConnectionQuality::Excellent.emoji(), "\u{1f7e2}");
+        assert_eq!(ConnectionQuality::Good.emoji(), "\u{1f7e2}");
+        assert_eq!(ConnectionQuality::Fair.emoji(), "\u{1f7e1}");
+        assert_eq!(ConnectionQuality::Poor.emoji(), "\u{1f7e0}");
+        assert_eq!(ConnectionQuality::Bad.emoji(), "\u{1f534}");
+    }
+
+    // ── Default impls ──
+
+    #[test]
+    fn test_stability_test_state_default() {
+        let state = StabilityTestState::default();
+        assert!(!state.running);
+        assert_eq!(state.progress, 0.0);
+        assert!(state.ping_samples.is_empty());
+        assert!(state.results.is_none());
+    }
+
+    #[test]
+    fn test_speed_test_state_default() {
+        let state = SpeedTestState::default();
+        assert!(!state.running);
+        assert_eq!(state.phase, SpeedTestPhase::Idle);
+        assert_eq!(state.download_speed, 0.0);
+        assert_eq!(state.upload_speed, 0.0);
+        assert_eq!(state.phase_progress, 0.0);
+        assert!(state.results.is_none());
+    }
+
+    #[test]
+    fn test_speed_test_phase_labels() {
+        assert_eq!(SpeedTestPhase::Idle.label(), "Ready");
+        assert_eq!(SpeedTestPhase::Download.label(), "Testing Download");
+        assert_eq!(SpeedTestPhase::Upload.label(), "Testing Upload");
+        assert_eq!(SpeedTestPhase::Complete.label(), "Complete");
+    }
+
+    #[test]
+    fn test_network_analyzer_state_default() {
+        let state = NetworkAnalyzerState::default();
+        assert!(!state.stability.running);
+        assert!(!state.speed.running);
+    }
+
+    // ── BufferbloatGrade ──
+
+    #[test]
+    fn test_bufferbloat_grade_labels() {
+        assert_eq!(BufferbloatGrade::APlus.label(), "A+");
+        assert_eq!(BufferbloatGrade::A.label(), "A");
+        assert_eq!(BufferbloatGrade::B.label(), "B");
+        assert_eq!(BufferbloatGrade::C.label(), "C");
+        assert_eq!(BufferbloatGrade::D.label(), "D");
+        assert_eq!(BufferbloatGrade::F.label(), "F");
+    }
+
+    #[test]
+    fn test_bufferbloat_grade_thresholds() {
+        assert_eq!(
+            BufferbloatGrade::from_bufferbloat_ms(0),
+            BufferbloatGrade::APlus
+        );
+        assert_eq!(
+            BufferbloatGrade::from_bufferbloat_ms(5),
+            BufferbloatGrade::APlus
+        );
+        assert_eq!(
+            BufferbloatGrade::from_bufferbloat_ms(6),
+            BufferbloatGrade::A
+        );
+        assert_eq!(
+            BufferbloatGrade::from_bufferbloat_ms(15),
+            BufferbloatGrade::A
+        );
+        assert_eq!(
+            BufferbloatGrade::from_bufferbloat_ms(16),
+            BufferbloatGrade::B
+        );
+        assert_eq!(
+            BufferbloatGrade::from_bufferbloat_ms(30),
+            BufferbloatGrade::B
+        );
+        assert_eq!(
+            BufferbloatGrade::from_bufferbloat_ms(31),
+            BufferbloatGrade::C
+        );
+        assert_eq!(
+            BufferbloatGrade::from_bufferbloat_ms(50),
+            BufferbloatGrade::C
+        );
+        assert_eq!(
+            BufferbloatGrade::from_bufferbloat_ms(51),
+            BufferbloatGrade::D
+        );
+        assert_eq!(
+            BufferbloatGrade::from_bufferbloat_ms(100),
+            BufferbloatGrade::D
+        );
+        assert_eq!(
+            BufferbloatGrade::from_bufferbloat_ms(101),
+            BufferbloatGrade::F
+        );
+        assert_eq!(
+            BufferbloatGrade::from_bufferbloat_ms(500),
+            BufferbloatGrade::F
+        );
+    }
+}

@@ -1,0 +1,305 @@
+import { create } from "zustand";
+import type {
+  RamCleanProgressEvent,
+  RamCleanResultResponse,
+  SystemMemorySnapshot,
+  Config,
+} from "../lib/types";
+import {
+  boostGetMetrics,
+  boostGetSystemMemory,
+  boostCleanRam,
+  boostGetSystemInfo,
+  boostRestartRoblox,
+} from "../lib/commands";
+import type { BoostMetricsOptions } from "../lib/commands";
+import { formatErrorMessage, reportError } from "../lib/errors";
+import { notify } from "../lib/notifications";
+import { useSettingsStore } from "./settingsStore";
+
+// Each option is boolean or absent, so at most nine native requests can be
+// pending in this window. Slow samplers must not queue another job every tick.
+const pendingMetrics = new Map<string, Promise<boolean>>();
+let metricsRequestRevision = 0;
+let appliedMetricsRevision = 0;
+let pendingMemory: Promise<void> | null = null;
+let memoryRevision = 0;
+
+interface BoostStore {
+  // Metrics
+  fps: number;
+  cpuUsage: number;
+  ramUsage: number;
+  ramTotal: number;
+  ping: number;
+  robloxRunning: boolean;
+  hasLoadedMetrics: boolean;
+  robloxForeground: boolean;
+  processId: number | null;
+
+  // System memory (RAM cleaner)
+  systemMem: SystemMemorySnapshot | null;
+  isCleaningRam: boolean;
+  ramCleanStage: string | null;
+  ramCleanTrimmedCount: number;
+  ramCleanCurrentProcess: string | null;
+  ramCleanResult: RamCleanResultResponse | null;
+  ramCleanStartSnapshot: SystemMemorySnapshot | null;
+  ramCleanDoneSnapshot: SystemMemorySnapshot | null;
+
+  error: string | null;
+  warning: string | null;
+
+  // System info
+  isAdmin: boolean;
+  osVersion: string;
+  cpuCount: number;
+
+  // Actions
+  /** False means the displayed sample is stale; never use it to authorize work. */
+  fetchMetrics: (options?: BoostMetricsOptions) => Promise<boolean>;
+  fetchSystemMemory: () => Promise<void>;
+  fetchSystemInfo: () => Promise<void>;
+  updateConfig: (configJson: string) => Promise<Config>;
+  syncEffectiveConfig: () => Promise<Config | null>;
+  restartRoblox: () => Promise<void>;
+  cleanRam: () => Promise<void>;
+  clearError: () => void;
+  handleRamCleanProgress: (event: RamCleanProgressEvent) => void;
+}
+
+export const useBoostStore = create<BoostStore>((set, get) => ({
+  fps: 0,
+  cpuUsage: 0,
+  ramUsage: 0,
+  ramTotal: 0,
+  ping: 0,
+  robloxRunning: false,
+  hasLoadedMetrics: false,
+  robloxForeground: false,
+  processId: null,
+  systemMem: null,
+  isCleaningRam: false,
+  ramCleanStage: null,
+  ramCleanTrimmedCount: 0,
+  ramCleanCurrentProcess: null,
+  ramCleanResult: null,
+  ramCleanStartSnapshot: null,
+  ramCleanDoneSnapshot: null,
+  error: null,
+  warning: null,
+  isAdmin: false,
+  osVersion: "",
+  cpuCount: 1,
+
+  fetchMetrics: (options) => {
+    const key = `${options?.overlayWantsFps ?? "saved"}:${options?.overlayWantsPing ?? "saved"}`;
+    const pending = pendingMetrics.get(key);
+    if (pending) return pending;
+    const revision = ++metricsRequestRevision;
+    const request = (async () => {
+      try {
+        const m = await boostGetMetrics(options);
+        // Different views use different sampling options and can finish out
+        // of order. An older response must not revive a player that a newer
+        // sample already saw close, or replace the next game's process ID.
+        if (revision < appliedMetricsRevision) return false;
+        appliedMetricsRevision = revision;
+        set({
+          fps: m.fps,
+          cpuUsage: m.cpu_usage,
+          ramUsage: m.ram_usage,
+          ramTotal: m.ram_total,
+          ping: m.ping,
+          robloxRunning: m.roblox_running,
+          hasLoadedMetrics: true,
+          robloxForeground: m.roblox_foreground,
+          processId: m.process_id,
+        });
+        return true;
+      } catch (error) {
+        reportError("Failed to fetch performance metrics", error, {
+          dedupeKey: "boost-fetch-metrics",
+        });
+        return false;
+      }
+    })().finally(() => {
+      pendingMetrics.delete(key);
+    });
+    pendingMetrics.set(key, request);
+    return request;
+  },
+
+  fetchSystemMemory: () => {
+    if (pendingMemory) return pendingMemory;
+    const revision = memoryRevision;
+    pendingMemory = (async () => {
+      try {
+        const mem = await boostGetSystemMemory();
+        // Native cleanup progress is newer than a sample requested before it.
+        if (revision === memoryRevision) set({ systemMem: mem });
+      } catch (error) {
+        reportError("Failed to fetch system memory", error, {
+          dedupeKey: "boost-fetch-system-memory",
+        });
+      }
+    })().finally(() => { pendingMemory = null; });
+    return pendingMemory;
+  },
+
+  fetchSystemInfo: async () => {
+    try {
+      const info = await boostGetSystemInfo();
+      set({
+        isAdmin: info.is_admin,
+        osVersion: info.os_version,
+        cpuCount: info.cpu_count,
+      });
+    } catch (error) {
+      reportError("Failed to fetch system info", error, {
+        dedupeKey: "boost-fetch-system-info",
+      });
+    }
+  },
+
+  updateConfig: async (configJson) => {
+    try {
+      set({ error: null, warning: null });
+      const result = await useSettingsStore.getState().applyBoostConfig(configJson);
+      if (result.warnings.length > 0) {
+        const message = result.warnings.join("; ");
+        set({ warning: message });
+        await notify(
+          "Boost applied with warnings",
+          "Some optimizations could not be applied.",
+        );
+      }
+      return result.applied_config ?? JSON.parse(configJson);
+    } catch (e) {
+      const message = formatErrorMessage(e);
+      set({ error: message, warning: null });
+      await notify("Boost config failed", "Could not save optimization profile.");
+      throw e;
+    }
+  },
+
+  syncEffectiveConfig: async () => {
+    try {
+      set({ error: null, warning: null });
+      const result = await useSettingsStore.getState().syncBoostConfig();
+      if (result.warnings.length > 0) {
+        set({ warning: result.warnings.join("; ") });
+      }
+      return result.applied_config;
+    } catch (error) {
+      reportError("Failed to sync boost config state", error, {
+        dedupeKey: "boost-sync-effective-config",
+      });
+      return null;
+    }
+  },
+
+  cleanRam: async () => {
+    // Several views can request this action. A rejected duplicate must not
+    // reset the first caller's progress or busy flag.
+    if (get().isCleaningRam) return;
+    memoryRevision += 1;
+    try {
+      set({
+        error: null,
+        warning: null,
+        isCleaningRam: true,
+        ramCleanStage: "start",
+        ramCleanTrimmedCount: 0,
+        ramCleanCurrentProcess: null,
+        ramCleanResult: null,
+        ramCleanStartSnapshot: null,
+        ramCleanDoneSnapshot: null,
+      });
+
+      // Refresh a baseline snapshot immediately on click. Polling can be stale by up to 1s,
+      // which makes the UI look like the cleaner freed memory before it actually ran.
+      const baseline = await boostGetSystemMemory().catch(() => null);
+      if (baseline) {
+        set({ systemMem: baseline, ramCleanStartSnapshot: baseline });
+      }
+
+      const result = await boostCleanRam();
+      memoryRevision += 1;
+      set((state) => ({
+        isCleaningRam: false,
+        ramCleanStage: "done",
+        ramCleanResult: result,
+        systemMem: result.after,
+        ramCleanTrimmedCount: result.trimmed_count,
+        ramCleanCurrentProcess: null,
+        ramCleanDoneSnapshot: state.ramCleanDoneSnapshot ?? result.after,
+      }));
+    } catch (e) {
+      const message = formatErrorMessage(e);
+      set({
+        error: message,
+        warning: null,
+        isCleaningRam: false,
+        ramCleanStage: null,
+        ramCleanStartSnapshot: null,
+        ramCleanDoneSnapshot: null,
+      });
+      await notify("RAM cleaner failed", "Could not clean memory.");
+    }
+  },
+
+  restartRoblox: async () => {
+    try {
+      await boostRestartRoblox();
+    } catch (e) {
+      const message = formatErrorMessage(e);
+      set({ error: message, warning: null });
+      await notify("Restart failed", "Could not restart Roblox.");
+      throw e;
+    }
+  },
+
+  clearError: () => {
+    set({ error: null, warning: null });
+  },
+
+  handleRamCleanProgress: (event) => {
+    memoryRevision += 1;
+    set((state) => ({
+      systemMem: {
+        total_mb: event.total_mb,
+        used_mb: event.used_mb,
+        available_mb: event.available_mb,
+        load_pct: event.load_pct,
+        standby_mb: event.standby_mb,
+        modified_mb: event.modified_mb,
+      },
+      ramCleanStage: event.stage,
+      ramCleanTrimmedCount: event.trimmed_count,
+      ramCleanCurrentProcess: event.current_process,
+      ramCleanStartSnapshot:
+        event.stage === "start" && !state.ramCleanStartSnapshot
+          ? {
+              total_mb: event.total_mb,
+              used_mb: event.used_mb,
+              available_mb: event.available_mb,
+              load_pct: event.load_pct,
+              standby_mb: event.standby_mb,
+              modified_mb: event.modified_mb,
+            }
+          : state.ramCleanStartSnapshot,
+      ramCleanDoneSnapshot:
+        event.stage === "done"
+          ? {
+              total_mb: event.total_mb,
+              used_mb: event.used_mb,
+              available_mb: event.available_mb,
+              load_pct: event.load_pct,
+              standby_mb: event.standby_mb,
+              modified_mb: event.modified_mb,
+            }
+          : state.ramCleanDoneSnapshot,
+    }));
+  },
+}));

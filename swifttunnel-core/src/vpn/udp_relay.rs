@@ -1,0 +1,4111 @@
+//! V3 Game Booster Mode - Unencrypted UDP Relay
+//!
+//! Similar to ExitLag/WTFast - routes game traffic through optimized paths
+//! without encryption overhead. Trades security for performance.
+//!
+//! Protocol:
+//! - Client sends: [8-byte session_id][original UDP payload]
+//! - Server forwards payload to game server, tracks session for responses
+//! - Server sends back: [8-byte session_id][game server response]
+//! - Client strips session_id and injects response to game
+
+use super::relay_support::{AuthAttempt, Sample as SupportSample, log_counter_example};
+use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
+use crossbeam_channel as channel;
+use std::cell::UnsafeCell;
+use std::collections::VecDeque;
+use std::net::{SocketAddr, UdpSocket};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+#[derive(Default)]
+struct ReceiveDiagnostics {
+    unexpected_source: AtomicU64,
+    pending_candidate_data: AtomicU64,
+    short_frame: AtomicU64,
+    session_mismatch: AtomicU64,
+    malformed_control: AtomicU64,
+    reauth_hints: AtomicU64,
+    socket_errors: AtomicU64,
+}
+
+/// Session ID length in bytes
+const SESSION_ID_LEN: usize = 8;
+const UDP_HEADER_LEN: usize = 8;
+const IPV4_HEADER_LEN: usize = 20;
+const IPV6_HEADER_LEN: usize = 40;
+const AUTH_HELLO_FRAME_TYPE: u8 = 0xA1;
+const AUTH_ACK_FRAME_TYPE: u8 = 0xA2;
+const PING_FRAME_TYPE: u8 = 0xA3;
+const PONG_FRAME_TYPE: u8 = 0xA4;
+const RTT_REPORT_FRAME_TYPE: u8 = 0xA5;
+// Censorship-resistant Roblox DNS resolve (see swifttunnel-relay). The client
+// asks the relay (outside the censorship) for Roblox's real IPs when local
+// DNS is blocked/poisoned. Optional + backward-compatible: old relays never
+// reply 0xA7, so the caller just falls back to its DoH pins.
+const RESOLVE_REQUEST_FRAME_TYPE: u8 = 0xA6;
+const RESOLVE_RESPONSE_FRAME_TYPE: u8 = 0xA7;
+const RESOLVE_MAX_HOSTS_PER_REQUEST: usize = 16;
+const RESOLVE_MAX_HOSTNAME_LEN: usize = 64;
+const PING_FRAME_LEN: usize = SESSION_ID_LEN + 1 + 4 + 8;
+const PONG_FRAME_LEN: usize = SESSION_ID_LEN + 1 + 4 + 8 + 8;
+// Slightly longer handshake budget improves reliability on congested/PPPoE paths
+// without affecting steady-state packet latency.
+const AUTH_HANDSHAKE_TOTAL_TIMEOUT: Duration = Duration::from_millis(1500);
+const AUTH_HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(500);
+const AUTH_HANDSHAKE_ATTEMPTS: usize = 4;
+
+/// Outer path MTU for relay packets (client <-> relay).
+///
+/// The tunneled payload is an *inner IPv4 packet* captured at NDIS layer. We then add:
+/// - 8 bytes session id (relay framing)
+/// - outer UDP header (8 bytes)
+/// - outer IP header (20 bytes for IPv4)
+///
+/// If Roblox (RakNet) negotiates ~1492-byte packets, adding our encapsulation overhead pushes
+/// the *outer* datagram over 1500, causing IP fragmentation on the client->relay path.
+/// Fragmented UDP is frequently dropped, and that can manifest as Roblox Error 279/277 during
+/// the connection handshake.
+///
+/// We avoid this by capping the inner packet length so the outer datagram stays <= 1500.
+///
+/// Note: 1500 is a *cap*, not a guarantee. If the user's active interface MTU is lower
+/// (PPPoE 1492, user-applied MTU boost, etc.), sending 1500-byte outer datagrams forces
+/// IP fragmentation. Fragmented UDP is frequently dropped.
+///
+/// On Windows we periodically refresh the effective MTU from the OS route/interface
+/// to the current relay endpoint, and clamp to that value (still capped at 1500).
+const RELAY_PATH_MTU_UPPER_BOUND: usize = 1500;
+const RELAY_PATH_MTU_MINIMUM: usize = 576;
+/// Conservative fallback when OS MTU probing fails.
+///
+/// 1400 keeps outer relay datagrams below common reduced-MTU links
+/// (PPPoE 1492 and many VLAN/overlay paths) instead of assuming 1500
+/// and silently fragmenting UDP.
+const RELAY_PATH_MTU_FALLBACK: usize = 1400;
+const RELAY_PATH_MTU_REFRESH_INTERVAL_MS: u64 = 5_000;
+/// While we're still on fallback MTU (probe never succeeded), retry probing
+/// more aggressively so we converge to the true path MTU quickly.
+const RELAY_PATH_MTU_FALLBACK_RETRY_INTERVAL_MS: u64 = 1_000;
+/// PPPoE lowers L3 MTU from 1500 to 1492 (8-byte PPPoE overhead).
+///
+/// Some WAN/PPPoE stacks still report a 1500 MTU on the selected interface even when
+/// effective internet-path MTU is 1492, which can reintroduce outer UDP fragmentation.
+/// In point-to-point default-route context we cap to 1492 to avoid that mismatch.
+const RELAY_PATH_MTU_POINT_TO_POINT_CEILING: usize = 1492;
+
+/// Keepalive interval to maintain NAT bindings - 15s is safer for strict NATs
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Read timeout - only affects idle wakeups (packets wake the socket immediately).
+/// Higher values reduce CPU usage when idle without adding latency when active.
+const READ_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// Outbound send path: bounded queue + fixed buffer pool.
+///
+/// This avoids per-packet heap allocations and eliminates multi-threaded contention
+/// on Winsock send calls from per-CPU packet workers (reduces p99 jitter).
+const OUTBOUND_FRAME_MAX: usize = SESSION_ID_LEN + RELAY_PATH_MTU_UPPER_BOUND;
+
+/// Largest inner packet that may still be sent when it does not fit the relay
+/// path un-fragmented. Bounded by the outbound pool frame, so an oversized
+/// packet can never split into more pieces than one local MTU worth of data.
+const FRAGMENTABLE_INNER_MAX: usize = OUTBOUND_FRAME_MAX - SESSION_ID_LEN;
+
+/// A relay resolve answer: the request id it replies to, plus each host and the
+/// IPv4 addresses the relay resolved it to.
+type ResolveResponse = (u16, Vec<(String, Vec<std::net::Ipv4Addr>)>);
+const OUTBOUND_POOL_SLOTS: usize = 4096;
+const OUTBOUND_QUEUE_CAP: usize = 4096;
+/// Maximum time a data packet may sit in the relay sender queue.
+///
+/// Game traffic should drop under transient local send-buffer pressure rather than
+/// arrive seconds late and show up as 1000ms+ in-game ping. Control/report frames
+/// are exempt because they do not become gameplay input.
+const OUTBOUND_DATA_MAX_QUEUE_AGE_MS: u64 = 250;
+/// Bound blocking UDP sends so rare OS send-buffer stalls cannot freeze the sender
+/// long enough to build a multi-second data backlog.
+const SEND_TIMEOUT: Duration = Duration::from_millis(5);
+
+/// DSCP Expedited Forwarding for relay UDP packets.
+///
+/// Keep this socket-scoped: the old Gaming QoS boost created broad Windows QoS
+/// policies for Roblox executables. Intercepted game packets leave the client as
+/// SwiftTunnel relay UDP traffic, so marking this socket preserves low-latency
+/// queueing without tagging unrelated app traffic.
+const RELAY_DSCP_EF: i32 = 46;
+const RELAY_DSCP_EF_TOS_BYTE: i32 = RELAY_DSCP_EF << 2;
+
+/// Control-plane ping for RTT/jitter telemetry (optional).
+const PING_INTERVAL: Duration = Duration::from_millis(50); // 20Hz
+const PING_IDLE_THRESHOLD: Duration = Duration::from_secs(2);
+const PING_IDLE_INTERVAL: Duration = Duration::from_millis(250);
+const PING_SAMPLE_WINDOW: usize = 1024;
+
+fn sender_wait_timeout(
+    ping_enabled: bool,
+    last_data_at: Option<Instant>,
+    next_ping_at: Instant,
+    now: Instant,
+) -> Duration {
+    // recv_timeout wakes immediately when a packet arrives. Without active
+    // telemetry, only the bounded stop check needs a timer. An expired ping
+    // deadline otherwise turns an empty channel into a busy loop.
+    if !ping_enabled
+        || !last_data_at.is_some_and(|last| now.duration_since(last) < PING_IDLE_THRESHOLD)
+    {
+        return Duration::from_millis(50);
+    }
+    next_ping_at
+        .saturating_duration_since(now)
+        .min(Duration::from_millis(50))
+}
+
+fn note_sender_activity(
+    kind: OutboundJobKind,
+    addr: SocketAddr,
+    now: Instant,
+    last_relay_addr: &mut Option<SocketAddr>,
+    last_data_at: &mut Option<Instant>,
+) {
+    // RTT reports and DNS requests are control traffic. Counting them as
+    // game activity lets each pong keep its own 20 Hz probe loop alive.
+    if kind == OutboundJobKind::Data {
+        *last_relay_addr = Some(addr);
+        *last_data_at = Some(now);
+    }
+}
+
+/// Grace period after relay switch: accept packets from BOTH old and new relay.
+/// This eliminates the inbound blackout while the new relay establishes session.
+const RELAY_SWITCH_GRACE_PERIOD: Duration = Duration::from_secs(2);
+
+/// After receiving traffic, if no inbound packet arrives for this long, declare relay stale.
+const RELAY_STALE_THRESHOLD: Duration = Duration::from_secs(30);
+/// After this many unanswered keepalives (~60s at 15s interval), declare relay dead.
+const RELAY_DEAD_KEEPALIVE_THRESHOLD: u32 = 4;
+/// Consecutive inbound packets that fail to inject before declaring the relay stale.
+/// Catches relays whose UDP control plane (keepalive ACK / pong) still responds while
+/// every reconstructed data packet is unusable — `last_receive_time` would otherwise
+/// keep getting refreshed by pongs and hide the data-plane failure indefinitely.
+const INJECT_STALE_STREAK: u32 = 8;
+/// Consecutive inject failures that escalate to Dead and force the connection to tear
+/// down so the user can pick a different relay.
+const INJECT_DEAD_STREAK: u32 = 24;
+/// Consecutive structured network-unreachable send failures before the relay is
+/// declared dead. The first failures are treated as a retryable route/socket
+/// hiccup; exhausting the budget surfaces a real connection error.
+const RELAY_SEND_UNREACHABLE_DEAD_THRESHOLD: u32 = 3;
+/// Consecutive send failures of *any* class (not just network-unreachable) that
+/// escalate the relay to Stale. This catches persistent non-repairable errors
+/// (e.g. ENOBUFS/EPERM/EACCES) that would otherwise leave health untouched
+/// while the connection silently stops moving traffic.
+const RELAY_SEND_FAILURE_STALE_THRESHOLD: u32 = 8;
+/// Consecutive send failures of any class that escalate the relay to Dead so the
+/// connection monitor tears down instead of sitting in a fake Connected state.
+const RELAY_SEND_FAILURE_DEAD_THRESHOLD: u32 = 24;
+
+/// Relay health states visible to the connection manager and UI.
+///
+/// Tracks the liveness of the relay connection so the system can detect
+/// silent disconnects and take corrective action.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayHealthState {
+    /// Relay is actively receiving traffic.
+    Healthy = 0,
+    /// Connected but no inbound packets received yet.
+    NoTrafficYet = 1,
+    /// Was receiving traffic, but stopped for >30s.
+    Stale = 2,
+    /// No response to multiple consecutive keepalives (~60s).
+    Dead = 3,
+}
+
+impl RelayHealthState {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Healthy,
+            1 => Self::NoTrafficYet,
+            2 => Self::Stale,
+            3 => Self::Dead,
+            _ => Self::NoTrafficYet,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::NoTrafficYet => "no_traffic_yet",
+            Self::Stale => "stale",
+            Self::Dead => "dead",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelaySendOutcome {
+    Enqueued(usize),
+    Backpressure,
+    Oversize,
+}
+
+impl RelaySendOutcome {
+    pub fn bytes_enqueued(self) -> usize {
+        match self {
+            Self::Enqueued(bytes) => bytes,
+            Self::Backpressure | Self::Oversize => 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelaySendFailureAction {
+    NonRepairable,
+    RetryBudgetRemaining(u32),
+    RetryBudgetExhausted(u32),
+}
+
+fn is_relay_network_unreachable_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        // Windows WSAENETUNREACH, Linux ENETUNREACH, macOS ENETUNREACH.
+        Some(10051) | Some(101) | Some(51)
+    )
+}
+
+fn record_relay_send_success(send_unreachable_streak: &AtomicU32, send_failure_streak: &AtomicU32) {
+    if send_unreachable_streak.load(Ordering::Relaxed) != 0 {
+        send_unreachable_streak.store(0, Ordering::Relaxed);
+    }
+    if send_failure_streak.load(Ordering::Relaxed) != 0 {
+        send_failure_streak.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Monotonically escalate `relay_health` to at least `target`.
+///
+/// `RelayHealthState` is laid out so worse states have larger discriminants
+/// (Healthy=0, NoTrafficYet=1, Stale=2, Dead=3). Using `fetch_max` makes the
+/// transition atomic: a concurrent writer that already moved health to Dead
+/// can never be silently downgraded to Stale by a later non-Dead update.
+fn escalate_relay_health(relay_health: &AtomicU8, target: RelayHealthState) -> bool {
+    relay_health.fetch_max(target as u8, Ordering::Relaxed) < target as u8
+}
+
+fn record_relay_send_error(
+    send_errors: &AtomicU64,
+    relay_health: &AtomicU8,
+    send_unreachable_streak: &AtomicU32,
+    send_failure_streak: &AtomicU32,
+    err: &std::io::Error,
+    relay_addr: SocketAddr,
+    context: &'static str,
+) -> RelaySendFailureAction {
+    let count = send_errors.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 5 || count.is_power_of_two() {
+        log::warn!(
+            "UDP Relay: Sender thread {} send_to error #{} to {}: {}",
+            context,
+            count,
+            relay_addr,
+            err
+        );
+    }
+
+    let total_failures = send_failure_streak.fetch_add(1, Ordering::Relaxed) + 1;
+
+    if !is_relay_network_unreachable_error(err) {
+        send_unreachable_streak.store(0, Ordering::Relaxed);
+
+        // Persistent non-repairable failures still need to surface as a real
+        // health degradation; otherwise the connection monitor sees Healthy
+        // forever while every send fails with EPERM/ENOBUFS/etc.
+        if total_failures >= RELAY_SEND_FAILURE_DEAD_THRESHOLD {
+            if escalate_relay_health(relay_health, RelayHealthState::Dead) {
+                log::error!(
+                    "UDP Relay: Health -> DEAD (relay_send_failure streak {} >= {}, relay {}, context {}, raw_os_error {:?})",
+                    total_failures,
+                    RELAY_SEND_FAILURE_DEAD_THRESHOLD,
+                    relay_addr,
+                    context,
+                    err.raw_os_error()
+                );
+            }
+        } else if total_failures >= RELAY_SEND_FAILURE_STALE_THRESHOLD {
+            if escalate_relay_health(relay_health, RelayHealthState::Stale) {
+                log::warn!(
+                    "UDP Relay: Health -> STALE (relay_send_failure streak {} >= {}, relay {}, context {}, raw_os_error {:?})",
+                    total_failures,
+                    RELAY_SEND_FAILURE_STALE_THRESHOLD,
+                    relay_addr,
+                    context,
+                    err.raw_os_error()
+                );
+            }
+        }
+
+        return RelaySendFailureAction::NonRepairable;
+    }
+
+    let streak = send_unreachable_streak.fetch_add(1, Ordering::Relaxed) + 1;
+    if streak >= RELAY_SEND_UNREACHABLE_DEAD_THRESHOLD {
+        if escalate_relay_health(relay_health, RelayHealthState::Dead) {
+            log::error!(
+                "UDP Relay: Health -> DEAD (relay_send_unreachable streak {} >= {}, relay {}, context {}, raw_os_error {:?})",
+                streak,
+                RELAY_SEND_UNREACHABLE_DEAD_THRESHOLD,
+                relay_addr,
+                context,
+                err.raw_os_error()
+            );
+        }
+        RelaySendFailureAction::RetryBudgetExhausted(streak)
+    } else {
+        escalate_relay_health(relay_health, RelayHealthState::Stale);
+        log::warn!(
+            "UDP Relay: relay_send_unreachable is retryable for now (streak {}/{}, relay {}, context {}, raw_os_error {:?})",
+            streak,
+            RELAY_SEND_UNREACHABLE_DEAD_THRESHOLD,
+            relay_addr,
+            context,
+            err.raw_os_error()
+        );
+        RelaySendFailureAction::RetryBudgetRemaining(streak)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RelayPathContext {
+    pub point_to_point_default_route: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayAuthAckStatus {
+    Ok = 0,
+    BadFormat = 1,
+    BadSignature = 2,
+    Expired = 3,
+    SidMismatch = 4,
+    ServerMismatch = 5,
+    AuthDisabled = 6,
+    /// The relay rejected this ticket's `jti` as a replay (already seen until
+    /// expiry). Previously coerced to `BadFormat`; modeled explicitly so it can
+    /// be logged distinctly. It is **always a rejection** on the client — never
+    /// coerced to `Ok`. See `authenticate_with_ticket` for why a replay cannot
+    /// be safely treated as lost-OK-ack recovery client-side.
+    Replay = 7,
+    OwnerMismatch = 8,
+    ReauthRequired = 9,
+}
+
+impl RelayAuthAckStatus {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Ok),
+            1 => Some(Self::BadFormat),
+            2 => Some(Self::BadSignature),
+            3 => Some(Self::Expired),
+            4 => Some(Self::SidMismatch),
+            5 => Some(Self::ServerMismatch),
+            6 => Some(Self::AuthDisabled),
+            7 => Some(Self::Replay),
+            8 => Some(Self::OwnerMismatch),
+            9 => Some(Self::ReauthRequired),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::BadFormat => "bad_format",
+            Self::BadSignature => "bad_signature",
+            Self::Expired => "expired",
+            Self::SidMismatch => "sid_mismatch",
+            Self::ServerMismatch => "server_mismatch",
+            Self::AuthDisabled => "auth_disabled",
+            Self::Replay => "replay",
+            Self::OwnerMismatch => "owner_mismatch",
+            Self::ReauthRequired => "reauth_required",
+        }
+    }
+
+    /// The single source of truth for "did relay auth succeed". ONLY `Ok`
+    /// authenticates the session; every other status — including `Replay` — is
+    /// a rejection the caller must roll back / fail over on. A `Replay` is
+    /// deliberately NOT treated as success: the client cannot tell a stale or
+    /// reused-ticket rejection from its own lost-OK-ack retransmit, so it fails
+    /// closed (see `authenticate_with_ticket`).
+    pub fn is_authenticated(self) -> bool {
+        matches!(self, Self::Ok)
+    }
+}
+
+async fn poll_recorded_auth_ack(
+    deadline: Instant,
+    mut take_ack: impl FnMut() -> Option<RelayAuthAckStatus>,
+) -> Option<RelayAuthAckStatus> {
+    let mut saw_replay = false;
+    loop {
+        match take_ack() {
+            Some(RelayAuthAckStatus::Replay) => saw_replay = true,
+            Some(status) => return Some(status),
+            None => {}
+        }
+        // Replay replies still consume the deadline and one polling interval.
+        // A stream of them must not turn renewal into an unbounded busy loop.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return saw_replay.then_some(RelayAuthAckStatus::Replay);
+        }
+        tokio::time::sleep(Duration::from_millis(25).min(remaining)).await;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct OutboundJob {
+    addr: SocketAddr,
+    buf_idx: usize,
+    len: usize,
+    enqueued_at_ms: u64,
+    kind: OutboundJobKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundJobKind {
+    Data,
+    Control,
+}
+
+struct OutboundPool {
+    buffers: Vec<UnsafeCell<[u8; OUTBOUND_FRAME_MAX]>>,
+    free_tx: channel::Sender<usize>,
+    free_rx: channel::Receiver<usize>,
+}
+
+// SAFETY: OutboundPool is Sync + Send because:
+// - Each buffer index is exclusively owned between OutboundPool::try_acquire() and
+//   OutboundPool::release() (no aliasing of indices).
+// - The bounded free-list channel is the sole authority for slot ownership.
+// - forward_outbound() writes the frame into the slot before enqueueing OutboundJob,
+//   and the sender loop in UdpRelay::new() reads the slot after recv_timeout() on the
+//   same crossbeam channel, which provides the necessary happens-before so writes
+//   are visible across threads.
+unsafe impl Sync for OutboundPool {}
+unsafe impl Send for OutboundPool {}
+
+impl OutboundPool {
+    fn new(slots: usize) -> Self {
+        let (free_tx, free_rx) = channel::bounded(slots);
+        let mut buffers = Vec::with_capacity(slots);
+        for i in 0..slots {
+            buffers.push(UnsafeCell::new([0u8; OUTBOUND_FRAME_MAX]));
+            free_tx
+                .send(i)
+                .expect("outbound pool free list must accept initial slots");
+        }
+        Self {
+            buffers,
+            free_tx,
+            free_rx,
+        }
+    }
+
+    fn try_acquire(&self) -> Option<usize> {
+        self.free_rx.try_recv().ok()
+    }
+
+    fn release(&self, idx: usize) {
+        let _ = self.free_tx.send(idx);
+    }
+
+    /// # Safety
+    ///
+    /// `idx` must be a slot the caller currently owns: obtained from
+    /// [`Self::try_acquire`] and not yet handed back to [`Self::release`].
+    /// The free list gives each index to exactly one caller at a time, which
+    /// is what makes producing `&mut` from `&self` sound here.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn buffer_mut(&self, idx: usize) -> &mut [u8; OUTBOUND_FRAME_MAX] {
+        unsafe { &mut *self.buffers[idx].get() }
+    }
+
+    /// # Safety
+    ///
+    /// Same slot-ownership requirement as [`Self::buffer_mut`].
+    unsafe fn buffer(&self, idx: usize) -> &[u8; OUTBOUND_FRAME_MAX] {
+        unsafe { &*self.buffers[idx].get() }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RelayPingSnapshot {
+    pub enabled: bool,
+    pub sent: u64,
+    pub received: u64,
+    /// Expired control probes as a percentage of resolved probes. Pending
+    /// probes are excluded; this is not a game-packet loss measurement.
+    pub loss_pct: f32,
+    pub last_rtt_ms: Option<u32>,
+    pub p50_rtt_ms: Option<u32>,
+    pub p99_rtt_ms: Option<u32>,
+    pub sample_count: usize,
+}
+
+/// RTT readings older than this are not reported: a relay that has stopped
+/// answering pings (switch to an unreachable relay, network drop) must show
+/// up as "no data" in the UI instead of freezing on the last good value.
+const PING_RTT_FRESHNESS_MS: u64 = 5_000;
+// A probe is unresolved until this deadline. This measures relay control
+// probes, not loss of game packets. Keep pending state bounded independently.
+const PING_RESPONSE_TIMEOUT_MS: u64 = 5_000;
+const MAX_PENDING_PINGS: usize = 256;
+
+struct PingMetrics {
+    enabled: AtomicBool,
+    sequence: AtomicU32,
+    state: parking_lot::Mutex<PingState>,
+}
+
+struct PingState {
+    relay_addr: SocketAddr,
+    sent: u64,
+    received: u64,
+    expired: u64,
+    pending: VecDeque<(u32, u64)>,
+    last_rtt: Option<(u64, u32)>,
+    samples: VecDeque<u32>,
+}
+
+impl PingState {
+    fn new(relay_addr: SocketAddr) -> Self {
+        Self {
+            relay_addr,
+            sent: 0,
+            received: 0,
+            expired: 0,
+            pending: VecDeque::with_capacity(MAX_PENDING_PINGS),
+            last_rtt: None,
+            samples: VecDeque::with_capacity(PING_SAMPLE_WINDOW),
+        }
+    }
+
+    fn expire(&mut self, now_ms: u64) {
+        let before = self.pending.len();
+        self.pending
+            .retain(|(_, sent_at)| now_ms.saturating_sub(*sent_at) < PING_RESPONSE_TIMEOUT_MS);
+        self.expired += (before - self.pending.len()) as u64;
+    }
+}
+
+impl PingMetrics {
+    fn new(relay_addr: SocketAddr) -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            sequence: AtomicU32::new(0),
+            state: parking_lot::Mutex::new(PingState::new(relay_addr)),
+        }
+    }
+
+    fn next_sequence(&self) -> u32 {
+        self.sequence
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+    }
+
+    // Register before send so a fast reply cannot beat registration. A local
+    // send error cancels the record rather than counting as network loss.
+    fn begin_probe(&self, addr: SocketAddr, seq: u32, sent_at: u64) {
+        let mut state = self.state.lock();
+        if state.relay_addr != addr {
+            return;
+        }
+        state.expire(sent_at);
+        if state.pending.len() < MAX_PENDING_PINGS && !state.pending.contains(&(seq, sent_at)) {
+            state.pending.push_back((seq, sent_at));
+            state.sent += 1;
+        }
+    }
+
+    fn cancel_probe(&self, addr: SocketAddr, seq: u32, sent_at: u64) {
+        let mut state = self.state.lock();
+        if state.relay_addr == addr
+            && let Some(index) = state.pending.iter().position(|key| *key == (seq, sent_at))
+        {
+            state.pending.remove(index);
+            state.sent -= 1;
+        }
+    }
+
+    fn record_pong(&self, addr: SocketAddr, seq: u32, sent_at: u64, now_ms: u64) -> Option<u32> {
+        let mut state = self.state.lock();
+        if state.relay_addr != addr || now_ms < sent_at {
+            return None;
+        }
+        state.expire(now_ms);
+        let index = state
+            .pending
+            .iter()
+            .position(|key| *key == (seq, sent_at))?;
+        state.pending.remove(index);
+        let rtt_ms = (now_ms - sent_at) as u32;
+        state.received += 1;
+        state.last_rtt = Some((now_ms, rtt_ms));
+        if state.samples.len() >= PING_SAMPLE_WINDOW {
+            state.samples.pop_front();
+        }
+        state.samples.push_back(rtt_ms);
+        Some(rtt_ms)
+    }
+
+    /// Clear all RTT state. Called on relay switch so the old relay's
+    /// readings can never be reported as the new relay's ping.
+    fn reset(&self, relay_addr: SocketAddr) {
+        // Sequence numbers remain session-wide across resets and keepalives.
+        *self.state.lock() = PingState::new(relay_addr);
+    }
+
+    fn snapshot(&self) -> RelayPingSnapshot {
+        self.snapshot_at(now_mono_ms())
+    }
+
+    fn snapshot_at(&self, now_ms: u64) -> RelayPingSnapshot {
+        let enabled = self.enabled.load(Ordering::Acquire);
+        let mut state = self.state.lock();
+        state.expire(now_ms);
+        let sent = state.sent;
+        let received = state.received;
+        let resolved = state.expired + received;
+        let loss_pct = if resolved == 0 {
+            0.0
+        } else {
+            (state.expired as f32) * 100.0 / (resolved as f32)
+        };
+        let last_rtt_ms = state.last_rtt.and_then(|(at, rtt)| {
+            (now_ms.saturating_sub(at) <= PING_RTT_FRESHNESS_MS).then_some(rtt)
+        });
+        let rtt_is_fresh = last_rtt_ms.is_some();
+
+        let mut p50_rtt_ms: Option<u32> = None;
+        let mut p99_rtt_ms: Option<u32> = None;
+        let sample_count;
+
+        {
+            let samples = &state.samples;
+            sample_count = samples.len();
+            // Percentiles share the freshness gate: once the relay stops
+            // answering, stale medians are as misleading as a stale last_rtt.
+            if sample_count > 0 && rtt_is_fresh {
+                let mut values: Vec<u32> = samples.iter().copied().collect();
+                values.sort_unstable();
+                let p50_idx = ((values.len() - 1) as f64 * 0.50).floor() as usize;
+                let p99_idx = ((values.len() - 1) as f64 * 0.99).floor() as usize;
+                p50_rtt_ms = values.get(p50_idx).copied();
+                p99_rtt_ms = values.get(p99_idx).copied();
+            }
+        }
+
+        RelayPingSnapshot {
+            enabled,
+            sent,
+            received,
+            loss_pct,
+            last_rtt_ms,
+            p50_rtt_ms,
+            p99_rtt_ms,
+            sample_count,
+        }
+    }
+}
+
+/// UDP Relay client for Game Booster mode
+pub struct UdpRelay {
+    /// Random diagnostic label, independent of the protocol session/credentials.
+    support_id: u64,
+    support_previous: parking_lot::Mutex<Option<SupportSample>>,
+    receive_diagnostics: ReceiveDiagnostics,
+    /// Socket for communicating with relay server
+    socket: UdpSocket,
+    /// Relay server address (swappable for auto-routing)
+    relay_addr: ArcSwap<SocketAddr>,
+    /// Previous relay address — accepted during grace period after switch
+    previous_relay_addr: ArcSwap<Option<SocketAddr>>,
+    /// When the last relay switch occurred (for grace period calculation)
+    switch_time: ArcSwap<Option<Instant>>,
+    /// Relay currently authenticating for renewal or an auto-route switch.
+    /// AUTH_ACK frames are recorded. Data is accepted only if this is already
+    /// the current relay, never merely because it is the pending target.
+    pending_auth_addr: ArcSwap<Option<SocketAddr>>,
+    /// Last auth ack observed by the inbound receiver thread, with its source
+    /// address. Mid-session authentication polls this because the inbound
+    /// thread owns socket reads once the session is running.
+    last_auth_ack: parking_lot::Mutex<Option<(SocketAddr, RelayAuthAckStatus)>>,
+    reauth_requested: tokio::sync::Notify,
+    /// Serializes live-session authentication so a lease refresh cannot race
+    /// an auto-route relay switch over the shared pending-auth slot.
+    auth_handshake_lock: tokio::sync::Mutex<()>,
+    /// Latest Roblox DNS resolve response (request_id + host→IPs) recorded by the
+    /// inbound receiver thread; polled by `resolve_roblox_hosts` during connect.
+    last_resolve_response: parking_lot::Mutex<Option<ResolveResponse>>,
+    /// Unique session ID for this connection
+    session_id: [u8; SESSION_ID_LEN],
+    /// Stop flag
+    stop_flag: Arc<AtomicBool>,
+    /// Packets sent counter
+    packets_sent: AtomicU64,
+    /// Packets received counter
+    packets_received: AtomicU64,
+    /// Inner packets dropped because encapsulation would exceed path MTU.
+    oversize_drops: AtomicU64,
+    /// Packets sent knowing the wire form will fragment. Tracked apart from
+    /// drops: these were delivered, just not in one piece.
+    fragmented_sends: AtomicU64,
+    /// Outbound frames dropped due to send queue pressure.
+    outbound_drops: AtomicU64,
+    /// Outbound data frames dropped because they sat in the sender queue too long.
+    stale_queue_drops: Arc<AtomicU64>,
+    /// Sender thread UDP send_to() errors.
+    send_errors: Arc<AtomicU64>,
+    /// Consecutive structured network-unreachable send failures.
+    send_unreachable_streak: Arc<AtomicU32>,
+    /// Consecutive send failures of any class (catches non-repairable errors
+    /// like ENOBUFS/EPERM that don't trip the unreachable retry budget).
+    send_failure_streak: Arc<AtomicU32>,
+    /// Effective outer MTU for relay packets (<= 1500), refreshed periodically on Windows.
+    relay_path_mtu: AtomicUsize,
+    relay_path_context: RelayPathContext,
+    /// True when relay_path_mtu is still a conservative fallback (probe failed).
+    relay_path_mtu_is_fallback: AtomicBool,
+    last_mtu_refresh_ms: AtomicU64,
+    /// Consecutive MTU detection failures (for throttled warning logs).
+    mtu_detect_failures: AtomicU64,
+    /// Whether PPPoE/point-to-point MTU clamp is currently active.
+    point_to_point_mtu_clamp_active: AtomicBool,
+    /// Number of times PPPoE/point-to-point MTU clamp has been applied.
+    point_to_point_mtu_clamp_events: AtomicU64,
+    /// Last activity timestamp (monotonic milliseconds via `now_mono_ms`).
+    /// Read on the keepalive hot path so we use an AtomicU64 instead of
+    /// `Mutex<Instant>` — lock+drop dwarfs the actual atomic store.
+    last_activity_ms: AtomicU64,
+    sender_handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+    outbound_pool: Arc<OutboundPool>,
+    outbound_tx: channel::Sender<OutboundJob>,
+    ping: Arc<PingMetrics>,
+    /// Relay health state — shared with connection manager for silent disconnect detection.
+    relay_health: Arc<AtomicU8>,
+    /// Consecutive keepalives sent without receiving any inbound traffic.
+    unanswered_keepalives: AtomicU32,
+    /// Consecutive inbound packets that failed to inject into the local stack since the
+    /// last successful inject. Used to detect data-plane failure that pongs would otherwise mask.
+    inject_error_streak: AtomicU32,
+    /// Last time the current relay provided liveness evidence.
+    last_receive_time: parking_lot::Mutex<Option<Instant>>,
+    /// First outbound activity since creation or relay switch.
+    first_outbound_time: parking_lot::Mutex<Option<Instant>>,
+    /// Set to true if the sender thread panics. Connection manager polls this so the
+    /// state machine can transition to Error instead of silently halting tunneling.
+    sender_panicked: Arc<AtomicBool>,
+}
+
+/// Parse a 0xA7 resolve response body: `[request_id_be_u16][answer_count:1]
+/// [(host_len:1, host_utf8, ip_count:1, (ipv4_be:4)*)]*`. Returns the request id
+/// and the resolved host→IPv4 answers. `None` on a malformed frame.
+fn parse_resolve_response(frame: &[u8], len: usize) -> Option<ResolveResponse> {
+    let header = SESSION_ID_LEN + 1; // session id + frame type byte
+    if len < header + 3 {
+        return None;
+    }
+    let request_id = u16::from_be_bytes([frame[header], frame[header + 1]]);
+    let answer_count = frame[header + 2] as usize;
+    let mut answers = Vec::with_capacity(answer_count);
+    let mut off = header + 3;
+    for _ in 0..answer_count {
+        if off >= len {
+            return None;
+        }
+        let hlen = frame[off] as usize;
+        off += 1;
+        if off + hlen > len {
+            return None;
+        }
+        let host = std::str::from_utf8(&frame[off..off + hlen])
+            .ok()?
+            .to_string();
+        off += hlen;
+        if off >= len {
+            return None;
+        }
+        let ip_count = frame[off] as usize;
+        off += 1;
+        if off + ip_count * 4 > len {
+            return None;
+        }
+        let mut ips = Vec::with_capacity(ip_count);
+        for _ in 0..ip_count {
+            ips.push(std::net::Ipv4Addr::new(
+                frame[off],
+                frame[off + 1],
+                frame[off + 2],
+                frame[off + 3],
+            ));
+            off += 4;
+        }
+        answers.push((host, ips));
+    }
+    Some((request_id, answers))
+}
+
+impl UdpRelay {
+    /// Wake renewal promptly after NAT port changes. Notifications coalesce;
+    /// the connection task separately bounds how often it requests a ticket.
+    pub async fn wait_for_lease_refresh(&self, delay: Duration) {
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {},
+            _ = self.reauth_requested.notified() => {},
+        }
+    }
+
+    /// Create a new UDP relay connection to the specified server
+    ///
+    /// relay_addr should already be resolved (use tokio::net::lookup_host for DNS)
+    pub fn new(relay_addr: SocketAddr) -> Result<Self> {
+        Self::new_with_path_context(relay_addr, RelayPathContext::default())
+    }
+
+    pub(crate) fn new_with_path_context(
+        relay_addr: SocketAddr,
+        path_context: RelayPathContext,
+    ) -> Result<Self> {
+        // Bind to any available port
+        let socket = UdpSocket::bind("0.0.0.0:0").context("Failed to bind UDP socket")?;
+
+        // Set socket options for low latency
+        socket
+            .set_read_timeout(Some(READ_TIMEOUT))
+            .context("Failed to set read timeout")?;
+        socket
+            .set_write_timeout(Some(SEND_TIMEOUT))
+            .context("Failed to set write timeout")?;
+
+        // Increase send and receive buffers to 256KB to handle burst traffic
+        // Default Windows SO_SNDBUF is only 8KB which causes WouldBlock under
+        // Roblox's 30-60 packets/sec rate, leading to silent packet drops (Error 277)
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            let raw = socket.as_raw_socket();
+            let buf_size: i32 = 256 * 1024;
+            let sock = windows::Win32::Networking::WinSock::SOCKET(raw as usize);
+
+            unsafe {
+                let buf_bytes = std::slice::from_raw_parts(&buf_size as *const i32 as *const u8, 4);
+
+                let result = windows::Win32::Networking::WinSock::setsockopt(
+                    sock,
+                    windows::Win32::Networking::WinSock::SOL_SOCKET,
+                    windows::Win32::Networking::WinSock::SO_RCVBUF,
+                    Some(buf_bytes),
+                );
+                if result != 0 {
+                    log::warn!("UDP Relay: Failed to set SO_RCVBUF to 256KB, using default");
+                }
+
+                let result = windows::Win32::Networking::WinSock::setsockopt(
+                    sock,
+                    windows::Win32::Networking::WinSock::SOL_SOCKET,
+                    windows::Win32::Networking::WinSock::SO_SNDBUF,
+                    Some(buf_bytes),
+                );
+                if result != 0 {
+                    log::warn!("UDP Relay: Failed to set SO_SNDBUF to 256KB, using default");
+                }
+
+                // Windows only honors user-set IP_TOS when DisableUserTOSSetting=0.
+                // The latency network boost sets that registry value and also installs
+                // a SwiftTunnel-only QoS policy; without it, this socket mark may be
+                // accepted by Winsock but stripped before packets leave the host.
+                let tos = RELAY_DSCP_EF_TOS_BYTE;
+                let tos_bytes = std::slice::from_raw_parts(&tos as *const i32 as *const u8, 4);
+                let result = windows::Win32::Networking::WinSock::setsockopt(
+                    sock,
+                    windows::Win32::Networking::WinSock::IPPROTO_IP.0,
+                    windows::Win32::Networking::WinSock::IP_TOS,
+                    Some(tos_bytes),
+                );
+                if result != 0 {
+                    log::warn!("UDP Relay: Failed to set IP_TOS DSCP EF; continuing");
+                }
+            }
+        }
+
+        // Generate random session ID
+        let mut session_id = [0u8; SESSION_ID_LEN];
+        getrandom(&mut session_id);
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        // Dedicated sender thread: eliminates multi-threaded Winsock send contention.
+        let outbound_pool = Arc::new(OutboundPool::new(OUTBOUND_POOL_SLOTS));
+        let (outbound_tx, outbound_rx) = channel::bounded::<OutboundJob>(OUTBOUND_QUEUE_CAP);
+        let ping = Arc::new(PingMetrics::new(relay_addr));
+        let send_errors = Arc::new(AtomicU64::new(0));
+        let stale_queue_drops = Arc::new(AtomicU64::new(0));
+        let send_unreachable_streak = Arc::new(AtomicU32::new(0));
+        let send_failure_streak = Arc::new(AtomicU32::new(0));
+        let relay_health = Arc::new(AtomicU8::new(RelayHealthState::NoTrafficYet as u8));
+
+        let sender_socket = socket
+            .try_clone()
+            .context("Failed to clone UDP socket for sender thread")?;
+        let sender_pool = Arc::clone(&outbound_pool);
+        let sender_stop = Arc::clone(&stop_flag);
+        let sender_ping = Arc::clone(&ping);
+        let sender_send_errors = Arc::clone(&send_errors);
+        let sender_stale_queue_drops = Arc::clone(&stale_queue_drops);
+        let sender_send_unreachable_streak = Arc::clone(&send_unreachable_streak);
+        let sender_send_failure_streak = Arc::clone(&send_failure_streak);
+        let sender_relay_health = Arc::clone(&relay_health);
+        let sender_session_id = session_id;
+        let sender_panicked = Arc::new(AtomicBool::new(false));
+        let sender_panicked_for_thread = Arc::clone(&sender_panicked);
+        let sender_handle = std::thread::Builder::new()
+            .name("udp-relay-sender".to_string())
+            .spawn(move || {
+                // Wrap the entire body in catch_unwind so a panic here doesn't
+                // silently halt tunneling — instead we surface it via the
+                // sender_panicked flag that the connection manager polls.
+                // AssertUnwindSafe: captured state is either Arcs or owned values
+                // we're willing to abandon on panic; they're dropped either way.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut last_relay_addr: Option<SocketAddr> = None;
+                    let mut last_data_at: Option<Instant> = None;
+                    let mut next_ping_at = Instant::now() + PING_INTERVAL;
+
+                    loop {
+                        if sender_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+
+                        // Wait for outbound work, but wake periodically to service ping timing.
+                        let now = Instant::now();
+                        let timeout = sender_wait_timeout(
+                            sender_ping.enabled.load(Ordering::Acquire),
+                            last_data_at,
+                            next_ping_at,
+                            now,
+                        );
+
+                        match outbound_rx.recv_timeout(timeout) {
+                            Ok(job) => {
+                                let now_ms = now_mono_ms();
+                                if should_drop_stale_outbound_job(
+                                    job.kind,
+                                    job.enqueued_at_ms,
+                                    now_ms,
+                                ) {
+                                    let drops =
+                                        sender_stale_queue_drops.fetch_add(1, Ordering::Relaxed)
+                                            + 1;
+                                    if drops <= 5 || drops.is_power_of_two() {
+                                        log::warn!(
+                                            "UDP Relay: Dropping stale queued data packet (age {}ms > {}ms, drop #{})",
+                                            now_ms.saturating_sub(job.enqueued_at_ms),
+                                            OUTBOUND_DATA_MAX_QUEUE_AGE_MS,
+                                            drops
+                                        );
+                                    }
+                                    sender_pool.release(job.buf_idx);
+                                    continue;
+                                }
+
+                                note_sender_activity(
+                                    job.kind,
+                                    job.addr,
+                                    Instant::now(),
+                                    &mut last_relay_addr,
+                                    &mut last_data_at,
+                                );
+
+                                // Send and release buffer slot.
+                                let bytes = unsafe { sender_pool.buffer(job.buf_idx) };
+                                match sender_socket.send_to(&bytes[..job.len], job.addr) {
+                                    Ok(_) => record_relay_send_success(
+                                        &sender_send_unreachable_streak,
+                                        &sender_send_failure_streak,
+                                    ),
+                                    Err(e) => {
+                                        record_relay_send_error(
+                                            &sender_send_errors,
+                                            &sender_relay_health,
+                                            &sender_send_unreachable_streak,
+                                            &sender_send_failure_streak,
+                                            &e,
+                                            job.addr,
+                                            "data",
+                                        );
+                                    }
+                                }
+                                sender_pool.release(job.buf_idx);
+                            }
+                            Err(channel::RecvTimeoutError::Timeout) => {}
+                            Err(channel::RecvTimeoutError::Disconnected) => break,
+                        }
+
+                        let now = Instant::now();
+                        if !sender_ping.enabled.load(Ordering::Acquire) {
+                            continue;
+                        }
+
+                        let Some(relay_addr) = last_relay_addr else {
+                            continue;
+                        };
+
+                        let Some(last_data_at) = last_data_at else {
+                            continue;
+                        };
+
+                        // Back off pings when idle to avoid noisy telemetry at rest.
+                        if now.duration_since(last_data_at) >= PING_IDLE_THRESHOLD {
+                            next_ping_at = now + PING_IDLE_INTERVAL;
+                            continue;
+                        }
+
+                        if now < next_ping_at {
+                            continue;
+                        }
+
+                        let ping_seq = sender_ping.next_sequence();
+                        let client_ts_mono_ms = now_mono_ms();
+
+                        let mut frame = [0u8; PING_FRAME_LEN];
+                        frame[..SESSION_ID_LEN].copy_from_slice(&sender_session_id);
+                        frame[SESSION_ID_LEN] = PING_FRAME_TYPE;
+                        frame[SESSION_ID_LEN + 1..SESSION_ID_LEN + 5]
+                            .copy_from_slice(&ping_seq.to_be_bytes());
+                        frame[SESSION_ID_LEN + 5..SESSION_ID_LEN + 13]
+                            .copy_from_slice(&client_ts_mono_ms.to_be_bytes());
+
+                        sender_ping.begin_probe(relay_addr, ping_seq, client_ts_mono_ms);
+                        match sender_socket.send_to(&frame, relay_addr) {
+                            Ok(_) => {
+                                record_relay_send_success(
+                                    &sender_send_unreachable_streak,
+                                    &sender_send_failure_streak,
+                                );
+                            }
+                            Err(e) => {
+                                sender_ping.cancel_probe(relay_addr, ping_seq, client_ts_mono_ms);
+                                record_relay_send_error(
+                                    &sender_send_errors,
+                                    &sender_relay_health,
+                                    &sender_send_unreachable_streak,
+                                    &sender_send_failure_streak,
+                                    &e,
+                                    relay_addr,
+                                    "ping",
+                                );
+                            }
+                        }
+                        next_ping_at = now + PING_INTERVAL;
+                    }
+
+                    // Drain any queued jobs to return buffer slots to the free list.
+                    while let Ok(job) = outbound_rx.try_recv() {
+                        sender_pool.release(job.buf_idx);
+                    }
+                }));
+
+                if let Err(panic_payload) = result {
+                    sender_panicked_for_thread.store(true, Ordering::Release);
+                    let msg = if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "<non-string panic payload>".to_string()
+                    };
+                    log::error!(
+                        "UDP Relay: Sender thread panicked — tunneling halted: {}",
+                        msg
+                    );
+                }
+            })
+            .context("Failed to spawn udp-relay-sender thread")?;
+
+        log::info!(
+            "UDP Relay: Created session {:016x} to {}",
+            u64::from_be_bytes(session_id),
+            relay_addr
+        );
+
+        let detected_mtu = detect_relay_path_mtu(relay_addr);
+        let initial_mtu = select_initial_relay_path_mtu_for_context(detected_mtu, path_context);
+        if initial_mtu.is_fallback {
+            log::warn!(
+                "UDP Relay: MTU probe unavailable for {}; using conservative fallback MTU {} (will retry)",
+                relay_addr,
+                initial_mtu.mtu
+            );
+        } else if initial_mtu.point_to_point_clamped {
+            let detected_mtu = detected_mtu
+                .map(clamp_relay_path_mtu)
+                .unwrap_or(RELAY_PATH_MTU_UPPER_BOUND);
+            log::warn!(
+                "UDP Relay: PPP/point-to-point default route detected; clamping relay path MTU to {} (detected {}, relay {})",
+                initial_mtu.mtu,
+                detected_mtu,
+                relay_addr
+            );
+        } else {
+            log::info!(
+                "UDP Relay: Detected relay path MTU {} for {}",
+                initial_mtu.mtu,
+                relay_addr
+            );
+        }
+
+        Ok(Self {
+            support_id: rand::random(),
+            support_previous: parking_lot::Mutex::new(None),
+            receive_diagnostics: ReceiveDiagnostics::default(),
+            socket,
+            relay_addr: ArcSwap::from_pointee(relay_addr),
+            previous_relay_addr: ArcSwap::from_pointee(None),
+            switch_time: ArcSwap::from_pointee(None),
+            pending_auth_addr: ArcSwap::from_pointee(None),
+            last_auth_ack: parking_lot::Mutex::new(None),
+            reauth_requested: tokio::sync::Notify::new(),
+            auth_handshake_lock: tokio::sync::Mutex::new(()),
+            last_resolve_response: parking_lot::Mutex::new(None),
+            session_id,
+            stop_flag,
+            packets_sent: AtomicU64::new(0),
+            packets_received: AtomicU64::new(0),
+            oversize_drops: AtomicU64::new(0),
+            fragmented_sends: AtomicU64::new(0),
+            outbound_drops: AtomicU64::new(0),
+            stale_queue_drops,
+            send_errors,
+            send_unreachable_streak,
+            send_failure_streak,
+            relay_path_mtu: AtomicUsize::new(initial_mtu.mtu),
+            relay_path_context: path_context,
+            relay_path_mtu_is_fallback: AtomicBool::new(initial_mtu.is_fallback),
+            last_mtu_refresh_ms: AtomicU64::new(if initial_mtu.is_fallback {
+                0
+            } else {
+                now_mono_ms()
+            }),
+            mtu_detect_failures: AtomicU64::new(0),
+            point_to_point_mtu_clamp_active: AtomicBool::new(initial_mtu.point_to_point_clamped),
+            point_to_point_mtu_clamp_events: AtomicU64::new(
+                if initial_mtu.point_to_point_clamped {
+                    1
+                } else {
+                    0
+                },
+            ),
+            last_activity_ms: AtomicU64::new(now_mono_ms()),
+            sender_handle: parking_lot::Mutex::new(Some(sender_handle)),
+            outbound_pool,
+            outbound_tx,
+            ping,
+            relay_health,
+            unanswered_keepalives: AtomicU32::new(0),
+            inject_error_streak: AtomicU32::new(0),
+            last_receive_time: parking_lot::Mutex::new(None),
+            first_outbound_time: parking_lot::Mutex::new(None),
+            sender_panicked,
+        })
+    }
+
+    /// Returns true if the sender thread panicked. The connection manager should
+    /// transition to Error if this becomes true so the user sees a real failure
+    /// instead of a frozen-but-"connected" tunnel.
+    pub fn sender_panicked(&self) -> bool {
+        self.sender_panicked.load(Ordering::Acquire)
+    }
+
+    fn record_outbound_activity(&self) {
+        self.last_activity_ms
+            .store(now_mono_ms(), Ordering::Relaxed);
+        let mut first = self.first_outbound_time.lock();
+        if first.is_none() {
+            *first = Some(Instant::now());
+        }
+    }
+
+    fn build_ping_frame(&self) -> [u8; PING_FRAME_LEN] {
+        let seq = self.ping.next_sequence();
+        let client_ts_mono_ms = now_mono_ms();
+
+        let mut frame = [0u8; PING_FRAME_LEN];
+        frame[..SESSION_ID_LEN].copy_from_slice(&self.session_id);
+        frame[SESSION_ID_LEN] = PING_FRAME_TYPE;
+        frame[SESSION_ID_LEN + 1..SESSION_ID_LEN + 5].copy_from_slice(&seq.to_be_bytes());
+        frame[SESSION_ID_LEN + 5..SESSION_ID_LEN + 13]
+            .copy_from_slice(&client_ts_mono_ms.to_be_bytes());
+        frame
+    }
+
+    fn send_ping_to_current_relay(&self, context: &'static str) -> Result<SocketAddr> {
+        let current_addr = **self.relay_addr.load();
+        let frame = self.build_ping_frame();
+        self.socket
+            .send_to(&frame, current_addr)
+            .with_context(|| format!("Failed to send {context}"))?;
+        Ok(current_addr)
+    }
+
+    fn record_current_relay_liveness(&self, now: Instant) {
+        self.last_activity_ms
+            .store(now_mono_ms(), Ordering::Relaxed);
+        self.relay_health
+            .store(RelayHealthState::Healthy as u8, Ordering::Relaxed);
+        self.unanswered_keepalives.store(0, Ordering::Relaxed);
+        *self.last_receive_time.lock() = Some(now);
+    }
+
+    /// Record the outcome of an inject attempt by the inbound receiver.
+    ///
+    /// A successful inject resets the streak; a failure increments it. The streak feeds
+    /// into `check_health()` so a relay that responds to pongs but produces unusable data
+    /// packets (e.g. malformed reconstructed IP frames) is detected, instead of looking
+    /// healthy forever because pongs alone refresh `last_receive_time`.
+    pub fn record_inject_outcome(&self, success: bool) {
+        if success {
+            self.inject_error_streak.store(0, Ordering::Relaxed);
+        } else {
+            self.inject_error_streak.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Current consecutive inject-failure streak (for tests + diagnostic logs).
+    pub fn inject_error_streak(&self) -> u32 {
+        self.inject_error_streak.load(Ordering::Relaxed)
+    }
+
+    /// Current consecutive structured network-unreachable send failures.
+    pub fn send_unreachable_streak(&self) -> u32 {
+        self.send_unreachable_streak.load(Ordering::Relaxed)
+    }
+
+    /// Current consecutive send failures of any class.
+    pub fn send_failure_streak(&self) -> u32 {
+        self.send_failure_streak.load(Ordering::Relaxed)
+    }
+
+    fn rollback_unanswered_keepalive(&self) {
+        let _ =
+            self.unanswered_keepalives
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                });
+    }
+
+    /// Get the session ID as a u64 for logging
+    pub fn session_id_u64(&self) -> u64 {
+        u64::from_be_bytes(self.session_id)
+    }
+
+    /// Get the session ID as lower-case hex string.
+    pub fn session_id_hex(&self) -> String {
+        format!("{:016x}", self.session_id_u64())
+    }
+
+    fn max_inner_packet_len_for_addr(&self, relay_addr: SocketAddr) -> usize {
+        let mtu = self.relay_path_mtu.load(Ordering::Relaxed);
+        let overhead = if relay_addr.ip().is_ipv4() {
+            IPV4_HEADER_LEN + UDP_HEADER_LEN + SESSION_ID_LEN
+        } else {
+            IPV6_HEADER_LEN + UDP_HEADER_LEN + SESSION_ID_LEN
+        };
+        mtu.saturating_sub(overhead)
+    }
+
+    /// Current maximum inner IP packet length that can be encapsulated without
+    /// exceeding the relay path MTU.
+    pub fn max_inner_packet_len(&self) -> usize {
+        self.max_inner_packet_len_for_addr(**self.relay_addr.load())
+    }
+
+    #[cfg(windows)]
+    pub fn relay_path_mtu_refresh_due(&self) -> bool {
+        let now = now_mono_ms();
+        let refresh_interval_ms = if self.relay_path_mtu_is_fallback.load(Ordering::Acquire) {
+            RELAY_PATH_MTU_FALLBACK_RETRY_INTERVAL_MS
+        } else {
+            RELAY_PATH_MTU_REFRESH_INTERVAL_MS
+        };
+        let last = self.last_mtu_refresh_ms.load(Ordering::Relaxed);
+        now.saturating_sub(last) >= refresh_interval_ms
+    }
+
+    #[cfg(not(windows))]
+    pub fn relay_path_mtu_refresh_due(&self) -> bool {
+        false
+    }
+
+    #[cfg(windows)]
+    fn maybe_refresh_relay_path_mtu(&self, relay_addr: SocketAddr) {
+        let now = now_mono_ms();
+        let refresh_interval_ms = if self.relay_path_mtu_is_fallback.load(Ordering::Acquire) {
+            RELAY_PATH_MTU_FALLBACK_RETRY_INTERVAL_MS
+        } else {
+            RELAY_PATH_MTU_REFRESH_INTERVAL_MS
+        };
+        let last = self.last_mtu_refresh_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < refresh_interval_ms {
+            return;
+        }
+
+        if self
+            .last_mtu_refresh_ms
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        match detect_relay_path_mtu(relay_addr) {
+            Some(detected_mtu) => {
+                let detected_mtu = clamp_relay_path_mtu(detected_mtu);
+                let (mtu, point_to_point_clamped) =
+                    apply_point_to_point_relay_mtu_ceiling(detected_mtu, self.relay_path_context);
+                let prev = self.relay_path_mtu.swap(mtu, Ordering::Relaxed);
+                let was_fallback = self
+                    .relay_path_mtu_is_fallback
+                    .swap(false, Ordering::AcqRel);
+                let was_point_to_point_clamped = self
+                    .point_to_point_mtu_clamp_active
+                    .swap(point_to_point_clamped, Ordering::AcqRel);
+                self.mtu_detect_failures.store(0, Ordering::Relaxed);
+                if prev != mtu || was_fallback {
+                    if was_fallback {
+                        log::info!(
+                            "UDP Relay: MTU probe recovered for {}; using detected MTU {}",
+                            relay_addr,
+                            mtu
+                        );
+                    } else {
+                        log::info!(
+                            "UDP Relay: Updated relay path MTU {} -> {} for {}",
+                            prev,
+                            mtu,
+                            relay_addr
+                        );
+                    }
+                }
+                if point_to_point_clamped && (!was_point_to_point_clamped || prev != mtu) {
+                    let events = self
+                        .point_to_point_mtu_clamp_events
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
+                    log::info!(
+                        "UDP Relay: PPPoE clamp active (detected MTU {}, clamped to {}, relay {}, event #{})",
+                        detected_mtu,
+                        mtu,
+                        relay_addr,
+                        events
+                    );
+                } else if !point_to_point_clamped && was_point_to_point_clamped {
+                    log::info!(
+                        "UDP Relay: PPPoE clamp no longer active (detected MTU {}, relay {})",
+                        detected_mtu,
+                        relay_addr
+                    );
+                }
+            }
+            None => {
+                let failures = self.mtu_detect_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if self.relay_path_mtu_is_fallback.load(Ordering::Acquire)
+                    && (failures <= 5 || failures.is_power_of_two())
+                {
+                    log::warn!(
+                        "UDP Relay: MTU probe failed for {}; keeping fallback MTU {} (attempt #{})",
+                        relay_addr,
+                        self.relay_path_mtu.load(Ordering::Relaxed),
+                        failures
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn maybe_refresh_relay_path_mtu(&self, _relay_addr: SocketAddr) {}
+
+    #[cfg(test)]
+    fn set_relay_path_mtu_for_test(&self, mtu: usize) {
+        let mtu = clamp_relay_path_mtu(mtu);
+        self.relay_path_mtu.store(mtu, Ordering::Relaxed);
+        self.relay_path_mtu_is_fallback
+            .store(false, Ordering::Release);
+        self.mtu_detect_failures.store(0, Ordering::Relaxed);
+        self.point_to_point_mtu_clamp_active
+            .store(false, Ordering::Release);
+        self.point_to_point_mtu_clamp_events
+            .store(0, Ordering::Relaxed);
+    }
+
+    fn is_expected_relay_source(&self, from: SocketAddr) -> bool {
+        let expected_addr = **self.relay_addr.load();
+        if from == expected_addr {
+            return true;
+        }
+
+        if let (Some(prev), Some(switched_at)) = (
+            (**self.previous_relay_addr.load()).as_ref(),
+            (**self.switch_time.load()).as_ref(),
+        ) {
+            return from == *prev && switched_at.elapsed() < RELAY_SWITCH_GRACE_PERIOD;
+        }
+        false
+    }
+
+    /// Send relay auth hello frame:
+    /// [session_id:8][0xA1][token_len:2][token_utf8].
+    pub fn send_auth_hello(&self, token: &str) -> Result<()> {
+        let current_addr = **self.relay_addr.load();
+        self.send_auth_hello_to(token, current_addr)
+    }
+
+    /// Send the auth hello frame to an explicit relay address. Used by the
+    /// pre-switch authentication path, which must authenticate the target
+    /// relay while tunnel data is still flowing to the current one.
+    fn send_auth_hello_to(&self, token: &str, target: SocketAddr) -> Result<()> {
+        let token_bytes = token.as_bytes();
+        if token_bytes.is_empty() || token_bytes.len() > u16::MAX as usize {
+            anyhow::bail!(
+                "Relay auth token length must be between 1 and {} bytes",
+                u16::MAX
+            );
+        }
+
+        let mut frame = Vec::with_capacity(SESSION_ID_LEN + 3 + token_bytes.len());
+        frame.extend_from_slice(&self.session_id);
+        frame.push(AUTH_HELLO_FRAME_TYPE);
+        frame.extend_from_slice(&(token_bytes.len() as u16).to_be_bytes());
+        frame.extend_from_slice(token_bytes);
+
+        self.socket
+            .send_to(&frame, target)
+            .context("Failed to send relay auth hello")?;
+        log::debug!(
+            "UDP Relay: Sent auth hello to {} (session {:016x}, token {} bytes)",
+            target,
+            self.session_id_u64(),
+            token_bytes.len()
+        );
+        Ok(())
+    }
+
+    fn wait_for_auth_ack_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<RelayAuthAckStatus>> {
+        let deadline = Instant::now() + timeout;
+        let mut recv_buf = [0u8; 1600];
+        let mut saw_replay = false;
+
+        while Instant::now() < deadline {
+            match self.socket.recv_from(&mut recv_buf) {
+                Ok((len, from)) => {
+                    if !self.is_expected_relay_source(from) {
+                        continue;
+                    }
+
+                    if len < SESSION_ID_LEN + 2 {
+                        continue;
+                    }
+                    if recv_buf[..SESSION_ID_LEN] != self.session_id {
+                        continue;
+                    }
+                    if recv_buf[SESSION_ID_LEN] != AUTH_ACK_FRAME_TYPE {
+                        continue;
+                    }
+
+                    let status_byte = recv_buf[SESSION_ID_LEN + 1];
+                    let status = RelayAuthAckStatus::from_u8(status_byte)
+                        .unwrap_or(RelayAuthAckStatus::BadFormat);
+                    if status == RelayAuthAckStatus::Replay {
+                        saw_replay = true;
+                        continue;
+                    }
+                    return Ok(Some(status));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        if saw_replay {
+            return Ok(Some(RelayAuthAckStatus::Replay));
+        }
+
+        Ok(None)
+    }
+
+    /// Send relay auth hello and wait for ack, with real retransmits.
+    ///
+    /// Up to `AUTH_HANDSHAKE_ATTEMPTS` hellos within `AUTH_HANDSHAKE_TOTAL_TIMEOUT`.
+    /// Early attempts listen one `AUTH_HANDSHAKE_RETRY_DELAY` then retransmit
+    /// (recovers a dropped hello/ack on a fast-but-lossy link); the final
+    /// attempt listens out the remaining budget (recovers a slow, high-RTT ack).
+    ///
+    /// Returns `Ok(Some(Ok))` on success, `Ok(Some(rejection))` for any
+    /// non-`Ok` status, or `Ok(None)` if no ack arrives in budget.
+    ///
+    /// A `Replay` ack is returned as-is — a rejection — and is NOT coerced to
+    /// `Ok`. A replay is ambiguous on the client and there is no reliable way
+    /// to disambiguate it here: the ack frame carries no indication of which
+    /// hello it answers, and on a high-RTT/queued-ack link a genuine
+    /// stale/reused-ticket rejection to the FIRST hello can arrive after this
+    /// loop has already retransmitted — so "have we sent a prior hello?" cannot
+    /// distinguish lost-OK-ack recovery from a real rejection. Coercing it to
+    /// `Ok` would let a spent ticket select the relay as authenticated and
+    /// leave the session silently unauthenticated (no rollback/failover), which
+    /// is the very failure this path must prevent. We therefore fail closed:
+    /// the caller rolls back and a reconnect fetches a fresh `jti`. The clean
+    /// recovery for a genuinely lost OK ack is relay-side (re-ack an
+    /// already-authed `jti` with `Ok` instead of `Replay`) — the documented
+    /// follow-up — not a client-side guess.
+    pub fn authenticate_with_ticket(&self, token: &str) -> Result<Option<RelayAuthAckStatus>> {
+        let mut diagnostic = AuthAttempt::new(self.support_id, self.relay_addr(), "initial");
+        let result = self.authenticate_initial_inner(token, &mut diagnostic);
+        diagnostic.outcome = match &result {
+            Ok(Some(status)) => status.as_str(),
+            Ok(None) => "ack_timeout",
+            Err(_) => "local_io_error",
+        };
+        result
+    }
+
+    fn authenticate_initial_inner(
+        &self,
+        token: &str,
+        diagnostic: &mut AuthAttempt,
+    ) -> Result<Option<RelayAuthAckStatus>> {
+        let deadline = Instant::now() + AUTH_HANDSHAKE_TOTAL_TIMEOUT;
+
+        for attempt in 0..AUTH_HANDSHAKE_ATTEMPTS {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            diagnostic.attempts += 1;
+            self.send_auth_hello(token)?;
+
+            // The bug this fixes: attempt 0 used to wait the ENTIRE budget, so
+            // the documented 4-attempt retransmit never fired and a single
+            // dropped auth packet hard-failed connect. Clamp early attempts to
+            // the retry delay so a retransmit actually happens; let the last
+            // attempt run out the remaining budget for high-RTT links.
+            let is_last_attempt = attempt + 1 == AUTH_HANDSHAKE_ATTEMPTS;
+            let attempt_timeout = if is_last_attempt {
+                remaining
+            } else {
+                AUTH_HANDSHAKE_RETRY_DELAY.min(remaining)
+            };
+
+            if let Some(status) = self.wait_for_auth_ack_with_timeout(attempt_timeout)? {
+                log::info!(
+                    "UDP Relay: Auth ack {} for session {:016x}",
+                    status.as_str(),
+                    self.session_id_u64()
+                );
+                return Ok(Some(status));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Authenticate this session with a *different* relay while the session
+    /// is live, without moving any tunnel traffic.
+    ///
+    /// `authenticate_with_ticket` reads the socket directly, which is only
+    /// safe before the inbound receiver thread starts. Mid-session, the
+    /// inbound thread owns all reads, so this variant registers `target` as
+    /// the pending-auth address (the inbound thread then records AUTH_ACKs
+    /// from it) and polls for the recorded ack.
+    ///
+    /// Returns `Ok(None)` on ack timeout. The caller must only call
+    /// `switch_relay(target)` after receiving `Ok(Some(RelayAuthAckStatus::Ok))`.
+    pub async fn authenticate_addr_with_ticket(
+        &self,
+        token: &str,
+        target: SocketAddr,
+    ) -> Result<Option<RelayAuthAckStatus>> {
+        let mut diagnostic = AuthAttempt::new(self.support_id, target, "renewal_or_switch");
+        let result = self
+            .authenticate_addr_serialized(token, target, &mut diagnostic)
+            .await;
+        diagnostic.outcome = match &result {
+            Ok(Some(status)) => status.as_str(),
+            Ok(None) => "ack_timeout",
+            Err(_) => "local_io_error",
+        };
+        result
+    }
+
+    async fn authenticate_addr_serialized(
+        &self,
+        token: &str,
+        target: SocketAddr,
+        diagnostic: &mut AuthAttempt,
+    ) -> Result<Option<RelayAuthAckStatus>> {
+        let _auth_guard = self.auth_handshake_lock.lock().await;
+        *self.last_auth_ack.lock() = None;
+        self.pending_auth_addr.store(Arc::new(Some(target)));
+        // The future can be dropped by disconnect, lease termination, or a
+        // cancelled route switch. Cleanup must also run on those paths, before
+        // releasing the handshake lock to another authentication attempt.
+        struct PendingAuthWindow<'a>(&'a UdpRelay);
+        impl Drop for PendingAuthWindow<'_> {
+            fn drop(&mut self) {
+                self.0.pending_auth_addr.store(Arc::new(None));
+                *self.0.last_auth_ack.lock() = None;
+            }
+        }
+        let _pending_window = PendingAuthWindow(self);
+        self.authenticate_addr_inner(token, target, diagnostic)
+            .await
+    }
+
+    async fn authenticate_addr_inner(
+        &self,
+        token: &str,
+        target: SocketAddr,
+        diagnostic: &mut AuthAttempt,
+    ) -> Result<Option<RelayAuthAckStatus>> {
+        let deadline = Instant::now() + AUTH_HANDSHAKE_TOTAL_TIMEOUT;
+        let mut saw_replay = false;
+
+        for attempt in 0..AUTH_HANDSHAKE_ATTEMPTS {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            diagnostic.attempts += 1;
+            self.send_auth_hello_to(token, target)?;
+
+            // Poll the ack recorded by the inbound receiver thread.
+            let is_last_attempt = attempt + 1 == AUTH_HANDSHAKE_ATTEMPTS;
+            let attempt_timeout = if is_last_attempt {
+                remaining
+            } else {
+                AUTH_HANDSHAKE_RETRY_DELAY.min(remaining)
+            };
+            let attempt_deadline = (Instant::now() + attempt_timeout).min(deadline);
+            let status = poll_recorded_auth_ack(attempt_deadline, || {
+                // Release the guard before handling the response. An if-let
+                // scrutinee keeps its temporary guard through the body, which
+                // deadlocked when the Replay branch tried to lock it again.
+                let ack = self.last_auth_ack.lock().take();
+                ack.filter(|(from, _)| *from == target).map(|(_, status)| {
+                    log::info!(
+                        "UDP Relay: Mid-session auth ack {} from {} (session {:016x})",
+                        status.as_str(),
+                        target,
+                        self.session_id_u64()
+                    );
+                    status
+                })
+            })
+            .await;
+            match status {
+                Some(RelayAuthAckStatus::Replay) => saw_replay = true,
+                Some(status) => return Ok(Some(status)),
+                None => {}
+            }
+        }
+
+        if saw_replay {
+            return Ok(Some(RelayAuthAckStatus::Replay));
+        }
+
+        Ok(None)
+    }
+
+    /// Get the stop flag for external control
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop_flag)
+    }
+
+    /// Enable or disable control-plane ping telemetry.
+    pub fn set_ping_enabled(&self, enabled: bool) {
+        if self.ping.enabled.swap(enabled, Ordering::AcqRel) != enabled {
+            self.ping.reset(self.relay_addr());
+        }
+    }
+
+    pub fn ping_snapshot(&self) -> RelayPingSnapshot {
+        self.ping.snapshot()
+    }
+
+    /// Forward a packet through the relay (outbound: game client -> relay -> game server)
+    ///
+    /// Takes the original UDP payload and prepends session ID before enqueueing to the
+    /// dedicated sender thread.
+    pub fn forward_outbound(&self, payload: &[u8]) -> Result<RelaySendOutcome> {
+        let current_addr = **self.relay_addr.load();
+        self.maybe_refresh_relay_path_mtu(current_addr);
+        self.forward_outbound_to_addr(payload, current_addr)
+    }
+
+    /// Forward a packet without doing the periodic MTU refresh check.
+    ///
+    /// Used by the NDIS reader fast path after it has confirmed refresh is not
+    /// currently due; the regular worker path still performs refreshes.
+    pub fn forward_outbound_fast(&self, payload: &[u8]) -> Result<RelaySendOutcome> {
+        let current_addr = **self.relay_addr.load();
+        self.forward_outbound_to_addr(payload, current_addr)
+    }
+
+    fn forward_outbound_to_addr(
+        &self,
+        payload: &[u8],
+        current_addr: SocketAddr,
+    ) -> Result<RelaySendOutcome> {
+        let max_payload = self.max_inner_packet_len_for_addr(current_addr);
+
+        if payload.len() > max_payload {
+            // Only packets too big for the pool frame are still dropped. Ones
+            // that merely overshoot the un-fragmented limit are sent anyway and
+            // allowed to fragment on the wire.
+            //
+            // The tunnel's session header is invisible to the application, so a
+            // client that has correctly discovered a 1500-byte path still emits
+            // packets sized for it. Those overshoot `max_payload` by up to
+            // SESSION_ID_LEN and used to be destroyed outright, which is total
+            // loss for the one packet size a well-behaved client is most likely
+            // to pick. Roblox's voice handshake sends full-size records and was
+            // the reliable casualty: gameplay rides smaller packets and kept
+            // working, so the symptom was a mic that never came up rather than
+            // anything that looked like a network fault.
+            //
+            // Fragments can be dropped by hostile middleboxes, but a fragment
+            // that might arrive strictly beats a packet that definitely will
+            // not. The relay needs no change either way: reassembly happens in
+            // its kernel before the socket ever sees the datagram.
+            if payload.len() > FRAGMENTABLE_INNER_MAX {
+                let dropped = self.oversize_drops.fetch_add(1, Ordering::Relaxed) + 1;
+                if dropped <= 5 || dropped.is_power_of_two() {
+                    let mtu = self.relay_path_mtu.load(Ordering::Relaxed);
+                    let overhead = mtu.saturating_sub(max_payload);
+                    log::warn!(
+                        "UDP Relay: Inner packet exceeds the tunnel frame ({} > {} bytes). \
+                        Dropping (relay path MTU {}, overhead {} bytes, relay {}).",
+                        payload.len(),
+                        FRAGMENTABLE_INNER_MAX,
+                        mtu,
+                        overhead,
+                        current_addr,
+                    );
+                }
+                return Ok(RelaySendOutcome::Oversize);
+            }
+
+            let fragmented = self.fragmented_sends.fetch_add(1, Ordering::Relaxed) + 1;
+            if fragmented <= 5 || fragmented.is_power_of_two() {
+                let mtu = self.relay_path_mtu.load(Ordering::Relaxed);
+                log::debug!(
+                    "UDP Relay: Inner packet {} bytes exceeds the un-fragmented limit {}; \
+                    sending fragmented (relay path MTU {}, relay {}, {} total).",
+                    payload.len(),
+                    max_payload,
+                    mtu,
+                    current_addr,
+                    fragmented,
+                );
+            }
+        }
+
+        let total_len = SESSION_ID_LEN + payload.len();
+
+        let Some(buf_idx) = self.outbound_pool.try_acquire() else {
+            let drops = self.outbound_drops.fetch_add(1, Ordering::Relaxed) + 1;
+            if drops <= 5 || drops.is_power_of_two() {
+                log::warn!(
+                    "UDP Relay: Outbound pool exhausted, dropping packet (drop #{}, {} bytes)",
+                    drops,
+                    payload.len()
+                );
+            }
+            return Ok(RelaySendOutcome::Backpressure);
+        };
+
+        unsafe {
+            let packet = self.outbound_pool.buffer_mut(buf_idx);
+            packet[..SESSION_ID_LEN].copy_from_slice(&self.session_id);
+            packet[SESSION_ID_LEN..total_len].copy_from_slice(payload);
+        }
+
+        let job = OutboundJob {
+            addr: current_addr,
+            buf_idx,
+            len: total_len,
+            enqueued_at_ms: now_mono_ms(),
+            kind: OutboundJobKind::Data,
+        };
+        if self.outbound_tx.try_send(job).is_err() {
+            let drops = self.outbound_drops.fetch_add(1, Ordering::Relaxed) + 1;
+            if drops <= 5 || drops.is_power_of_two() {
+                log::warn!(
+                    "UDP Relay: Outbound send queue full, dropping packet (drop #{}, {} bytes)",
+                    drops,
+                    payload.len()
+                );
+            }
+            self.outbound_pool.release(buf_idx);
+            return Ok(RelaySendOutcome::Backpressure);
+        }
+
+        self.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.record_outbound_activity();
+
+        Ok(RelaySendOutcome::Enqueued(total_len))
+    }
+
+    /// Receive a packet from the relay directly into the caller-provided frame buffer.
+    ///
+    /// Returns the payload slice with the session ID stripped, or None if no packet
+    /// is available. The returned slice borrows `frame_buffer`, avoiding the extra
+    /// relay-frame -> payload copy on the inbound hot path.
+    ///
+    /// After an auto-routing relay switch, packets from the OLD relay are accepted
+    /// during a 2-second grace period. This eliminates the inbound blackout that
+    /// occurs while the new relay establishes the game server session mapping.
+    pub fn receive_inbound_payload<'a>(
+        &self,
+        frame_buffer: &'a mut [u8],
+    ) -> Result<Option<&'a [u8]>> {
+        match self.socket.recv_from(frame_buffer) {
+            Ok((len, from)) => {
+                // A candidate may deliver only authentication responses until
+                // a route switch commits. Renewal of the current relay must
+                // still pass its data, telemetry, and reauthentication hints.
+                if let Some(pending) = **self.pending_auth_addr.load()
+                    && from == pending
+                {
+                    if len == SESSION_ID_LEN + 2
+                        && frame_buffer[..SESSION_ID_LEN] == self.session_id
+                        && frame_buffer[SESSION_ID_LEN] == AUTH_ACK_FRAME_TYPE
+                    {
+                        let status = RelayAuthAckStatus::from_u8(frame_buffer[SESSION_ID_LEN + 1])
+                            .unwrap_or(RelayAuthAckStatus::BadFormat);
+                        if status != RelayAuthAckStatus::ReauthRequired {
+                            *self.last_auth_ack.lock() = Some((from, status));
+                            return Ok(None);
+                        }
+                    }
+                    if from != **self.relay_addr.load() {
+                        self.record_receive_rejection(
+                            &self.receive_diagnostics.pending_candidate_data,
+                            "unauthenticated_candidate_data",
+                        );
+                        return Ok(None);
+                    }
+                }
+
+                // Verify it's from our relay server (current or previous during grace period)
+                if !self.is_expected_relay_source(from) {
+                    self.record_receive_rejection(
+                        &self.receive_diagnostics.unexpected_source,
+                        "unexpected_source",
+                    );
+                    return Ok(None);
+                }
+
+                // Must have at least session ID
+                if len < SESSION_ID_LEN {
+                    self.record_receive_rejection(
+                        &self.receive_diagnostics.short_frame,
+                        "short_frame",
+                    );
+                    return Ok(None);
+                }
+
+                // Verify session ID matches
+                if frame_buffer[..SESSION_ID_LEN] != self.session_id {
+                    self.record_receive_rejection(
+                        &self.receive_diagnostics.session_mismatch,
+                        "session_mismatch",
+                    );
+                    return Ok(None);
+                }
+
+                // Extract payload (skip session ID)
+                let payload_len = len - SESSION_ID_LEN;
+
+                // Control frames (auth + ping telemetry) should never reach packet injection.
+                if payload_len >= 1 {
+                    match frame_buffer[SESSION_ID_LEN] {
+                        AUTH_ACK_FRAME_TYPE => {
+                            if len != SESSION_ID_LEN + 2
+                                || RelayAuthAckStatus::from_u8(frame_buffer[SESSION_ID_LEN + 1])
+                                    .is_none()
+                            {
+                                self.record_receive_rejection(
+                                    &self.receive_diagnostics.malformed_control,
+                                    "malformed_auth_ack",
+                                );
+                            }
+                            if len == SESSION_ID_LEN + 2
+                                && from == **self.relay_addr.load()
+                                && RelayAuthAckStatus::from_u8(frame_buffer[SESSION_ID_LEN + 1])
+                                    == Some(RelayAuthAckStatus::ReauthRequired)
+                            {
+                                self.record_receive_rejection(
+                                    &self.receive_diagnostics.reauth_hints,
+                                    "reauthentication_requested",
+                                );
+                                self.reauth_requested.notify_one();
+                            }
+                            return Ok(None);
+                        }
+                        AUTH_HELLO_FRAME_TYPE | PING_FRAME_TYPE => {
+                            return Ok(None);
+                        }
+                        PONG_FRAME_TYPE => {
+                            let current_addr = **self.relay_addr.load();
+                            if len != PONG_FRAME_LEN {
+                                self.record_receive_rejection(
+                                    &self.receive_diagnostics.malformed_control,
+                                    "malformed_pong",
+                                );
+                            }
+                            if len == PONG_FRAME_LEN && from == current_addr {
+                                self.record_current_relay_liveness(Instant::now());
+
+                                if self.ping.enabled.load(Ordering::Acquire) {
+                                    let client_ts_mono_ms = u64::from_be_bytes([
+                                        frame_buffer[SESSION_ID_LEN + 5],
+                                        frame_buffer[SESSION_ID_LEN + 6],
+                                        frame_buffer[SESSION_ID_LEN + 7],
+                                        frame_buffer[SESSION_ID_LEN + 8],
+                                        frame_buffer[SESSION_ID_LEN + 9],
+                                        frame_buffer[SESSION_ID_LEN + 10],
+                                        frame_buffer[SESSION_ID_LEN + 11],
+                                        frame_buffer[SESSION_ID_LEN + 12],
+                                    ]);
+                                    let now_ms = now_mono_ms();
+                                    let seq = u32::from_be_bytes(
+                                        frame_buffer[SESSION_ID_LEN + 1..SESSION_ID_LEN + 5]
+                                            .try_into()
+                                            .expect("validated pong length"),
+                                    );
+                                    if let Some(rtt_ms) =
+                                        self.ping.record_pong(from, seq, client_ts_mono_ms, now_ms)
+                                    {
+                                        // Report RTT to the relay that sent this pong, routed
+                                        // through the sender thread to avoid blocking the receive path.
+                                        let rtt_us = rtt_ms.saturating_mul(1000);
+                                        const RTT_REPORT_LEN: usize = SESSION_ID_LEN + 1 + 4; // 13 bytes
+                                        if let Some(buf_idx) = self.outbound_pool.try_acquire() {
+                                            unsafe {
+                                                let pkt = self.outbound_pool.buffer_mut(buf_idx);
+                                                pkt[..SESSION_ID_LEN]
+                                                    .copy_from_slice(&self.session_id);
+                                                pkt[SESSION_ID_LEN] = RTT_REPORT_FRAME_TYPE;
+                                                pkt[SESSION_ID_LEN + 1..SESSION_ID_LEN + 5]
+                                                    .copy_from_slice(&rtt_us.to_be_bytes());
+                                            }
+                                            let job = OutboundJob {
+                                                addr: from,
+                                                buf_idx,
+                                                len: RTT_REPORT_LEN,
+                                                enqueued_at_ms: now_mono_ms(),
+                                                kind: OutboundJobKind::Control,
+                                            };
+                                            if self.outbound_tx.try_send(job).is_err() {
+                                                self.outbound_pool.release(buf_idx);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            return Ok(None);
+                        }
+                        RESOLVE_RESPONSE_FRAME_TYPE => {
+                            if let Some(parsed) = parse_resolve_response(frame_buffer, len) {
+                                *self.last_resolve_response.lock() = Some(parsed);
+                            } else {
+                                self.record_receive_rejection(
+                                    &self.receive_diagnostics.malformed_control,
+                                    "malformed_dns_response",
+                                );
+                            }
+                            return Ok(None);
+                        }
+                        _ => {}
+                    }
+                }
+
+                self.packets_received.fetch_add(1, Ordering::Relaxed);
+                let now = Instant::now();
+                if from == **self.relay_addr.load() {
+                    self.record_current_relay_liveness(now);
+                }
+
+                Ok(Some(&frame_buffer[SESSION_ID_LEN..len]))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(None),
+            Err(e) => {
+                let count = self
+                    .receive_diagnostics
+                    .socket_errors
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                if log_counter_example(count) {
+                    log::warn!(
+                        "Relay receive error: diagnostic={:016x} endpoint={} count={} os_code={:?} kind={:?}",
+                        self.support_id,
+                        self.relay_addr(),
+                        count,
+                        e.raw_os_error(),
+                        e.kind()
+                    );
+                }
+                Err(e.into())
+            }
+        }
+    }
+
+    fn record_receive_rejection(&self, counter: &AtomicU64, reason: &'static str) {
+        let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if log_counter_example(count) {
+            log::warn!(
+                "Relay receive event: diagnostic={:016x} reason={} count={}",
+                self.support_id,
+                reason,
+                count
+            );
+        }
+    }
+
+    pub(crate) fn support_id(&self) -> u64 {
+        self.support_id
+    }
+
+    /// Send a Roblox DNS resolve request (0xA6) for up to
+    /// `RESOLVE_MAX_HOSTS_PER_REQUEST` hosts. Best-effort control frame; the reply
+    /// is recorded by the inbound receiver into `last_resolve_response`.
+    fn send_resolve_request(&self, request_id: u16, hosts: &[&str]) -> bool {
+        let current_addr = **self.relay_addr.load();
+        let count = hosts.len().min(RESOLVE_MAX_HOSTS_PER_REQUEST);
+        let mut frame = Vec::with_capacity(8 + count * 24);
+        frame.push(RESOLVE_REQUEST_FRAME_TYPE);
+        frame.extend_from_slice(&request_id.to_be_bytes());
+        frame.push(count as u8);
+        for host in hosts.iter().take(count) {
+            let hb = host.as_bytes();
+            let hlen = hb.len().min(RESOLVE_MAX_HOSTNAME_LEN);
+            frame.push(hlen as u8);
+            frame.extend_from_slice(&hb[..hlen]);
+        }
+        let total_len = SESSION_ID_LEN + frame.len();
+
+        let Some(buf_idx) = self.outbound_pool.try_acquire() else {
+            return false;
+        };
+        unsafe {
+            let pkt = self.outbound_pool.buffer_mut(buf_idx);
+            if pkt.len() < total_len {
+                self.outbound_pool.release(buf_idx);
+                return false;
+            }
+            pkt[..SESSION_ID_LEN].copy_from_slice(&self.session_id);
+            pkt[SESSION_ID_LEN..total_len].copy_from_slice(&frame);
+        }
+        let job = OutboundJob {
+            addr: current_addr,
+            buf_idx,
+            len: total_len,
+            enqueued_at_ms: now_mono_ms(),
+            kind: OutboundJobKind::Control,
+        };
+        if self.outbound_tx.try_send(job).is_err() {
+            self.outbound_pool.release(buf_idx);
+            return false;
+        }
+        true
+    }
+
+    /// Resolve Roblox hostnames through the relay (censorship-resistant lookup
+    /// from outside the censor) when local DNS is blocked/poisoned. Sends in
+    /// batches and collects whatever resolves within `per_batch_timeout`.
+    /// Best-effort: an old relay that doesn't support the resolve frame simply
+    /// returns nothing, and the caller keeps its DoH pins.
+    pub async fn resolve_roblox_hosts(
+        &self,
+        hosts: &[&str],
+        per_batch_timeout: std::time::Duration,
+    ) -> std::collections::HashMap<String, Vec<std::net::Ipv4Addr>> {
+        let mut out: std::collections::HashMap<String, Vec<std::net::Ipv4Addr>> =
+            std::collections::HashMap::new();
+        let mut request_id: u16 = 1;
+        for chunk in hosts.chunks(RESOLVE_MAX_HOSTS_PER_REQUEST) {
+            *self.last_resolve_response.lock() = None;
+            if !self.send_resolve_request(request_id, chunk) {
+                request_id = request_id.wrapping_add(1);
+                continue;
+            }
+            let deadline = Instant::now() + per_batch_timeout;
+            loop {
+                let matched = {
+                    let guard = self.last_resolve_response.lock();
+                    match guard.as_ref() {
+                        Some((rid, answers)) if *rid == request_id => Some(answers.clone()),
+                        _ => None,
+                    }
+                };
+                if let Some(answers) = matched {
+                    for (host, ips) in answers {
+                        if !ips.is_empty() {
+                            out.entry(host).or_default().extend(ips);
+                        }
+                    }
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            request_id = request_id.wrapping_add(1);
+        }
+        out
+    }
+
+    /// Receive a packet from the relay (inbound: game server -> relay -> game client).
+    ///
+    /// Returns the payload with session ID stripped, or None if no packet available.
+    pub fn receive_inbound(&self, buffer: &mut [u8]) -> Result<Option<usize>> {
+        // Kept for existing callers/tests. The inbound injector uses
+        // `receive_inbound_payload` to avoid this copy.
+        let mut recv_buf = [0u8; 1600];
+        let Some(payload) = self.receive_inbound_payload(&mut recv_buf)? else {
+            return Ok(None);
+        };
+
+        if payload.len() > buffer.len() {
+            log::warn!("UDP Relay: Buffer too small for payload");
+            return Ok(None);
+        }
+
+        buffer[..payload.len()].copy_from_slice(payload);
+        Ok(Some(payload.len()))
+    }
+
+    /// Send an immediate keepalive PING to the current relay.
+    /// Used after auto-routing switch to establish session on the new relay ASAP.
+    pub fn send_keepalive_now(&self) -> Result<()> {
+        let current_addr = self.send_ping_to_current_relay("immediate keepalive")?;
+        self.record_outbound_activity();
+        log::info!(
+            "UDP Relay: Sent immediate keepalive to {} (session {:016x})",
+            current_addr,
+            self.session_id_u64()
+        );
+        Ok(())
+    }
+
+    /// Send a burst of keepalives to quickly establish NAT mapping and relay session.
+    /// Sends 3 keepalives at 0ms, 50ms, 100ms spacing to punch through NAT/firewalls
+    /// faster than a single packet. Used after auto-routing relay switch.
+    ///
+    /// SYNC version: blocks the calling thread for ~100ms. Only call this from
+    /// an `std::thread`-scope worker. Async callers must use
+    /// `send_keepalive_burst_async` instead — blocking the runtime through this
+    /// path froze every other Tokio task on the worker thread for 100ms.
+    pub fn send_keepalive_burst(&self) -> Result<()> {
+        let current_addr = **self.relay_addr.load();
+        // Count before sending so a fast PONG cannot be overwritten by a later increment.
+        self.unanswered_keepalives.fetch_add(1, Ordering::Relaxed);
+        for i in 0..3 {
+            if i > 0 {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let frame = self.build_ping_frame();
+            match self.socket.send_to(&frame, current_addr) {
+                Ok(_) => {}
+                Err(e) if i == 0 => {
+                    self.rollback_unanswered_keepalive();
+                    return Err(e.into());
+                }
+                Err(e) => {
+                    log::warn!("UDP Relay: Keepalive burst #{} failed: {}", i + 1, e);
+                }
+            }
+        }
+        self.record_outbound_activity();
+        log::debug!(
+            "UDP Relay: Sent keepalive burst (3 packets) to {} (session {:016x})",
+            current_addr,
+            self.session_id_u64()
+        );
+        Ok(())
+    }
+
+    /// Async variant of `send_keepalive_burst` that yields between packets via
+    /// `tokio::time::sleep` instead of `std::thread::sleep`. The sync version
+    /// was being called from inside `tokio::spawn` blocks, which froze every
+    /// other task on the runtime worker for the full 100ms.
+    pub async fn send_keepalive_burst_async(&self) -> Result<()> {
+        let current_addr = **self.relay_addr.load();
+        self.unanswered_keepalives.fetch_add(1, Ordering::Relaxed);
+        for i in 0..3 {
+            if i > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let frame = self.build_ping_frame();
+            match self.socket.send_to(&frame, current_addr) {
+                Ok(_) => {}
+                Err(e) if i == 0 => {
+                    self.rollback_unanswered_keepalive();
+                    return Err(e.into());
+                }
+                Err(e) => {
+                    log::warn!("UDP Relay: Keepalive burst #{} failed: {}", i + 1, e);
+                }
+            }
+        }
+        self.record_outbound_activity();
+        log::info!(
+            "UDP Relay: Sent async keepalive burst (3 packets) to {} (session {:016x})",
+            current_addr,
+            self.session_id_u64()
+        );
+        Ok(())
+    }
+
+    /// Send keepalive to maintain NAT binding.
+    ///
+    /// Also increments the unanswered keepalive counter. The counter is reset
+    /// to zero whenever the current relay provides liveness evidence.
+    pub fn send_keepalive(&self) -> Result<()> {
+        self.send_keepalive_at(now_mono_ms())
+    }
+
+    fn send_keepalive_at(&self, now_ms: u64) -> Result<()> {
+        let last_ms = self.last_activity_ms.load(Ordering::Relaxed);
+        let elapsed = Duration::from_millis(now_ms.saturating_sub(last_ms));
+        if elapsed >= KEEPALIVE_INTERVAL {
+            self.unanswered_keepalives.fetch_add(1, Ordering::Relaxed);
+            if let Err(e) = self.send_ping_to_current_relay("keepalive") {
+                self.rollback_unanswered_keepalive();
+                return Err(e);
+            }
+            self.record_outbound_activity();
+            log::trace!("UDP Relay: Sent keepalive");
+        }
+        Ok(())
+    }
+
+    /// Get the current relay health state.
+    pub fn relay_health(&self) -> RelayHealthState {
+        RelayHealthState::from_u8(self.relay_health.load(Ordering::Relaxed))
+    }
+
+    /// Get an Arc to the relay health atomic for sharing with the connection manager.
+    pub fn relay_health_arc(&self) -> Arc<AtomicU8> {
+        Arc::clone(&self.relay_health)
+    }
+
+    /// Evaluate relay health based on inbound traffic silence and unanswered keepalives.
+    ///
+    /// Called periodically from the inbound receiver health check loop.
+    /// Updates the health state to Stale or Dead when the relay stops responding.
+    pub fn check_health(&self) {
+        let has_ever_received = self.last_receive_time.lock().is_some();
+
+        if !has_ever_received {
+            let first_outbound = *self.first_outbound_time.lock();
+            let Some(first_outbound) = first_outbound else {
+                // Pure idle startup: no game packet or keepalive has tried to use the relay yet.
+                return;
+            };
+
+            let silence = first_outbound.elapsed();
+            let unanswered = self.unanswered_keepalives.load(Ordering::Relaxed);
+            let current = self.relay_health();
+
+            if unanswered >= RELAY_DEAD_KEEPALIVE_THRESHOLD {
+                if current != RelayHealthState::Dead {
+                    escalate_relay_health(&self.relay_health, RelayHealthState::Dead);
+                    log::error!(
+                        "UDP Relay: Health -> DEAD (no inbound ever, {} unanswered keepalives, {}s since first outbound, session {:016x})",
+                        unanswered,
+                        silence.as_secs(),
+                        self.session_id_u64()
+                    );
+                }
+            } else if silence >= RELAY_STALE_THRESHOLD && current == RelayHealthState::NoTrafficYet
+            {
+                escalate_relay_health(&self.relay_health, RelayHealthState::Stale);
+                log::warn!(
+                    "UDP Relay: Health -> STALE (no inbound ever, {}s since first outbound, {} unanswered keepalives, session {:016x})",
+                    silence.as_secs(),
+                    unanswered,
+                    self.session_id_u64()
+                );
+            }
+            return;
+        }
+
+        let silence = self
+            .last_receive_time
+            .lock()
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::ZERO);
+
+        let unanswered = self.unanswered_keepalives.load(Ordering::Relaxed);
+        let current = self.relay_health();
+
+        if unanswered >= RELAY_DEAD_KEEPALIVE_THRESHOLD {
+            if current != RelayHealthState::Dead {
+                escalate_relay_health(&self.relay_health, RelayHealthState::Dead);
+                log::error!(
+                    "UDP Relay: Health -> DEAD ({} unanswered keepalives, {}s silence, session {:016x})",
+                    unanswered,
+                    silence.as_secs(),
+                    self.session_id_u64()
+                );
+            }
+        } else if silence >= RELAY_STALE_THRESHOLD && current == RelayHealthState::Healthy {
+            escalate_relay_health(&self.relay_health, RelayHealthState::Stale);
+            log::warn!(
+                "UDP Relay: Health -> STALE ({}s since last inbound packet, {} unanswered keepalives, session {:016x})",
+                silence.as_secs(),
+                unanswered,
+                self.session_id_u64()
+            );
+        }
+
+        // Data-plane failure check: pongs may keep refreshing `last_receive_time`, so the
+        // checks above can stay Healthy even when every reconstructed data packet is being
+        // rejected by the local inject path. The streak is the only signal that catches this.
+        let streak = self.inject_error_streak.load(Ordering::Relaxed);
+        let current_after = self.relay_health();
+        if streak >= INJECT_DEAD_STREAK {
+            if current_after != RelayHealthState::Dead {
+                escalate_relay_health(&self.relay_health, RelayHealthState::Dead);
+                log::error!(
+                    "UDP Relay: Health -> DEAD (inject failure streak {} >= {}, session {:016x})",
+                    streak,
+                    INJECT_DEAD_STREAK,
+                    self.session_id_u64()
+                );
+            }
+        } else if streak >= INJECT_STALE_STREAK
+            && matches!(
+                current_after,
+                RelayHealthState::Healthy | RelayHealthState::NoTrafficYet
+            )
+        {
+            escalate_relay_health(&self.relay_health, RelayHealthState::Stale);
+            log::warn!(
+                "UDP Relay: Health -> STALE (inject failure streak {} >= {}, session {:016x})",
+                streak,
+                INJECT_STALE_STREAK,
+                self.session_id_u64()
+            );
+        }
+    }
+
+    /// Get statistics
+    pub fn stats(&self) -> (u64, u64) {
+        (
+            self.packets_sent.load(Ordering::Relaxed),
+            self.packets_received.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Low-frequency support summary. Control-probe replies do not prove that
+    /// Roblox data returns, and enqueued data does not prove remote delivery.
+    /// Reuse existing counters without adding work to each game packet.
+    pub(crate) fn log_support_snapshot(&self, reason: &str) {
+        // Serialize sampling, not the packet path. Counters are still approximate
+        // because packets and route switches can happen while they are read.
+        let mut previous = self.support_previous.lock();
+        let ping = self.ping.snapshot();
+        let last_reply_age_s = self.last_receive_time.lock().map(|t| t.elapsed().as_secs());
+        let route_epoch = **self.switch_time.load();
+        let current = SupportSample {
+            at: Instant::now(),
+            endpoint: self.relay_addr(),
+            route_epoch,
+            switch_grace: route_epoch.is_some_and(|at| at.elapsed() < RELAY_SWITCH_GRACE_PERIOD),
+            enqueued: self.packets_sent.load(Ordering::Relaxed),
+            received: self.packets_received.load(Ordering::Relaxed),
+            pongs: ping.received,
+            ping_enabled: ping.enabled,
+        };
+        let interval = current.since(*previous);
+        *previous = Some(current);
+        drop(previous);
+        log::info!(
+            "Relay support: diagnostic={:016x} reason={} endpoint={} health={} data_enqueued_total={} data_received_total={} control_probes_sent={} control_pongs_received={} control_rtt_ms={:?} last_current_relay_reply_age_s={:?} unanswered_keepalives={} send_queue_len={} outbound_backpressure_drops={} queue_expired_drops={} socket_send_errors={} oversize_drops={} fragmented_sends={} path_mtu={} mtu_fallback={} inject_error_streak={}",
+            self.support_id,
+            reason,
+            current.endpoint,
+            self.relay_health().as_str(),
+            current.enqueued,
+            current.received,
+            ping.sent,
+            ping.received,
+            ping.last_rtt_ms,
+            last_reply_age_s,
+            self.unanswered_keepalives.load(Ordering::Relaxed),
+            self.outbound_tx.len(),
+            self.outbound_drops.load(Ordering::Relaxed),
+            self.stale_queue_drops.load(Ordering::Relaxed),
+            self.send_errors.load(Ordering::Relaxed),
+            self.oversize_drops.load(Ordering::Relaxed),
+            self.fragmented_sends.load(Ordering::Relaxed),
+            self.relay_path_mtu.load(Ordering::Relaxed),
+            self.relay_path_mtu_is_fallback.load(Ordering::Relaxed),
+            self.inject_error_streak.load(Ordering::Relaxed),
+        );
+        if let Some(interval) = interval {
+            log::info!(
+                "Relay interval: diagnostic={:016x} elapsed_ms={} data_enqueued={} data_received={} control_pongs={} observation={} approximate=true",
+                self.support_id,
+                interval.elapsed_ms,
+                interval.enqueued,
+                interval.received,
+                interval.pongs,
+                interval.observation
+            );
+        } else {
+            log::info!(
+                "Relay interval: diagnostic={:016x} observation=new_baseline",
+                self.support_id
+            );
+        }
+        let receive = &self.receive_diagnostics;
+        log::info!(
+            "Relay receive totals: diagnostic={:016x} unexpected_source={} candidate_data={} short_frame={} session_mismatch={} malformed_control={} reauth_hints={} socket_errors={} ping_enabled={} rtt_samples={} rtt_p50_ms={:?} rtt_p99_ms={:?} send_failure_streak={} sender_panicked={}",
+            self.support_id,
+            receive.unexpected_source.load(Ordering::Relaxed),
+            receive.pending_candidate_data.load(Ordering::Relaxed),
+            receive.short_frame.load(Ordering::Relaxed),
+            receive.session_mismatch.load(Ordering::Relaxed),
+            receive.malformed_control.load(Ordering::Relaxed),
+            receive.reauth_hints.load(Ordering::Relaxed),
+            receive.socket_errors.load(Ordering::Relaxed),
+            ping.enabled,
+            ping.sample_count,
+            ping.p50_rtt_ms,
+            ping.p99_rtt_ms,
+            self.send_failure_streak.load(Ordering::Relaxed),
+            self.sender_panicked()
+        );
+    }
+
+    /// Stop the relay
+    pub fn stop(&self) {
+        self.stop_flag.store(true, Ordering::Release);
+        let ping = self.ping.snapshot();
+        log::info!(
+            "UDP Relay: Stopped session {:016x} (sent: {}, recv: {}, oversize_drops: {}, fragmented_sends: {}, outbound_drops: {}, stale_queue_drops: {}, send_errors: {}, send_unreachable_streak: {}, send_failure_streak: {}, pppoe_clamp_active: {}, pppoe_clamp_events: {}, health: {}, ping: {}/{} {:.1}% loss)",
+            self.session_id_u64(),
+            self.packets_sent.load(Ordering::Relaxed),
+            self.packets_received.load(Ordering::Relaxed),
+            self.oversize_drops.load(Ordering::Relaxed),
+            self.fragmented_sends.load(Ordering::Relaxed),
+            self.outbound_drops.load(Ordering::Relaxed),
+            self.stale_queue_drops.load(Ordering::Relaxed),
+            self.send_errors.load(Ordering::Relaxed),
+            self.send_unreachable_streak.load(Ordering::Relaxed),
+            self.send_failure_streak.load(Ordering::Relaxed),
+            self.point_to_point_mtu_clamp_active.load(Ordering::Acquire),
+            self.point_to_point_mtu_clamp_events.load(Ordering::Relaxed),
+            self.relay_health().as_str(),
+            ping.sent,
+            ping.received,
+            ping.loss_pct,
+        );
+    }
+
+    /// Clone the socket for use in inbound receiver thread
+    pub fn try_clone_socket(&self) -> Result<UdpSocket> {
+        self.socket
+            .try_clone()
+            .context("Failed to clone relay socket")
+    }
+
+    /// Get the relay server address
+    pub fn relay_addr(&self) -> SocketAddr {
+        **self.relay_addr.load()
+    }
+
+    /// Atomically switch to a new relay server address.
+    /// The next outbound packet will go to the new address.
+    /// Stores the old address so receive_inbound() can accept packets from both
+    /// relays during a grace period, eliminating the inbound blackout.
+    pub fn switch_relay(&self, new_addr: SocketAddr) {
+        self.log_support_snapshot("before_relay_switch");
+        let old_addr = **self.relay_addr.load();
+        self.previous_relay_addr.store(Arc::new(Some(old_addr)));
+        self.switch_time.store(Arc::new(Some(Instant::now())));
+        self.relay_addr.store(Arc::new(new_addr));
+        self.last_mtu_refresh_ms.store(0, Ordering::Relaxed);
+        self.maybe_refresh_relay_path_mtu(new_addr);
+        // Reset health state for the new relay - give it a clean slate
+        self.relay_health
+            .store(RelayHealthState::NoTrafficYet as u8, Ordering::Relaxed);
+        self.unanswered_keepalives.store(0, Ordering::Relaxed);
+        self.inject_error_streak.store(0, Ordering::Relaxed);
+        *self.last_receive_time.lock() = None;
+        *self.first_outbound_time.lock() = None;
+        // Reset RTT telemetry: the old relay's readings must never be shown
+        // as the new relay's ping. The UI reports "no data" until the first
+        // pong from the new relay arrives.
+        self.ping.reset(new_addr);
+        *self.support_previous.lock() = None;
+        self.log_support_snapshot("after_relay_switch");
+        log::info!(
+            "UDP Relay: Switched relay {} -> {} (session {:016x}, grace period {}s)",
+            old_addr,
+            new_addr,
+            self.session_id_u64(),
+            RELAY_SWITCH_GRACE_PERIOD.as_secs()
+        );
+    }
+
+    /// Get session ID bytes
+    pub fn session_id_bytes(&self) -> &[u8; SESSION_ID_LEN] {
+        &self.session_id
+    }
+}
+
+impl Drop for UdpRelay {
+    fn drop(&mut self) {
+        self.stop();
+
+        let handle = self.sender_handle.lock().take();
+        if let Some(handle) = handle
+            && let Err(panic) = handle.join()
+        {
+            log::error!("UDP Relay: sender thread panicked: {:?}", panic);
+        }
+    }
+}
+
+/// Generate random bytes using the rand crate
+fn getrandom(buf: &mut [u8]) {
+    use rand::RngCore;
+    rand::thread_rng().fill_bytes(buf);
+}
+
+fn now_mono_ms() -> u64 {
+    #[cfg(windows)]
+    unsafe {
+        windows::Win32::System::SystemInformation::GetTickCount64()
+    }
+
+    #[cfg(not(windows))]
+    {
+        use std::sync::OnceLock;
+        static START: OnceLock<Instant> = OnceLock::new();
+        let start = START.get_or_init(Instant::now);
+        start.elapsed().as_millis() as u64
+    }
+}
+
+#[inline]
+fn should_drop_stale_outbound_job(kind: OutboundJobKind, enqueued_at_ms: u64, now_ms: u64) -> bool {
+    kind == OutboundJobKind::Data
+        && now_ms.saturating_sub(enqueued_at_ms) > OUTBOUND_DATA_MAX_QUEUE_AGE_MS
+}
+
+#[inline]
+fn clamp_relay_path_mtu(mtu: usize) -> usize {
+    mtu.clamp(RELAY_PATH_MTU_MINIMUM, RELAY_PATH_MTU_UPPER_BOUND)
+}
+
+#[inline]
+fn apply_point_to_point_relay_mtu_ceiling(
+    mtu: usize,
+    path_context: RelayPathContext,
+) -> (usize, bool) {
+    if path_context.point_to_point_default_route && mtu > RELAY_PATH_MTU_POINT_TO_POINT_CEILING {
+        (RELAY_PATH_MTU_POINT_TO_POINT_CEILING, true)
+    } else {
+        (mtu, false)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InitialRelayPathMtu {
+    mtu: usize,
+    is_fallback: bool,
+    point_to_point_clamped: bool,
+}
+
+#[inline]
+fn select_initial_relay_path_mtu_for_context(
+    detected_mtu: Option<usize>,
+    path_context: RelayPathContext,
+) -> InitialRelayPathMtu {
+    match detected_mtu {
+        Some(mtu) => {
+            let mtu = clamp_relay_path_mtu(mtu);
+            let (mtu, point_to_point_clamped) =
+                apply_point_to_point_relay_mtu_ceiling(mtu, path_context);
+            InitialRelayPathMtu {
+                mtu,
+                is_fallback: false,
+                point_to_point_clamped,
+            }
+        }
+        None => {
+            let fallback_mtu = clamp_relay_path_mtu(RELAY_PATH_MTU_FALLBACK);
+            let (mtu, point_to_point_clamped) =
+                apply_point_to_point_relay_mtu_ceiling(fallback_mtu, path_context);
+            InitialRelayPathMtu {
+                mtu,
+                is_fallback: true,
+                point_to_point_clamped,
+            }
+        }
+    }
+}
+
+#[inline]
+#[allow(dead_code)]
+fn select_initial_relay_path_mtu(detected_mtu: Option<usize>) -> (usize, bool) {
+    let selection =
+        select_initial_relay_path_mtu_for_context(detected_mtu, RelayPathContext::default());
+    (selection.mtu, selection.is_fallback)
+}
+
+#[inline]
+fn select_detected_relay_path_mtu(
+    link_mtu: usize,
+    ip_layer_mtu: Option<usize>,
+    is_ppp: bool,
+) -> usize {
+    let mtu = ip_layer_mtu.unwrap_or(link_mtu);
+    if is_ppp {
+        mtu.min(RELAY_PATH_MTU_POINT_TO_POINT_CEILING)
+    } else {
+        mtu
+    }
+}
+
+fn detect_relay_path_mtu(relay_addr: SocketAddr) -> Option<usize> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::NetworkManagement::IpHelper::{
+            GetBestInterfaceEx, GetIfEntry2, GetIpInterfaceEntry, IF_TYPE_PPP, MIB_IF_ROW2,
+            MIB_IPINTERFACE_ROW,
+        };
+        use windows::Win32::Networking::WinSock::{
+            AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, SOCKADDR, SOCKADDR_IN,
+            SOCKADDR_IN6, SOCKADDR_IN6_0,
+        };
+
+        let mut if_index: u32 = 0;
+
+        let rc = match relay_addr {
+            SocketAddr::V4(addr) => {
+                let ip_octets = addr.ip().octets();
+                let sockaddr_in = SOCKADDR_IN {
+                    sin_family: AF_INET,
+                    sin_port: 0,
+                    sin_addr: IN_ADDR {
+                        S_un: IN_ADDR_0 {
+                            S_addr: u32::from_ne_bytes(ip_octets),
+                        },
+                    },
+                    sin_zero: [0; 8],
+                };
+                unsafe {
+                    GetBestInterfaceEx(
+                        &sockaddr_in as *const SOCKADDR_IN as *const SOCKADDR,
+                        &mut if_index,
+                    )
+                }
+            }
+            SocketAddr::V6(addr) => {
+                let ip_octets = addr.ip().octets();
+                let sockaddr_in6 = SOCKADDR_IN6 {
+                    sin6_family: AF_INET6,
+                    sin6_port: 0,
+                    sin6_flowinfo: 0,
+                    sin6_addr: IN6_ADDR {
+                        u: IN6_ADDR_0 { Byte: ip_octets },
+                    },
+                    Anonymous: SOCKADDR_IN6_0 {
+                        sin6_scope_id: addr.scope_id(),
+                    },
+                };
+                unsafe {
+                    GetBestInterfaceEx(
+                        &sockaddr_in6 as *const SOCKADDR_IN6 as *const SOCKADDR,
+                        &mut if_index,
+                    )
+                }
+            }
+        };
+
+        if rc != 0 {
+            return None;
+        }
+
+        let mut row = MIB_IF_ROW2 {
+            InterfaceIndex: if_index,
+            ..Default::default()
+        };
+        let rc = unsafe { GetIfEntry2(&mut row) };
+        if rc.0 != 0 {
+            return None;
+        }
+
+        let family = match relay_addr {
+            SocketAddr::V4(_) => AF_INET,
+            SocketAddr::V6(_) => AF_INET6,
+        };
+        let mut ip_row = MIB_IPINTERFACE_ROW {
+            InterfaceIndex: if_index,
+            Family: family,
+            ..Default::default()
+        };
+        let ip_layer_mtu = if unsafe { GetIpInterfaceEntry(&mut ip_row) }.0 == 0 && ip_row.NlMtu > 0
+        {
+            Some(ip_row.NlMtu as usize)
+        } else {
+            None
+        };
+
+        let detected_mtu =
+            select_detected_relay_path_mtu(row.Mtu as usize, ip_layer_mtu, row.Type == IF_TYPE_PPP);
+        Some(detected_mtu)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = relay_addr;
+        None
+    }
+}
+
+/// Context for relay mode in ParallelInterceptor
+pub struct RelayContext {
+    pub relay: Arc<UdpRelay>,
+    pub session_id: [u8; SESSION_ID_LEN],
+}
+
+impl RelayContext {
+    pub fn new(relay: Arc<UdpRelay>) -> Self {
+        let session_id = *relay.session_id_bytes();
+        Self { relay, session_id }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn repeated_send_failures_log_health_transitions_only_once() {
+        struct Capture;
+        thread_local! { static HEALTH_LOGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+        impl log::Log for Capture {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                if record.args().to_string().contains("Health ->") {
+                    HEALTH_LOGS.with(|count| count.set(count.get() + 1));
+                }
+            }
+            fn flush(&self) {}
+        }
+        static LOGGER: Capture = Capture;
+        log::set_logger(&LOGGER).expect("test logger should be unclaimed");
+        log::set_max_level(log::LevelFilter::Warn);
+        let health = AtomicU8::new(RelayHealthState::Healthy as u8);
+        let errors = AtomicU64::new(0);
+        let unreachable = AtomicU32::new(0);
+        let failures = AtomicU32::new(0);
+        let error = std::io::Error::from_raw_os_error(10055);
+        for _ in 0..10_000 {
+            record_relay_send_error(
+                &errors,
+                &health,
+                &unreachable,
+                &failures,
+                &error,
+                "127.0.0.1:51821".parse().unwrap(),
+                "test",
+            );
+        }
+        assert_eq!(errors.load(Ordering::Relaxed), 10_000);
+        assert_eq!(health.load(Ordering::Relaxed), RelayHealthState::Dead as u8);
+        HEALTH_LOGS.with(|count| assert_eq!(count.get(), 2));
+        assert!(!escalate_relay_health(&health, RelayHealthState::Stale));
+        assert_eq!(health.load(Ordering::Relaxed), RelayHealthState::Dead as u8);
+    }
+
+    use super::*;
+
+    #[test]
+    fn pending_ping_is_not_packet_loss() {
+        let addr = "127.0.0.1:10001".parse().unwrap();
+        let metrics = PingMetrics::new(addr);
+        metrics.begin_probe(addr, 1, 100);
+        assert_eq!(metrics.snapshot_at(101).loss_pct, 0.0);
+    }
+
+    #[test]
+    fn probe_loss_counts_only_expired_probes_and_matches_replies_once() {
+        let addr = "127.0.0.1:10001".parse().unwrap();
+        let metrics = PingMetrics::new(addr);
+        metrics.begin_probe(addr, 1, 100);
+        metrics.begin_probe(addr, 2, 100);
+        assert_eq!(metrics.record_pong(addr, 1, 100, 100), Some(0));
+        assert_eq!(metrics.record_pong(addr, 1, 100, 101), None);
+        assert_eq!(metrics.record_pong(addr, 2, 101, 102), None);
+        assert_eq!(metrics.record_pong(addr, 2, 100, 99), None);
+        let pending = metrics.snapshot_at(101);
+        assert_eq!(
+            (pending.sent, pending.received, pending.sample_count),
+            (2, 1, 1)
+        );
+        assert_eq!(pending.last_rtt_ms, Some(0));
+        assert_eq!(pending.loss_pct, 0.0);
+        let deadline = 100 + PING_RESPONSE_TIMEOUT_MS;
+        assert_eq!(metrics.snapshot_at(deadline - 1).loss_pct, 0.0);
+        assert_eq!(metrics.snapshot_at(deadline).loss_pct, 50.0);
+        assert_eq!(metrics.record_pong(addr, 2, 100, deadline + 1), None);
+        let stale = metrics.snapshot_at(deadline + 1);
+        assert_eq!(stale.sample_count, 1);
+        assert_eq!(stale.last_rtt_ms, None);
+        assert_eq!(stale.p50_rtt_ms, None);
+        assert_eq!(stale.p99_rtt_ms, None);
+    }
+
+    #[test]
+    fn local_probe_send_failure_is_not_relay_loss_and_pending_memory_is_bounded() {
+        let addr = "127.0.0.1:10001".parse().unwrap();
+        let metrics = PingMetrics::new(addr);
+        metrics.begin_probe(addr, 1, 100);
+        metrics.cancel_probe(addr, 1, 100);
+        let snap = metrics.snapshot_at(100 + PING_RESPONSE_TIMEOUT_MS);
+        assert_eq!((snap.sent, snap.received, snap.loss_pct), (0, 0, 0.0));
+        for seq in 0..MAX_PENDING_PINGS as u32 + 10 {
+            metrics.begin_probe(addr, seq, 10_000);
+        }
+        assert_eq!(metrics.state.lock().pending.len(), MAX_PENDING_PINGS);
+        assert_eq!(metrics.snapshot_at(10_000).sent, MAX_PENDING_PINGS as u64);
+        assert_eq!(metrics.snapshot_at(15_000).loss_pct, 100.0);
+        assert!(metrics.state.lock().pending.is_empty());
+    }
+
+    #[test]
+    fn switching_relay_rejects_old_probe_registration_and_old_replies() {
+        let old_addr = "127.0.0.1:10001".parse().unwrap();
+        let new_addr = "127.0.0.1:10002".parse().unwrap();
+        let metrics = PingMetrics::new(old_addr);
+        let old_seq = metrics.next_sequence();
+        metrics.begin_probe(old_addr, old_seq, 100);
+        metrics.reset(new_addr);
+        metrics.begin_probe(old_addr, old_seq, 100);
+        assert_eq!(metrics.record_pong(old_addr, old_seq, 100, 120), None);
+        assert_eq!(metrics.record_pong(new_addr, old_seq, 100, 120), None);
+        assert_eq!(metrics.snapshot_at(120).sent, 0);
+        let new_seq = metrics.next_sequence();
+        assert_ne!(old_seq, new_seq);
+        metrics.begin_probe(new_addr, new_seq, 120);
+        assert_eq!(metrics.record_pong(new_addr, new_seq, 120, 130), Some(10));
+        assert_eq!(metrics.snapshot_at(130).received, 1);
+    }
+
+    #[test]
+    fn unsolicited_pong_does_not_count_as_a_probe_response() {
+        let relay = UdpRelay::new("127.0.0.1:51821".parse().unwrap()).unwrap();
+        relay.set_ping_enabled(true);
+        let server = bind_fake_relay(&relay);
+        let frame = make_pong_frame(&relay);
+        server.send_to(&frame, relay_loopback_addr(&relay)).unwrap();
+        let mut buffer = [0u8; 1600];
+        relay.receive_inbound(&mut buffer).unwrap();
+        assert_eq!(relay.ping_snapshot().received, 0);
+
+        let sent_at = u64::from_be_bytes(
+            frame[SESSION_ID_LEN + 5..SESSION_ID_LEN + 13]
+                .try_into()
+                .unwrap(),
+        );
+        relay
+            .ping
+            .begin_probe(server.local_addr().unwrap(), 1, sent_at);
+        for _ in 0..2 {
+            server.send_to(&frame, relay_loopback_addr(&relay)).unwrap();
+            relay.receive_inbound(&mut buffer).unwrap();
+        }
+        let snapshot = relay.ping_snapshot();
+        assert_eq!(
+            (snapshot.sent, snapshot.received, snapshot.sample_count),
+            (1, 1, 1)
+        );
+        assert_eq!(snapshot.loss_pct, 0.0);
+    }
+
+    #[test]
+    fn inactive_ping_timer_does_not_spin_the_sender() {
+        let now = Instant::now();
+        let expired = now - Duration::from_secs(1);
+        for (enabled, last_data) in [
+            (false, Some(now)),
+            (true, None),
+            (true, Some(now - PING_IDLE_THRESHOLD)),
+        ] {
+            assert_eq!(
+                sender_wait_timeout(enabled, last_data, expired, now),
+                Duration::from_millis(50),
+                "inactive telemetry must wait for data or the stop check"
+            );
+        }
+        assert_eq!(
+            sender_wait_timeout(true, Some(now), expired, now),
+            Duration::ZERO
+        );
+        assert_eq!(
+            sender_wait_timeout(true, Some(now), now + Duration::from_millis(12), now),
+            Duration::from_millis(12)
+        );
+    }
+
+    #[test]
+    fn control_traffic_cannot_keep_game_ping_telemetry_active() {
+        let now = Instant::now();
+        let game_relay = "127.0.0.1:10001".parse().unwrap();
+        let control_relay = "127.0.0.1:10002".parse().unwrap();
+        let mut last_relay = None;
+        let mut last_data = None;
+        note_sender_activity(
+            OutboundJobKind::Data,
+            game_relay,
+            now,
+            &mut last_relay,
+            &mut last_data,
+        );
+        let later = now + PING_IDLE_THRESHOLD + Duration::from_millis(1);
+        note_sender_activity(
+            OutboundJobKind::Control,
+            control_relay,
+            later,
+            &mut last_relay,
+            &mut last_data,
+        );
+        assert_eq!(last_relay, Some(game_relay));
+        assert_eq!(last_data, Some(now));
+        assert_eq!(
+            sender_wait_timeout(true, last_data, now, later),
+            Duration::from_millis(50)
+        );
+        note_sender_activity(
+            OutboundJobKind::Data,
+            control_relay,
+            later,
+            &mut last_relay,
+            &mut last_data,
+        );
+        assert_eq!(last_relay, Some(control_relay));
+        assert_eq!(last_data, Some(later));
+    }
+
+    #[test]
+    fn auth_ack_status_round_trips_including_rebinding() {
+        // Every assigned status has a distinct decoding, including reauthentication.
+        for (byte, expected) in [
+            (0u8, RelayAuthAckStatus::Ok),
+            (1, RelayAuthAckStatus::BadFormat),
+            (2, RelayAuthAckStatus::BadSignature),
+            (3, RelayAuthAckStatus::Expired),
+            (4, RelayAuthAckStatus::SidMismatch),
+            (5, RelayAuthAckStatus::ServerMismatch),
+            (6, RelayAuthAckStatus::AuthDisabled),
+            (7, RelayAuthAckStatus::Replay),
+            (8, RelayAuthAckStatus::OwnerMismatch),
+            (9, RelayAuthAckStatus::ReauthRequired),
+        ] {
+            assert_eq!(RelayAuthAckStatus::from_u8(byte), Some(expected));
+        }
+        // Unknown statuses are still unmapped (caller coerces to BadFormat).
+        assert_eq!(RelayAuthAckStatus::from_u8(10), None);
+        assert_eq!(RelayAuthAckStatus::from_u8(255), None);
+    }
+
+    #[test]
+    fn only_ok_ack_authenticates() {
+        // Positive: Ok is the one and only status that authenticates a session.
+        assert!(RelayAuthAckStatus::Ok.is_authenticated());
+    }
+
+    #[test]
+    fn replay_ack_is_never_treated_as_authenticated() {
+        // Mandatory negative (regression guard for the P1): a `Replay` ack must
+        // never count as auth success. The client cannot tell a stale/reused
+        // ticket rejection from its own lost-OK-ack retransmit — on a high-RTT
+        // link a genuine first-hello replay rejection can arrive after we have
+        // already retransmitted — so it MUST fail closed. Coercing it to Ok
+        // would leave a spent-ticket session silently unauthenticated with no
+        // rollback/failover.
+        assert!(!RelayAuthAckStatus::Replay.is_authenticated());
+    }
+
+    #[test]
+    fn every_non_ok_ack_is_a_rejection() {
+        // No status other than Ok may authenticate, regardless of retransmits.
+        for status in [
+            RelayAuthAckStatus::BadFormat,
+            RelayAuthAckStatus::BadSignature,
+            RelayAuthAckStatus::Expired,
+            RelayAuthAckStatus::SidMismatch,
+            RelayAuthAckStatus::ServerMismatch,
+            RelayAuthAckStatus::AuthDisabled,
+            RelayAuthAckStatus::Replay,
+            RelayAuthAckStatus::OwnerMismatch,
+            RelayAuthAckStatus::ReauthRequired,
+        ] {
+            assert!(
+                !status.is_authenticated(),
+                "{} must be a rejection",
+                status.as_str()
+            );
+        }
+    }
+
+    /// Build a 0xA7 response body the way the relay does, for parse round-trips.
+    fn build_resolve_response_frame(
+        session_id: &[u8; SESSION_ID_LEN],
+        request_id: u16,
+        answers: &[(&str, &[std::net::Ipv4Addr])],
+    ) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(session_id);
+        f.push(RESOLVE_RESPONSE_FRAME_TYPE);
+        f.extend_from_slice(&request_id.to_be_bytes());
+        f.push(answers.len() as u8);
+        for (host, ips) in answers {
+            f.push(host.len() as u8);
+            f.extend_from_slice(host.as_bytes());
+            f.push(ips.len() as u8);
+            for ip in *ips {
+                f.extend_from_slice(&ip.octets());
+            }
+        }
+        f
+    }
+
+    #[test]
+    fn parse_resolve_response_round_trips_relay_format() {
+        let sid = [7u8; SESSION_ID_LEN];
+        let a_ips = [
+            std::net::Ipv4Addr::new(128, 116, 50, 1),
+            std::net::Ipv4Addr::new(128, 116, 50, 2),
+        ];
+        let b_ips = [std::net::Ipv4Addr::new(203, 0, 113, 9)];
+        let frame = build_resolve_response_frame(
+            &sid,
+            0x2024,
+            &[
+                ("clientsettings.roblox.com", &a_ips),
+                ("c0.rbxcdn.com", &b_ips),
+            ],
+        );
+        let (rid, answers) = parse_resolve_response(&frame, frame.len()).expect("valid");
+        assert_eq!(rid, 0x2024);
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0].0, "clientsettings.roblox.com");
+        assert_eq!(answers[0].1, a_ips.to_vec());
+        assert_eq!(answers[1].0, "c0.rbxcdn.com");
+        assert_eq!(answers[1].1, b_ips.to_vec());
+    }
+
+    #[test]
+    fn parse_resolve_response_rejects_truncated() {
+        let sid = [0u8; SESSION_ID_LEN];
+        let ips = [std::net::Ipv4Addr::new(1, 2, 3, 4)];
+        let frame = build_resolve_response_frame(&sid, 1, &[("clientsettings.roblox.com", &ips)]);
+        let truncated = &frame[..frame.len() - 2];
+        assert!(parse_resolve_response(truncated, truncated.len()).is_none());
+    }
+
+    #[test]
+    fn dns_response_parser_handles_seeded_counts_lengths_and_truncations() {
+        use rand::{Rng, RngCore, SeedableRng};
+        let mut random = rand::rngs::StdRng::seed_from_u64(0x5357494654444e53);
+        let ips = [std::net::Ipv4Addr::new(128, 116, 47, 3)];
+        let seed = build_resolve_response_frame(
+            &[7; SESSION_ID_LEN],
+            12,
+            &[("clientsettings.roblox.com", &ips)],
+        );
+        for case in 0..8192 {
+            let mut frame = if case % 2 == 0 {
+                seed.clone()
+            } else {
+                let mut bytes = vec![0; random.gen_range(0..=2048)];
+                random.fill_bytes(&mut bytes);
+                bytes
+            };
+            for _ in 0..4 {
+                if !frame.is_empty() {
+                    let index = random.gen_range(0..frame.len());
+                    frame[index] = random.r#gen();
+                }
+            }
+            let length = random.gen_range(0..=frame.len());
+            if let Some((request, answers)) = parse_resolve_response(&frame, length) {
+                let borrowed = answers
+                    .iter()
+                    .map(|(host, ips)| (host.as_str(), ips.as_slice()))
+                    .collect::<Vec<_>>();
+                let rebuilt = build_resolve_response_frame(
+                    &frame[..SESSION_ID_LEN].try_into().unwrap(),
+                    request,
+                    &borrowed,
+                );
+                assert!(
+                    rebuilt.len() <= length,
+                    "case {case} read beyond the received bytes"
+                );
+                assert_eq!(
+                    &rebuilt[SESSION_ID_LEN + 1..],
+                    &frame[SESSION_ID_LEN + 1..rebuilt.len()],
+                    "case {case} did not preserve the parsed wire fields"
+                );
+            }
+        }
+    }
+
+    fn relay_loopback_addr(relay: &UdpRelay) -> SocketAddr {
+        let local_port = relay
+            .try_clone_socket()
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        SocketAddr::from(([127, 0, 0, 1], local_port))
+    }
+
+    fn make_pong_frame(relay: &UdpRelay) -> [u8; PONG_FRAME_LEN] {
+        let seq: u32 = 1;
+        let client_ts_mono_ms = now_mono_ms();
+        let mut frame = [0u8; PONG_FRAME_LEN];
+        frame[..SESSION_ID_LEN].copy_from_slice(relay.session_id_bytes());
+        frame[SESSION_ID_LEN] = PONG_FRAME_TYPE;
+        frame[SESSION_ID_LEN + 1..SESSION_ID_LEN + 5].copy_from_slice(&seq.to_be_bytes());
+        frame[SESSION_ID_LEN + 5..SESSION_ID_LEN + 13]
+            .copy_from_slice(&client_ts_mono_ms.to_be_bytes());
+        frame[SESSION_ID_LEN + 13..SESSION_ID_LEN + 21].copy_from_slice(&0u64.to_be_bytes());
+        frame
+    }
+
+    fn bind_fake_relay(relay: &UdpRelay) -> UdpSocket {
+        let fake_relay = UdpSocket::bind("127.0.0.1:0").unwrap();
+        relay.switch_relay(fake_relay.local_addr().unwrap());
+        fake_relay
+    }
+
+    #[test]
+    fn test_session_id_generation() {
+        let mut id1 = [0u8; 8];
+        let mut id2 = [0u8; 8];
+        getrandom(&mut id1);
+        getrandom(&mut id2);
+        // Should be different (with extremely high probability)
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_packet_format() {
+        // Session ID is 8 bytes, so a 100-byte payload becomes 108 bytes
+        let session_id = [1, 2, 3, 4, 5, 6, 7, 8];
+        let payload = [0u8; 100];
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&session_id);
+        packet.extend_from_slice(&payload);
+
+        assert_eq!(packet.len(), 108);
+        assert_eq!(&packet[..8], &session_id);
+    }
+
+    #[test]
+    fn test_select_initial_relay_path_mtu_prefers_detected_value() {
+        let (mtu, fallback) = select_initial_relay_path_mtu(Some(1492));
+        assert_eq!(mtu, 1492);
+        assert!(!fallback);
+    }
+
+    #[test]
+    fn test_select_initial_relay_path_mtu_clamps_detected_value() {
+        let (mtu_low, fallback_low) = select_initial_relay_path_mtu(Some(400));
+        assert_eq!(mtu_low, RELAY_PATH_MTU_MINIMUM);
+        assert!(!fallback_low);
+
+        let (mtu_high, fallback_high) = select_initial_relay_path_mtu(Some(9000));
+        assert_eq!(mtu_high, RELAY_PATH_MTU_UPPER_BOUND);
+        assert!(!fallback_high);
+    }
+
+    #[test]
+    fn test_select_initial_relay_path_mtu_uses_conservative_fallback_on_failure() {
+        let (mtu, fallback) = select_initial_relay_path_mtu(None);
+        assert_eq!(mtu, RELAY_PATH_MTU_FALLBACK);
+        assert!(fallback);
+    }
+
+    #[test]
+    fn test_select_initial_relay_path_mtu_pppoe_path_caps_detected_1500() {
+        let selected = select_initial_relay_path_mtu_for_context(
+            Some(1500),
+            RelayPathContext {
+                point_to_point_default_route: true,
+            },
+        );
+        assert_eq!(selected.mtu, RELAY_PATH_MTU_POINT_TO_POINT_CEILING);
+        assert!(!selected.is_fallback);
+        assert!(selected.point_to_point_clamped);
+    }
+
+    #[test]
+    fn test_select_initial_relay_path_mtu_non_pppoe_path_keeps_detected_value() {
+        let selected = select_initial_relay_path_mtu_for_context(
+            Some(1500),
+            RelayPathContext {
+                point_to_point_default_route: false,
+            },
+        );
+        assert_eq!(selected.mtu, 1500);
+        assert!(!selected.is_fallback);
+        assert!(!selected.point_to_point_clamped);
+    }
+
+    #[test]
+    fn test_select_detected_relay_path_mtu_prefers_ip_layer_mtu() {
+        assert_eq!(
+            select_detected_relay_path_mtu(1500, Some(1460), false),
+            1460
+        );
+    }
+
+    #[test]
+    fn test_select_detected_relay_path_mtu_falls_back_to_link_mtu() {
+        assert_eq!(select_detected_relay_path_mtu(1492, None, false), 1492);
+    }
+
+    #[test]
+    fn test_select_detected_relay_path_mtu_clamps_ppp_to_1492() {
+        assert_eq!(
+            select_detected_relay_path_mtu(1500, Some(1500), true),
+            RELAY_PATH_MTU_POINT_TO_POINT_CEILING
+        );
+        assert_eq!(select_detected_relay_path_mtu(1492, Some(1460), true), 1460);
+    }
+
+    #[test]
+    fn test_network_unreachable_send_errors_exhaust_retry_budget() {
+        let send_errors = AtomicU64::new(0);
+        let relay_health = AtomicU8::new(RelayHealthState::Healthy as u8);
+        let unreachable = AtomicU32::new(0);
+        let failure = AtomicU32::new(0);
+        let relay_addr: SocketAddr = "127.0.0.1:51821".parse().unwrap();
+        let err = std::io::Error::from_raw_os_error(10051);
+
+        assert_eq!(
+            record_relay_send_error(
+                &send_errors,
+                &relay_health,
+                &unreachable,
+                &failure,
+                &err,
+                relay_addr,
+                "data"
+            ),
+            RelaySendFailureAction::RetryBudgetRemaining(1)
+        );
+        assert_eq!(
+            RelayHealthState::from_u8(relay_health.load(Ordering::Relaxed)),
+            RelayHealthState::Stale
+        );
+
+        assert_eq!(
+            record_relay_send_error(
+                &send_errors,
+                &relay_health,
+                &unreachable,
+                &failure,
+                &err,
+                relay_addr,
+                "data"
+            ),
+            RelaySendFailureAction::RetryBudgetRemaining(2)
+        );
+        assert_eq!(
+            record_relay_send_error(
+                &send_errors,
+                &relay_health,
+                &unreachable,
+                &failure,
+                &err,
+                relay_addr,
+                "data"
+            ),
+            RelaySendFailureAction::RetryBudgetExhausted(3)
+        );
+        assert_eq!(
+            RelayHealthState::from_u8(relay_health.load(Ordering::Relaxed)),
+            RelayHealthState::Dead
+        );
+    }
+
+    #[test]
+    fn test_non_repairable_send_error_does_not_trigger_unreachable_recovery() {
+        let send_errors = AtomicU64::new(0);
+        let relay_health = AtomicU8::new(RelayHealthState::Healthy as u8);
+        let unreachable = AtomicU32::new(2);
+        let failure = AtomicU32::new(0);
+        let relay_addr: SocketAddr = "127.0.0.1:51821".parse().unwrap();
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "blocked");
+
+        assert_eq!(
+            record_relay_send_error(
+                &send_errors,
+                &relay_health,
+                &unreachable,
+                &failure,
+                &err,
+                relay_addr,
+                "data"
+            ),
+            RelaySendFailureAction::NonRepairable
+        );
+        // Unreachable streak resets so it can't masquerade as fast-budget exhaustion.
+        assert_eq!(unreachable.load(Ordering::Relaxed), 0);
+        // A single non-repairable failure must not yet escalate health.
+        assert_eq!(
+            RelayHealthState::from_u8(relay_health.load(Ordering::Relaxed)),
+            RelayHealthState::Healthy
+        );
+    }
+
+    #[test]
+    fn test_persistent_non_repairable_send_errors_escalate_to_dead() {
+        let send_errors = AtomicU64::new(0);
+        let relay_health = AtomicU8::new(RelayHealthState::Healthy as u8);
+        let unreachable = AtomicU32::new(0);
+        let failure = AtomicU32::new(0);
+        let relay_addr: SocketAddr = "127.0.0.1:51821".parse().unwrap();
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "blocked");
+
+        for _ in 0..(RELAY_SEND_FAILURE_STALE_THRESHOLD - 1) {
+            record_relay_send_error(
+                &send_errors,
+                &relay_health,
+                &unreachable,
+                &failure,
+                &err,
+                relay_addr,
+                "data",
+            );
+        }
+        // Still below the slow threshold — stay Healthy.
+        assert_eq!(
+            RelayHealthState::from_u8(relay_health.load(Ordering::Relaxed)),
+            RelayHealthState::Healthy
+        );
+
+        // Crossing the Stale threshold escalates without ever seeing an unreachable code.
+        record_relay_send_error(
+            &send_errors,
+            &relay_health,
+            &unreachable,
+            &failure,
+            &err,
+            relay_addr,
+            "data",
+        );
+        assert_eq!(
+            RelayHealthState::from_u8(relay_health.load(Ordering::Relaxed)),
+            RelayHealthState::Stale
+        );
+
+        for _ in 0..(RELAY_SEND_FAILURE_DEAD_THRESHOLD - RELAY_SEND_FAILURE_STALE_THRESHOLD) {
+            record_relay_send_error(
+                &send_errors,
+                &relay_health,
+                &unreachable,
+                &failure,
+                &err,
+                relay_addr,
+                "data",
+            );
+        }
+        assert_eq!(
+            RelayHealthState::from_u8(relay_health.load(Ordering::Relaxed)),
+            RelayHealthState::Dead
+        );
+        // Unreachable streak must never have been touched by non-repairable errors.
+        assert_eq!(unreachable.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn relay_dscp_ef_tos_byte_keeps_ecn_bits_clear() {
+        assert_eq!(RELAY_DSCP_EF, 46);
+        assert_eq!(RELAY_DSCP_EF_TOS_BYTE, 184);
+        assert_eq!(RELAY_DSCP_EF_TOS_BYTE & 0b11, 0);
+    }
+
+    #[test]
+    fn test_concurrent_unreachable_stale_cannot_downgrade_dead() {
+        // Simulates the TOCTOU window where check_health() escalated relay_health
+        // to Dead between the sender thread observing an unreachable error and
+        // committing its Stale escalation. The monotonic fetch_max must not
+        // silently downgrade the relay back to Stale.
+        let send_errors = AtomicU64::new(0);
+        let relay_health = AtomicU8::new(RelayHealthState::Dead as u8);
+        let unreachable = AtomicU32::new(0);
+        let failure = AtomicU32::new(0);
+        let relay_addr: SocketAddr = "127.0.0.1:51821".parse().unwrap();
+        let err = std::io::Error::from_raw_os_error(10051);
+
+        record_relay_send_error(
+            &send_errors,
+            &relay_health,
+            &unreachable,
+            &failure,
+            &err,
+            relay_addr,
+            "data",
+        );
+
+        assert_eq!(
+            RelayHealthState::from_u8(relay_health.load(Ordering::Relaxed)),
+            RelayHealthState::Dead
+        );
+    }
+
+    #[test]
+    fn test_success_resets_send_streaks() {
+        let unreachable = AtomicU32::new(2);
+        let failure = AtomicU32::new(5);
+
+        record_relay_send_success(&unreachable, &failure);
+
+        assert_eq!(unreachable.load(Ordering::Relaxed), 0);
+        assert_eq!(failure.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_forward_outbound_fragments_payload_over_unfragmented_limit() {
+        let relay = UdpRelay::new("127.0.0.1:51821".parse().unwrap()).unwrap();
+        relay.set_relay_path_mtu_for_test(1500);
+        let max_payload = relay.max_inner_packet_len_for_addr("127.0.0.1:51821".parse().unwrap());
+        // A client that has correctly discovered a 1500-byte path emits packets
+        // this size; it cannot know the tunnel spends SESSION_ID_LEN of it.
+        let payload = vec![0u8; max_payload + 1];
+        let outcome = relay.forward_outbound(&payload).unwrap();
+        assert_eq!(
+            outcome,
+            RelaySendOutcome::Enqueued(SESSION_ID_LEN + payload.len())
+        );
+        assert_eq!(relay.oversize_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(relay.fragmented_sends.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_forward_outbound_drops_payload_beyond_tunnel_frame() {
+        let relay = UdpRelay::new("127.0.0.1:51821".parse().unwrap()).unwrap();
+        relay.set_relay_path_mtu_for_test(1500);
+        let payload = vec![0u8; FRAGMENTABLE_INNER_MAX + 1];
+        let outcome = relay.forward_outbound(&payload).unwrap();
+        assert_eq!(outcome, RelaySendOutcome::Oversize);
+        assert_eq!(relay.oversize_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(relay.fragmented_sends.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_forward_outbound_allows_max_payload() {
+        let relay = UdpRelay::new("127.0.0.1:51821".parse().unwrap()).unwrap();
+        relay.set_relay_path_mtu_for_test(1500);
+        let max_payload = relay.max_inner_packet_len_for_addr("127.0.0.1:51821".parse().unwrap());
+        let payload = vec![0u8; max_payload];
+        let outcome = relay.forward_outbound(&payload).unwrap();
+        assert_eq!(
+            outcome,
+            RelaySendOutcome::Enqueued(SESSION_ID_LEN + max_payload)
+        );
+    }
+
+    #[test]
+    fn test_forward_outbound_respects_lower_path_mtu() {
+        let relay = UdpRelay::new("127.0.0.1:51821".parse().unwrap()).unwrap();
+        relay.set_relay_path_mtu_for_test(1400);
+        let max_payload = relay.max_inner_packet_len_for_addr("127.0.0.1:51821".parse().unwrap());
+        assert_eq!(
+            max_payload,
+            1400 - (IPV4_HEADER_LEN + UDP_HEADER_LEN + SESSION_ID_LEN)
+        );
+
+        // Still under the tunnel frame, so a lower path MTU means more
+        // fragments on the wire rather than a dropped packet.
+        let payload = vec![0u8; max_payload + 1];
+        let outcome = relay.forward_outbound(&payload).unwrap();
+        assert_eq!(
+            outcome,
+            RelaySendOutcome::Enqueued(SESSION_ID_LEN + payload.len())
+        );
+        assert_eq!(relay.oversize_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(relay.fragmented_sends.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_stale_data_queue_jobs_are_dropped() {
+        let now = 10_000;
+        assert!(should_drop_stale_outbound_job(
+            OutboundJobKind::Data,
+            now - OUTBOUND_DATA_MAX_QUEUE_AGE_MS - 1,
+            now
+        ));
+    }
+
+    #[test]
+    fn test_fresh_data_queue_jobs_are_not_dropped() {
+        let now = 10_000;
+        assert!(!should_drop_stale_outbound_job(
+            OutboundJobKind::Data,
+            now - OUTBOUND_DATA_MAX_QUEUE_AGE_MS,
+            now
+        ));
+    }
+
+    #[test]
+    fn test_stale_control_queue_jobs_are_not_dropped() {
+        let now = 10_000;
+        assert!(!should_drop_stale_outbound_job(
+            OutboundJobKind::Control,
+            now - OUTBOUND_DATA_MAX_QUEUE_AGE_MS - 1,
+            now
+        ));
+    }
+
+    #[test]
+    fn test_valid_current_pong_is_liveness_evidence() {
+        let relay = UdpRelay::new("127.0.0.1:51821".parse().unwrap()).unwrap();
+        relay.set_ping_enabled(true);
+        let fake_relay = bind_fake_relay(&relay);
+        relay
+            .unanswered_keepalives
+            .store(RELAY_DEAD_KEEPALIVE_THRESHOLD - 1, Ordering::Relaxed);
+        let local_addr = relay_loopback_addr(&relay);
+        let frame = make_pong_frame(&relay);
+
+        fake_relay.send_to(&frame, local_addr).unwrap();
+
+        let mut buffer = [0u8; 1600];
+        let result = relay.receive_inbound(&mut buffer).unwrap();
+        assert_eq!(result, None);
+        assert_eq!(relay.relay_health(), RelayHealthState::Healthy);
+        assert_eq!(relay.unanswered_keepalives.load(Ordering::Relaxed), 0);
+        assert!(relay.last_receive_time.lock().is_some());
+
+        let snap = relay.ping_snapshot();
+        assert_eq!(
+            snap.received, 0,
+            "liveness alone is not a measured probe reply"
+        );
+    }
+
+    #[test]
+    fn receive_diagnostics_separate_rejections_from_return_data() {
+        let relay = UdpRelay::new("127.0.0.1:51821".parse().unwrap()).unwrap();
+        let server = bind_fake_relay(&relay);
+        let destination = relay_loopback_addr(&relay);
+        let mut buffer = [0u8; 1600];
+        // Truncated control frames must stay out of the data/injection counters.
+        for kind in [
+            AUTH_ACK_FRAME_TYPE,
+            PONG_FRAME_TYPE,
+            RESOLVE_RESPONSE_FRAME_TYPE,
+        ] {
+            let mut frame = relay.session_id.to_vec();
+            frame.push(kind);
+            server.send_to(&frame, destination).unwrap();
+            assert!(
+                relay
+                    .receive_inbound_payload(&mut buffer)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        server.send_to(&[0; 3], destination).unwrap();
+        assert!(
+            relay
+                .receive_inbound_payload(&mut buffer)
+                .unwrap()
+                .is_none()
+        );
+        let mut wrong_session = relay.session_id.to_vec();
+        wrong_session[0] ^= 1;
+        server.send_to(&wrong_session, destination).unwrap();
+        assert!(
+            relay
+                .receive_inbound_payload(&mut buffer)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            relay
+                .receive_diagnostics
+                .malformed_control
+                .load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(
+            relay
+                .receive_diagnostics
+                .short_frame
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            relay
+                .receive_diagnostics
+                .session_mismatch
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(relay.stats(), (0, 0));
+        assert!(relay.last_receive_time.lock().is_none());
+        let mut data = relay.session_id.to_vec();
+        data.extend_from_slice(&[0x45; 20]);
+        server.send_to(&data, destination).unwrap();
+        assert_eq!(
+            relay.receive_inbound_payload(&mut buffer).unwrap(),
+            Some(&[0x45; 20][..])
+        );
+        assert_eq!(relay.stats(), (0, 1));
+    }
+
+    #[test]
+    fn test_malformed_current_pong_is_not_liveness_evidence() {
+        let relay = UdpRelay::new("127.0.0.1:51821".parse().unwrap()).unwrap();
+        let fake_relay = bind_fake_relay(&relay);
+        relay
+            .unanswered_keepalives
+            .store(RELAY_DEAD_KEEPALIVE_THRESHOLD, Ordering::Relaxed);
+        *relay.first_outbound_time.lock() =
+            Some(Instant::now() - Duration::from_secs(RELAY_STALE_THRESHOLD.as_secs() + 1));
+        let local_addr = relay_loopback_addr(&relay);
+        let frame = make_pong_frame(&relay);
+
+        fake_relay
+            .send_to(&frame[..PONG_FRAME_LEN - 1], local_addr)
+            .unwrap();
+
+        let mut buffer = [0u8; 1600];
+        let result = relay.receive_inbound(&mut buffer).unwrap();
+        assert_eq!(result, None);
+        assert!(relay.last_receive_time.lock().is_none());
+
+        relay.check_health();
+        assert_eq!(relay.relay_health(), RelayHealthState::Dead);
+    }
+
+    #[test]
+    fn test_wrong_source_pong_is_not_liveness_evidence() {
+        let relay = UdpRelay::new("127.0.0.1:51821".parse().unwrap()).unwrap();
+        let _expected_relay = bind_fake_relay(&relay);
+        relay
+            .unanswered_keepalives
+            .store(RELAY_DEAD_KEEPALIVE_THRESHOLD, Ordering::Relaxed);
+        *relay.first_outbound_time.lock() =
+            Some(Instant::now() - Duration::from_secs(RELAY_STALE_THRESHOLD.as_secs() + 1));
+        let wrong_source = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_addr = relay_loopback_addr(&relay);
+        let frame = make_pong_frame(&relay);
+
+        wrong_source.send_to(&frame, local_addr).unwrap();
+
+        let mut buffer = [0u8; 1600];
+        let result = relay.receive_inbound(&mut buffer).unwrap();
+        assert_eq!(result, None);
+        assert!(relay.last_receive_time.lock().is_none());
+
+        relay.check_health();
+        assert_eq!(relay.relay_health(), RelayHealthState::Dead);
+    }
+
+    #[tokio::test]
+    async fn rebind_hint_from_current_relay_wakes_renewal_without_authenticating() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let relay = UdpRelay::new(server.local_addr().unwrap()).unwrap();
+        let destination =
+            SocketAddr::from(([127, 0, 0, 1], relay.socket.local_addr().unwrap().port()));
+        let mut frame = relay.session_id.to_vec();
+        frame.extend_from_slice(&[
+            AUTH_ACK_FRAME_TYPE,
+            RelayAuthAckStatus::ReauthRequired as u8,
+        ]);
+        server.send_to(&frame, destination).unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let mut buffer = [0u8; 1600];
+        assert!(
+            relay
+                .receive_inbound_payload(&mut buffer)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                relay.wait_for_lease_refresh(Duration::from_secs(120))
+            )
+            .await
+            .is_ok()
+        );
+        assert!(relay.last_auth_ack.lock().is_none());
+        assert_eq!(
+            relay
+                .receive_diagnostics
+                .reauth_hints
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(!RelayAuthAckStatus::ReauthRequired.is_authenticated());
+    }
+
+    #[tokio::test]
+    async fn auth_window_keeps_current_relay_data_and_rebind_hints() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let target = server.local_addr().unwrap();
+        let relay = UdpRelay::new(target).unwrap();
+        let mut auth = Box::pin(relay.authenticate_addr_with_ticket("local-test-ticket", target));
+        assert!(futures_util::poll!(auth.as_mut()).is_pending());
+        let destination = relay_loopback_addr(&relay);
+        let mut frame = relay.session_id.to_vec();
+        frame.extend_from_slice(&[0x45, 0, 0, 20]);
+        server.send_to(&frame, destination).unwrap();
+        let mut buffer = [0u8; 1600];
+        assert_eq!(
+            relay.receive_inbound_payload(&mut buffer).unwrap(),
+            Some(&frame[8..])
+        );
+
+        frame.truncate(SESSION_ID_LEN);
+        frame.extend_from_slice(&[
+            AUTH_ACK_FRAME_TYPE,
+            RelayAuthAckStatus::ReauthRequired as u8,
+        ]);
+        server.send_to(&frame, destination).unwrap();
+        assert!(
+            relay
+                .receive_inbound_payload(&mut buffer)
+                .unwrap()
+                .is_none()
+        );
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            relay.wait_for_lease_refresh(Duration::from_secs(120)),
+        )
+        .await
+        .expect("renewing the current relay must not swallow a rebind hint");
+        assert!(relay.last_auth_ack.lock().is_none());
+
+        frame[SESSION_ID_LEN + 1] = RelayAuthAckStatus::Ok as u8;
+        server.send_to(&frame, destination).unwrap();
+        assert!(
+            relay
+                .receive_inbound_payload(&mut buffer)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(auth.await.unwrap(), Some(RelayAuthAckStatus::Ok));
+    }
+
+    #[tokio::test]
+    async fn auth_window_cancellation_clears_pending_target_and_response() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let target = server.local_addr().unwrap();
+        let relay = UdpRelay::new(target).unwrap();
+        let mut auth = Box::pin(relay.authenticate_addr_with_ticket("local-test-ticket", target));
+        assert!(futures_util::poll!(auth.as_mut()).is_pending());
+        assert_eq!(**relay.pending_auth_addr.load(), Some(target));
+        *relay.last_auth_ack.lock() = Some((target, RelayAuthAckStatus::Ok));
+        drop(auth);
+        assert_eq!(**relay.pending_auth_addr.load(), None);
+        assert!(relay.last_auth_ack.lock().is_none());
+        assert!(relay.auth_handshake_lock.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn auth_window_candidate_cannot_deliver_data_or_rebind_hints() {
+        let current = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let candidate = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let relay = UdpRelay::new(current.local_addr().unwrap()).unwrap();
+        let mut auth =
+            Box::pin(relay.authenticate_addr_with_ticket(
+                "local-test-ticket",
+                candidate.local_addr().unwrap(),
+            ));
+        assert!(futures_util::poll!(auth.as_mut()).is_pending());
+        let mut buffer = [0u8; 1600];
+        for payload in [
+            vec![0x45, 0, 0, 20],
+            vec![
+                AUTH_ACK_FRAME_TYPE,
+                RelayAuthAckStatus::ReauthRequired as u8,
+            ],
+        ] {
+            let mut frame = relay.session_id.to_vec();
+            frame.extend_from_slice(&payload);
+            candidate
+                .send_to(&frame, relay_loopback_addr(&relay))
+                .unwrap();
+            assert!(
+                relay
+                    .receive_inbound_payload(&mut buffer)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                relay.wait_for_lease_refresh(Duration::from_secs(120))
+            )
+            .await
+            .is_err()
+        );
+        assert!(relay.last_auth_ack.lock().is_none());
+        let mut frame = relay.session_id.to_vec();
+        frame.extend_from_slice(&[AUTH_ACK_FRAME_TYPE, RelayAuthAckStatus::Ok as u8]);
+        candidate
+            .send_to(&frame, relay_loopback_addr(&relay))
+            .unwrap();
+        assert!(
+            relay
+                .receive_inbound_payload(&mut buffer)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(auth.await.unwrap(), Some(RelayAuthAckStatus::Ok));
+        assert_eq!(**relay.relay_addr.load(), current.local_addr().unwrap());
+    }
+
+    #[test]
+    fn mid_session_replay_finishes_with_rejection_instead_of_deadlocking() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let target = server.local_addr().unwrap();
+        let relay = Arc::new(UdpRelay::new(target).unwrap());
+        let worker_relay = Arc::clone(&relay);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        // A native mutex deadlock cannot be cancelled by a Tokio timeout.
+        // Observe completion from another thread so a regression fails boundedly.
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime
+                .block_on(worker_relay.authenticate_addr_with_ticket("local-test-ticket", target));
+            let _ = done_tx.send(result);
+        });
+        let mut buffer = [0u8; 1600];
+        let (len, client) = server.recv_from(&mut buffer).unwrap();
+        assert_eq!(buffer[SESSION_ID_LEN], AUTH_HELLO_FRAME_TYPE);
+        assert!(len > SESSION_ID_LEN + 3);
+        let mut ack = relay.session_id.to_vec();
+        ack.extend_from_slice(&[AUTH_ACK_FRAME_TYPE, RelayAuthAckStatus::Replay as u8]);
+        server.send_to(&ack, client).unwrap();
+        assert!(
+            relay
+                .receive_inbound_payload(&mut buffer)
+                .unwrap()
+                .is_none()
+        );
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("mid-session replay stalled past the handshake deadline")
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(result, Some(RelayAuthAckStatus::Replay));
+        assert!(relay.last_auth_ack.lock().is_none());
+        assert!((**relay.pending_auth_addr.load()).is_none());
+    }
+
+    #[tokio::test]
+    async fn repeated_recorded_auth_replays_yield_and_expire() {
+        let calls = std::cell::Cell::new(0);
+        let deadline = Instant::now() + Duration::from_millis(60);
+        let mut waiting = Box::pin(poll_recorded_auth_ack(deadline, || {
+            let count = calls.get() + 1;
+            calls.set(count);
+            assert!(count <= 5, "replay replies bypassed the polling delay");
+            Some(RelayAuthAckStatus::Replay)
+        }));
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        assert_eq!(calls.get(), 1);
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .unwrap(),
+            Some(RelayAuthAckStatus::Replay)
+        );
+        assert!(Instant::now() >= deadline);
+    }
+
+    #[tokio::test]
+    async fn recorded_auth_replay_can_be_followed_by_a_real_acceptance() {
+        let mut replies = [RelayAuthAckStatus::Replay, RelayAuthAckStatus::Ok].into_iter();
+        assert_eq!(
+            poll_recorded_auth_ack(Instant::now() + Duration::from_secs(1), || replies.next())
+                .await,
+            Some(RelayAuthAckStatus::Ok)
+        );
+        assert_eq!(poll_recorded_auth_ack(Instant::now(), || None).await, None);
+    }
+
+    #[test]
+    fn test_never_sent_session_does_not_false_die_at_startup() {
+        let relay = UdpRelay::new("127.0.0.1:51821".parse().unwrap()).unwrap();
+        relay
+            .unanswered_keepalives
+            .store(RELAY_DEAD_KEEPALIVE_THRESHOLD, Ordering::Relaxed);
+
+        relay.check_health();
+
+        assert_eq!(relay.relay_health(), RelayHealthState::NoTrafficYet);
+    }
+
+    #[test]
+    fn test_real_silence_still_reaches_dead() {
+        let relay = UdpRelay::new("127.0.0.1:51821".parse().unwrap()).unwrap();
+        relay
+            .unanswered_keepalives
+            .store(RELAY_DEAD_KEEPALIVE_THRESHOLD, Ordering::Relaxed);
+        *relay.first_outbound_time.lock() =
+            Some(Instant::now() - Duration::from_secs(RELAY_STALE_THRESHOLD.as_secs() + 1));
+
+        relay.check_health();
+
+        assert_eq!(relay.relay_health(), RelayHealthState::Dead);
+    }
+
+    #[test]
+    fn test_inject_failure_streak_flips_health_to_stale_even_when_pongs_refresh_liveness() {
+        // Reproduces the tokyo-02 scenario: pongs keep `last_receive_time` fresh and
+        // `unanswered_keepalives` at zero, so the keepalive-based health checks would
+        // call this Healthy. The inject streak must override that.
+        let relay = UdpRelay::new("127.0.0.1:51821".parse().unwrap()).unwrap();
+        relay
+            .relay_health
+            .store(RelayHealthState::Healthy as u8, Ordering::Relaxed);
+        *relay.last_receive_time.lock() = Some(Instant::now());
+
+        for _ in 0..INJECT_STALE_STREAK {
+            relay.record_inject_outcome(false);
+        }
+
+        relay.check_health();
+        assert_eq!(relay.relay_health(), RelayHealthState::Stale);
+        assert_eq!(relay.inject_error_streak(), INJECT_STALE_STREAK);
+    }
+
+    #[test]
+    fn test_inject_failure_streak_escalates_to_dead() {
+        let relay = UdpRelay::new("127.0.0.1:51821".parse().unwrap()).unwrap();
+        relay
+            .relay_health
+            .store(RelayHealthState::Healthy as u8, Ordering::Relaxed);
+        *relay.last_receive_time.lock() = Some(Instant::now());
+
+        for _ in 0..INJECT_DEAD_STREAK {
+            relay.record_inject_outcome(false);
+        }
+
+        relay.check_health();
+        assert_eq!(relay.relay_health(), RelayHealthState::Dead);
+    }
+
+    #[test]
+    fn test_inject_success_resets_streak_and_does_not_flip_health() {
+        // Negative test: a relay producing some bad packets but mostly good ones must NOT
+        // be flagged as Stale. Only sustained, no-recovery failure triggers the override.
+        let relay = UdpRelay::new("127.0.0.1:51821".parse().unwrap()).unwrap();
+        relay
+            .relay_health
+            .store(RelayHealthState::Healthy as u8, Ordering::Relaxed);
+        *relay.last_receive_time.lock() = Some(Instant::now());
+
+        // Get within one of the threshold, then succeed — streak resets.
+        for _ in 0..(INJECT_STALE_STREAK - 1) {
+            relay.record_inject_outcome(false);
+        }
+        relay.record_inject_outcome(true);
+
+        // Even with another batch of failures right after, the streak only restarts here.
+        for _ in 0..(INJECT_STALE_STREAK - 1) {
+            relay.record_inject_outcome(false);
+        }
+
+        relay.check_health();
+        assert_eq!(relay.relay_health(), RelayHealthState::Healthy);
+        assert_eq!(relay.inject_error_streak(), INJECT_STALE_STREAK - 1);
+    }
+
+    #[test]
+    fn test_inject_streak_resets_on_relay_switch() {
+        let relay = UdpRelay::new("127.0.0.1:51821".parse().unwrap()).unwrap();
+        for _ in 0..(INJECT_STALE_STREAK + 2) {
+            relay.record_inject_outcome(false);
+        }
+        assert!(relay.inject_error_streak() >= INJECT_STALE_STREAK);
+
+        relay.switch_relay("127.0.0.1:51822".parse().unwrap());
+
+        assert_eq!(relay.inject_error_streak(), 0);
+        assert_eq!(relay.relay_health(), RelayHealthState::NoTrafficYet);
+    }
+
+    #[test]
+    fn test_send_keepalive_emits_ping_frame() {
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        relay_socket
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let relay = UdpRelay::new(relay_socket.local_addr().unwrap()).unwrap();
+        relay.last_activity_ms.store(0, Ordering::Relaxed);
+
+        relay
+            .send_keepalive_at(KEEPALIVE_INTERVAL.as_millis() as u64 + 1)
+            .unwrap();
+
+        let mut frame = [0u8; 1600];
+        let (len, _from) = relay_socket.recv_from(&mut frame).unwrap();
+        assert_eq!(len, PING_FRAME_LEN);
+        assert_eq!(&frame[..SESSION_ID_LEN], relay.session_id_bytes());
+        assert_eq!(frame[SESSION_ID_LEN], PING_FRAME_TYPE);
+        assert_eq!(relay.unanswered_keepalives.load(Ordering::Relaxed), 1);
+    }
+}

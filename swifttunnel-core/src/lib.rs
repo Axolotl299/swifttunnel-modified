@@ -1,0 +1,64 @@
+//! SwiftTunnel Core Library
+//!
+//! Core functionality for VPN, authentication, system optimization,
+//! and networking. Used by the Tauri desktop app.
+
+mod atomic_file;
+pub mod auth;
+pub mod autostart;
+pub mod discord_rpc;
+pub mod diskless;
+mod etw_lifecycle;
+pub mod firewall_fixer;
+pub mod fps_monitor;
+pub mod geolocation;
+#[cfg(windows)]
+mod gpu_recovery;
+pub mod http_body;
+mod http_client;
+pub mod installed_clients;
+pub mod lite_update;
+#[cfg(windows)]
+pub mod msi_uninstall;
+pub mod network_analyzer;
+pub mod network_booster;
+pub mod notification;
+pub mod nvidia_profile;
+pub mod optimizations;
+pub mod optional_components;
+pub mod performance_monitor;
+mod process_names;
+#[cfg(windows)]
+mod process_snapshot;
+pub mod ram_cleaner;
+#[cfg(windows)]
+mod registry_value;
+pub mod roblox_directory;
+pub mod roblox_flag_cleanup;
+pub mod roblox_game_profile;
+pub mod roblox_launch_flags;
+pub mod roblox_launcher;
+pub mod roblox_library;
+pub mod roblox_native_launch;
+pub mod roblox_optimizer;
+pub mod roblox_proxy;
+pub mod roblox_watcher;
+#[cfg(windows)]
+pub mod roblox_window;
+pub mod rolling_log;
+pub mod settings;
+pub mod single_client;
+pub mod structs;
+pub mod system_optimizer;
+#[cfg(test)]
+mod test_support;
+pub mod update_verify;
+pub mod updater;
+pub mod utils;
+pub mod vpn;
+
+// Re-export commonly used items
+pub use utils::is_administrator;
+pub use utils::quote_windows_arg;
+pub use utils::with_retry;
+pub use utils::{BoundedCommandOutput, hidden_command, run_hidden_command_with_timeout};

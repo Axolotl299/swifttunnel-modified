@@ -1,0 +1,1870 @@
+//! HTTP client for SwiftTunnel API
+
+use super::device_identity::desktop_hwid;
+use super::types::{
+    AuthError, ExchangeTokenResponse, RelayTicketResponse, SupabaseAuthResponse, VpnConfig,
+};
+use log::{debug, error, info, warn};
+use reqwest::Client;
+use serde::Deserialize;
+use serde_json::json;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+#[derive(Default)]
+struct TicketRetryWindow {
+    until: Option<Instant>,
+}
+
+impl TicketRetryWindow {
+    fn remaining(&self, now: Instant) -> Option<u64> {
+        let wait = self.until?.saturating_duration_since(now);
+        (!wait.is_zero()).then(|| wait.as_secs() + u64::from(wait.subsec_nanos() > 0))
+    }
+
+    fn defer(&mut self, now: Instant, seconds: u64) {
+        let until = now + Duration::from_secs(seconds.clamp(1, MAX_RETRY_AFTER_SECONDS));
+        self.until = Some(self.until.map_or(until, |previous| previous.max(until)));
+    }
+}
+
+// A fresh HTTP client or re-auth hint must not reset a server-issued cooldown.
+static TICKET_RETRY_WINDOW: parking_lot::Mutex<TicketRetryWindow> =
+    parking_lot::Mutex::new(TicketRetryWindow { until: None });
+
+/// Response from the user profile API
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct UserProfileResponse {
+    #[allow(dead_code)]
+    pub id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub full_name: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub username: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub is_admin: bool,
+    #[serde(default)]
+    pub is_tester: bool,
+    #[serde(default)]
+    pub is_banned: bool,
+    #[serde(default)]
+    pub banned_reason: Option<String>,
+    #[serde(default)]
+    pub banned_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorResponse {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    banned_reason: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    /// Human-readable text. Routes that put a machine code in `error` carry the
+    /// sentence for the user here instead.
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// Hosts the desktop API answers on, most preferred first.
+///
+/// More than one because a single hostname is a single point of censorship.
+/// Content filters and national DPI both work the same way: they read the
+/// server name out of the TLS ClientHello, match it against a list, and kill
+/// the handshake. Nothing else about the connection matters, so a request to a
+/// different name over the very same IP goes straight through.
+///
+/// Measured, not assumed. A player on T-Mobile in Denver could complete a TLS
+/// handshake to `cloudflare.com` and not to `swifttunnel.net`, seconds apart,
+/// same machine, both over IPv6, both Cloudflare: DNS resolved, TCP connected,
+/// and the handshake came back `SEC_E_INVALID_TOKEN`. The apex failed exactly
+/// like the `www` name, so this is a match on our domain, not on a prefix.
+///
+/// A second name buys back every user behind that kind of filter until it is
+/// classified too, at which point another name is added here. That is the
+/// normal shape of this problem and there is no permanent version of it: only
+/// Encrypted Client Hello removes the name from the wire, and Windows schannel
+/// cannot do ECH, so it would mean leaving native TLS entirely.
+///
+/// Two rules for anything added here. It must not contain "swifttunnel", or
+/// the same substring match that caught the first name catches it as well. And
+/// it must serve the same origin, because a client that fails over mid-session
+/// has to keep talking to the same database.
+const API_HOSTS: &[&str] = &["https://www.swifttunnel.net"];
+
+/// Index into [`API_HOSTS`] that last completed a request.
+///
+/// Without this, every user behind a filter pays the full failure of host one
+/// on every single call for the life of the session, and every user who is not
+/// pays nothing. Remembering the winner means one bad round trip per app run
+/// rather than one per request.
+static ACTIVE_API_HOST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The base URL currently believed to work.
+///
+/// For callers that hand a URL to something other than our HTTP client, like
+/// the OAuth sign-in page which is opened in the user's browser.
+pub fn current_api_base() -> &'static str {
+    let index = ACTIVE_API_HOST.load(std::sync::atomic::Ordering::Relaxed);
+    API_HOSTS.get(index).copied().unwrap_or(API_HOSTS[0])
+}
+
+/// Hosts to try, in order: the one that worked last, then the rest.
+pub fn api_hosts_in_order() -> Vec<&'static str> {
+    let start = ACTIVE_API_HOST.load(std::sync::atomic::Ordering::Relaxed);
+    order_hosts_from(API_HOSTS, start)
+}
+
+/// Remember a host that just answered, so the rest of the run starts there.
+///
+/// Public because the server list keeps its own HTTP client, built with
+/// different timeouts, and shares only the host list and this memory.
+pub fn note_api_host_worked(base: &str) {
+    if let Some(index) = API_HOSTS.iter().position(|candidate| *candidate == base) {
+        ACTIVE_API_HOST.store(index, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Pure half of [`api_hosts_in_order`], so the rotation can be tested without
+/// touching the global.
+fn order_hosts_from<'a>(hosts: &[&'a str], start: usize) -> Vec<&'a str> {
+    if hosts.is_empty() {
+        return Vec::new();
+    }
+    let start = start % hosts.len();
+    hosts[start..]
+        .iter()
+        .chain(&hosts[..start])
+        .copied()
+        .collect()
+}
+
+const SUPABASE_URL: &str = "https://ppwacjpkeonxdblwygqo.supabase.co";
+const SUPABASE_ANON_KEY: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBwd2FjanBrZW9ueGRibHd5Z3FvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI4OTY1NTksImV4cCI6MjA5ODQ3MjU1OX0.WSRbDCg2NUJhZ4DiWh8PKbCKoi9oHO5td86HJFK7iBw";
+
+/// The running app version, reported to the API in the `X-SwiftTunnel-Version`
+/// header so the server can lock out builds pulled from old GitHub releases.
+/// Set once at startup by the desktop shell via [`set_client_version`]; falls
+/// back to this crate's version if never set (e.g. in tests).
+static CLIENT_VERSION: OnceLock<String> = OnceLock::new();
+
+/// Record the running app version. Call once at startup from the Tauri shell.
+pub fn set_client_version(version: impl Into<String>) {
+    let _ = CLIENT_VERSION.set(version.into());
+}
+
+fn client_version() -> &'static str {
+    CLIENT_VERSION
+        .get()
+        .map(String::as_str)
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+/// Set when the server rejects this build as too old, and cleared again the
+/// moment it serves us anything.
+///
+/// This was a `OnceLock`, which cannot be cleared at all, so a single 426
+/// locked the client out for the life of the process with no way back. That is
+/// only correct if the server's answer can never change, and it can: the floor
+/// is an environment variable, so lowering it, or setting it by mistake for
+/// half a minute, left every client that happened to ask during that window
+/// showing a forced-update gate against a server perfectly willing to serve
+/// them. In Lite the gate also disables the connect button, so the app sat
+/// there dead until it was restarted.
+static UPDATE_REQUIRED_MESSAGE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// The "please update" message if the server has locked this build out, else None.
+pub fn update_required_message() -> Option<String> {
+    UPDATE_REQUIRED_MESSAGE
+        .read()
+        .ok()
+        .and_then(|held| held.clone())
+}
+
+/// Note that the server just served this build, so any lockout is stale.
+///
+/// Only our API enforces the minimum app version. A successful Supabase
+/// sign-in/refresh says nothing about whether our server accepts this build.
+fn note_server_served_us(base: &str) {
+    if !API_HOSTS.contains(&base) {
+        return;
+    }
+    // Cheap read first. This runs on every successful request and the lock is
+    // almost always already empty.
+    if UPDATE_REQUIRED_MESSAGE
+        .read()
+        .is_ok_and(|held| held.is_none())
+    {
+        return;
+    }
+    if let Ok(mut held) = UPDATE_REQUIRED_MESSAGE.write() {
+        log::info!("server accepted this build again; clearing the update-required gate");
+        *held = None;
+    }
+}
+
+/// HTTP client for authentication API calls
+pub struct AuthClient {
+    client: OnceLock<Result<Client, String>>,
+    direct_client: OnceLock<Result<Client, String>>,
+    device_hwid: OnceLock<Option<String>>,
+}
+
+fn build_http_client(use_system_proxy: bool) -> Result<Client, String> {
+    let mut builder = Client::builder()
+        // Real build version (set at startup) so server logs/WAF can tell
+        // client versions apart instead of the old hardcoded "0.1.0".
+        .user_agent(format!("SwiftTunnel-Desktop/{}", client_version()))
+        .timeout(std::time::Duration::from_secs(30))
+        .use_native_tls();
+
+    if !use_system_proxy {
+        builder = builder.no_proxy();
+    }
+
+    finish_http_client(builder)
+}
+
+fn finish_http_client(builder: reqwest::ClientBuilder) -> Result<Client, String> {
+    builder.build().map_err(|error| {
+        format!(
+            "Could not prepare a secure connection. Restart SwiftTunnel and try again. ({})",
+            crate::utils::describe_error_chain(&error)
+        )
+    })
+}
+
+async fn send_using_client<F>(
+    client: &Result<Client, String>,
+    base: &str,
+    build_request: &F,
+) -> Result<reqwest::Response, String>
+where
+    F: Fn(&Client, &str) -> reqwest::RequestBuilder,
+{
+    let client = client.as_ref().map_err(Clone::clone)?;
+    build_request(client, base)
+        .send()
+        .await
+        .map_err(|error| crate::utils::describe_error_chain(&error))
+}
+
+impl AuthClient {
+    #[cfg(test)]
+    pub(super) fn unavailable_for_test() -> Self {
+        Self {
+            client: OnceLock::from(Err("fixture transport unavailable".into())),
+            direct_client: OnceLock::from(Err("fixture transport unavailable".into())),
+            device_hwid: OnceLock::from(None),
+        }
+    }
+
+    /// Create a new AuthClient
+    pub fn new() -> Self {
+        // This constructor runs before Desktop's first window. Build TLS/proxy
+        // transports and read device identity only when an API request needs
+        // them. The direct fallback usually never needs to be constructed.
+        Self {
+            client: OnceLock::new(),
+            direct_client: OnceLock::new(),
+            device_hwid: OnceLock::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_device_hwid(device_hwid: Option<String>) -> Self {
+        Self {
+            device_hwid: OnceLock::from(device_hwid),
+            ..Self::new()
+        }
+    }
+
+    fn add_common_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        // Report the running build so the server can lock out old versions.
+        let request = request.header("X-SwiftTunnel-Version", client_version());
+        let request = match self.device_hwid.get_or_init(desktop_hwid) {
+            Some(hwid) => request.header("X-SwiftTunnel-HWID", hwid),
+            None => request,
+        };
+        // Richer device signals for per-device quota. Sent alongside the v1
+        // header rather than replacing it, so the API keeps working unchanged
+        // until it learns to read this, and older clients keep working after.
+        match super::device_identity::device_fingerprint() {
+            Some(fingerprint) => request.header("X-SwiftTunnel-Device", fingerprint),
+            None => request,
+        }
+    }
+
+    /// Send a request, trying every network path and every known host.
+    ///
+    /// Two nested fallbacks, for two different failures. The inner one is the
+    /// proxy: a machine behind a corporate proxy reaches us only through the
+    /// system settings, and a machine behind a broken proxy reaches us only
+    /// without them, so both are tried. The outer one is the hostname, for the
+    /// case where the name itself is what a filter objects to. See
+    /// [`API_HOSTS`].
+    ///
+    /// The closure is handed the base URL rather than building a fixed one,
+    /// because the URL is exactly the thing that changes between attempts.
+    async fn send_with_network_fallback<F>(
+        &self,
+        label: &str,
+        build_request: F,
+    ) -> Result<reqwest::Response, AuthError>
+    where
+        F: Fn(&Client, &str) -> reqwest::RequestBuilder,
+    {
+        let hosts = api_hosts_in_order();
+        let mut failures: Vec<String> = Vec::new();
+
+        for base in &hosts {
+            match self.send_to_host(label, base, &build_request).await {
+                Ok(response) => {
+                    // Remember the winner so the rest of this run goes straight
+                    // here instead of re-failing the blocked name every time.
+                    note_api_host_worked(base);
+                    return Ok(response);
+                }
+                Err(error) => {
+                    if hosts.len() > 1 {
+                        warn!("{label}: {base} unreachable ({error}); trying the next host");
+                    }
+                    failures.push(format!("{base}: {error}"));
+                }
+            }
+        }
+
+        Err(AuthError::NetworkError(failures.join(" | ")))
+    }
+
+    /// Send to one fixed URL, with the proxy fallback but no host rotation.
+    ///
+    /// For Supabase, which is a different service on a different domain and is
+    /// reachable for exactly the users our own domain is not. Rotating it
+    /// through [`API_HOSTS`] would retry the identical Supabase URL once per
+    /// host and multiply the wait for nothing.
+    async fn send_to_fixed_url<F>(
+        &self,
+        label: &str,
+        build_request: F,
+    ) -> Result<reqwest::Response, AuthError>
+    where
+        F: Fn(&Client) -> reqwest::RequestBuilder,
+    {
+        self.send_to_host(label, "", &move |client, _base| build_request(client))
+            .await
+            .map_err(AuthError::NetworkError)
+    }
+
+    /// One host, both network paths.
+    async fn send_to_host<F>(
+        &self,
+        label: &str,
+        base: &str,
+        build_request: &F,
+    ) -> Result<reqwest::Response, String>
+    where
+        F: Fn(&Client, &str) -> reqwest::RequestBuilder,
+    {
+        match send_using_client(
+            self.client.get_or_init(|| build_http_client(true)),
+            base,
+            build_request,
+        )
+        .await
+        {
+            Ok(response) => {
+                if response.status().is_success() {
+                    note_server_served_us(base);
+                }
+                Ok(response)
+            }
+            Err(primary_error) => {
+                // The chain, not just the wrapper: reqwest's own message names
+                // the URL and nothing else, which is the half support already
+                // knows. See `describe_error_chain`.
+                warn!(
+                    "{} request failed through the system network path: {}. Retrying direct.",
+                    label, primary_error
+                );
+
+                // Same treatment on the fallback path. A machine behind a proxy
+                // reaches the API only this way, so leaving it out would mean
+                // the update gate could never lift for those users.
+                send_using_client(
+                    self.direct_client.get_or_init(|| build_http_client(false)),
+                    base,
+                    build_request,
+                )
+                .await
+                .inspect(|response| {
+                    if response.status().is_success() {
+                        note_server_served_us(base);
+                    }
+                })
+                .map_err(|direct_error| {
+                    format!(
+                        "{}. Direct retry also failed: {}",
+                        primary_error, direct_error
+                    )
+                })
+            }
+        }
+    }
+
+    fn exchange_oauth_payload(&self, exchange_token: &str, state: &str) -> serde_json::Value {
+        let mut payload = json!({
+            "exchange_token": exchange_token,
+            "state": state,
+        });
+        if let Some(hwid) = self.device_hwid.get_or_init(desktop_hwid) {
+            payload["device_hwid"] = json!(hwid);
+        }
+        payload
+    }
+
+    async fn parse_password_sign_in_response(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<SupabaseAuthResponse, AuthError> {
+        if !response.status().is_success() {
+            let status = response.status();
+            let retry_after = retry_after_seconds(&response);
+            let body = read_auth_error(response).await;
+            error!(
+                "Sign in failed: {} - {}",
+                status,
+                summarize_error_body(&body)
+            );
+
+            if status.as_u16() == 429 {
+                return Err(AuthError::RateLimited(retry_after));
+            }
+            if let Some(error) = update_required_error(status, &body) {
+                return Err(error);
+            }
+            if let Some(error) = user_banned_error_from_body(&body) {
+                return Err(error);
+            }
+            if body.contains("Invalid login credentials") {
+                return Err(AuthError::InvalidCredentials);
+            }
+            return Err(AuthError::ApiError(format!(
+                "Sign in failed: {} - {}",
+                status,
+                summarize_error_body(&body)
+            )));
+        }
+
+        read_auth_json(response, "response").await
+    }
+
+    async fn sign_in_with_password_via_desktop_api(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> Result<SupabaseAuthResponse, AuthError> {
+        let path = "/api/auth/desktop/password";
+        let response = self
+            .send_with_network_fallback("desktop password sign in", |client, base| {
+                let url = format!("{base}{path}");
+                self.add_common_headers(
+                    client
+                        .post(&url)
+                        .header("Content-Type", "application/json")
+                        .json(&json!({
+                            "email": email,
+                            "password": password,
+                        })),
+                )
+            })
+            .await?;
+
+        self.parse_password_sign_in_response(response).await
+    }
+
+    async fn refresh_token_via_desktop_api(
+        &self,
+        refresh_token: &str,
+    ) -> Result<SupabaseAuthResponse, AuthError> {
+        let path = "/api/auth/desktop/refresh";
+        let response = self
+            .send_with_network_fallback("desktop token refresh", |client, base| {
+                let url = format!("{base}{path}");
+                self.add_common_headers(
+                    client
+                        .post(&url)
+                        .header("Content-Type", "application/json")
+                        .json(&json!({
+                            "refresh_token": refresh_token,
+                        })),
+                )
+            })
+            .await?;
+
+        parse_refresh_response(response).await
+    }
+
+    /// Sign in with email and password via Supabase
+    pub async fn sign_in_with_password(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> Result<SupabaseAuthResponse, AuthError> {
+        debug!("Signing in user");
+
+        match self
+            .sign_in_with_password_via_desktop_api(email, password)
+            .await
+        {
+            Ok(data) => {
+                info!("Sign in successful for user {}", data.user.id);
+                return Ok(data);
+            }
+            Err(error) if !auth_fallback_allowed(&error) => return Err(error),
+            Err(primary_error) => {
+                warn!(
+                    "Desktop API sign in failed; trying direct Supabase fallback: {}",
+                    primary_error
+                );
+            }
+        }
+
+        let url = format!("{}/auth/v1/token?grant_type=password", SUPABASE_URL);
+
+        let response = match self
+            .send_to_fixed_url("sign in", |client| {
+                client
+                    .post(&url)
+                    .header("apikey", SUPABASE_ANON_KEY)
+                    .header("Content-Type", "application/json")
+                    .json(&json!({
+                        "email": email,
+                        "password": password,
+                    }))
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(primary_error) => return Err(primary_error),
+        };
+
+        let data = self.parse_password_sign_in_response(response).await?;
+
+        info!("Sign in successful for user {}", data.user.id);
+        Ok(data)
+    }
+
+    /// Refresh the access token via Supabase
+    pub async fn refresh_token(
+        &self,
+        refresh_token: &str,
+    ) -> Result<SupabaseAuthResponse, AuthError> {
+        debug!("Refreshing token via Supabase");
+
+        match self.refresh_token_via_desktop_api(refresh_token).await {
+            Ok(data) => return Ok(data),
+            Err(error) if !auth_fallback_allowed(&error) => return Err(error),
+            Err(primary_error) => {
+                warn!(
+                    "Desktop API token refresh failed; trying direct Supabase fallback: {}",
+                    primary_error
+                );
+            }
+        }
+
+        let url = format!("{}/auth/v1/token?grant_type=refresh_token", SUPABASE_URL);
+
+        let response = match self
+            .send_to_fixed_url("refresh token", |client| {
+                client
+                    .post(&url)
+                    .header("apikey", SUPABASE_ANON_KEY)
+                    .header("Content-Type", "application/json")
+                    .json(&json!({
+                        "refresh_token": refresh_token,
+                    }))
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(primary_error) => return Err(primary_error),
+        };
+
+        let data = parse_refresh_response(response).await?;
+
+        info!("Token refresh successful");
+        Ok(data)
+    }
+
+    /// Fetch VPN configuration for a region
+    #[allow(dead_code)]
+    pub async fn get_vpn_config(
+        &self,
+        access_token: &str,
+        region: &str,
+    ) -> Result<VpnConfig, AuthError> {
+        let path = "/api/vpn/generate-config";
+
+        debug!("Fetching VPN config for region {}", region);
+
+        let response = self
+            .send_with_network_fallback("VPN config", |client, base| {
+                let url = format!("{base}{path}");
+                self.add_common_headers(client.post(&url))
+                    .header("Authorization", format!("Bearer {}", access_token))
+                    .json(&json!({
+                        "region": region,
+                    }))
+            })
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = read_auth_error(response).await;
+            error!(
+                "Get VPN config failed: {} - {}",
+                status,
+                summarize_error_body(&body)
+            );
+            if let Some(error) = update_required_error(status, &body) {
+                return Err(error);
+            }
+            if let Some(error) = user_banned_error_from_body(&body) {
+                return Err(error);
+            }
+            return Err(AuthError::ApiError(format!(
+                "Config fetch failed: {} - {}",
+                status,
+                summarize_error_body(&body)
+            )));
+        }
+
+        let data: VpnConfig = read_auth_json(response, "config").await?;
+
+        info!("Got VPN config for region {}", region);
+        Ok(data)
+    }
+
+    /// Best-effort compatibility notification. Issued lease coverage remains paid
+    /// until expiry; a client release is not evidence that forwarding stopped.
+    pub async fn release_relay_quota(&self, access_token: &str) -> Result<(), AuthError> {
+        let path = "/api/vpn/relay-release";
+
+        let response = self
+            .send_with_network_fallback("relay release", |client, base| {
+                let url = format!("{base}{path}");
+                self.add_common_headers(client.post(&url))
+                    .header("Authorization", format!("Bearer {}", access_token))
+                    .header("X-SwiftTunnel-Relay-Lease", "1")
+                    .header("Content-Type", "application/json")
+                    .json(&json!({}))
+            })
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = read_auth_error(response).await;
+            return Err(AuthError::ApiError(format!(
+                "Relay release failed: {} - {}",
+                status,
+                summarize_error_body(&body)
+            )));
+        }
+
+        debug!("Relay disconnect acknowledged");
+        Ok(())
+    }
+
+    /// Fetch a short-lived relay auth ticket for a specific session/server pair.
+    pub async fn get_relay_ticket(
+        &self,
+        access_token: &str,
+        server_region: &str,
+        session_id: &str,
+    ) -> Result<RelayTicketResponse, AuthError> {
+        let path = "/api/vpn/relay-ticket";
+        if let Some(wait) = TICKET_RETRY_WINDOW.lock().remaining(Instant::now()) {
+            return Err(AuthError::RateLimited(wait));
+        }
+        // One renewal identity survives all transport retries and fallback hosts.
+        let request_id: String = rand::random::<[u8; 16]>()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+
+        debug!(
+            "Fetching relay ticket for region {} and session {}",
+            server_region, session_id
+        );
+
+        let response = self
+            .send_with_network_fallback("relay ticket", |client, base| {
+                let url = format!("{base}{path}");
+                self.add_common_headers(client.post(&url))
+                    .header("Authorization", format!("Bearer {}", access_token))
+                    .header("Content-Type", "application/json")
+                    .json(&json!({
+                        "server_region": server_region,
+                        "session_id": session_id,
+                        "request_id": request_id,
+                    }))
+            })
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let retry_after = retry_after_seconds(&response);
+            let body = read_auth_error(response).await;
+            error!(
+                "Relay ticket fetch failed: {} - {}",
+                status,
+                summarize_error_body(&body)
+            );
+            if let Some(error) = update_required_error(status, &body) {
+                return Err(error);
+            }
+            if let Some(error) = user_banned_error_from_body(&body) {
+                return Err(error);
+            }
+            if let Some(error) = free_tier_limit_error(status, &body) {
+                return Err(error);
+            }
+            if let Some(wait) = retryable_ticket_delay(status, retry_after) {
+                TICKET_RETRY_WINDOW.lock().defer(Instant::now(), wait);
+                return Err(AuthError::RateLimited(wait));
+            }
+            // A 401 here means the API rejected our access token, which is a
+            // dead session and nothing the user can fix by retrying. It used to
+            // fall through to a generic ApiError, so the app reported "not
+            // authorized" and left them signed in, unable to connect, with no
+            // hint that signing out and back in was the fix. Report it as an
+            // invalid session so the caller can end it for them.
+            if status.as_u16() == 401 {
+                return Err(AuthError::RefreshTokenInvalid);
+            }
+            return Err(AuthError::ApiError(format!(
+                "Relay ticket fetch failed: {} - {}",
+                status,
+                summarize_error_body(&body)
+            )));
+        }
+
+        let data: RelayTicketResponse = read_auth_json(response, "relay ticket").await?;
+
+        info!(
+            "Received relay ticket (auth_required: {}, key_id: {}, preflight_mode: {:?}, queue_full_mode: {:?})",
+            data.auth_required,
+            data.key_id,
+            data.preflight_mode(),
+            data.queue_full_mode()
+        );
+        Ok(data)
+    }
+
+    /// Exchange OAuth token for magic link token (desktop OAuth flow)
+    /// Called after receiving the callback from browser OAuth
+    pub async fn exchange_oauth_token(
+        &self,
+        exchange_token: &str,
+        state: &str,
+    ) -> Result<ExchangeTokenResponse, AuthError> {
+        let path = "/api/auth/desktop/exchange";
+
+        debug!("Exchanging OAuth token for session");
+
+        let response = self
+            .send_with_network_fallback("desktop auth exchange", |client, base| {
+                let url = format!("{base}{path}");
+                self.add_common_headers(client.put(&url))
+                    .header("Content-Type", "application/json")
+                    .json(&self.exchange_oauth_payload(exchange_token, state))
+            })
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = read_auth_error(response).await;
+            error!(
+                "Exchange token failed: {} - {}",
+                status,
+                summarize_error_body(&body)
+            );
+
+            if let Some(error) = user_banned_error_from_body(&body) {
+                return Err(error);
+            }
+            if body.contains("Invalid exchange token") {
+                return Err(AuthError::ApiError(
+                    "Invalid or expired exchange token. Please try again.".to_string(),
+                ));
+            }
+            if body.contains("Token already used") {
+                return Err(AuthError::ApiError(
+                    "This login link has already been used. Please try again.".to_string(),
+                ));
+            }
+            if body.contains("Token expired") {
+                return Err(AuthError::ApiError(
+                    "Login link expired. Please try again.".to_string(),
+                ));
+            }
+
+            return Err(AuthError::ApiError(format!(
+                "Exchange failed: {} - {}",
+                status,
+                summarize_error_body(&body)
+            )));
+        }
+
+        let data: ExchangeTokenResponse = read_auth_json(response, "exchange response").await?;
+
+        info!("Successfully exchanged OAuth token");
+        Ok(data)
+    }
+
+    /// Fetch user profile from SwiftTunnel API (includes tester status)
+    pub async fn fetch_user_profile(
+        &self,
+        access_token: &str,
+    ) -> Result<UserProfileResponse, AuthError> {
+        let path = "/api/user/profile";
+
+        debug!("Fetching user profile");
+
+        let response = self
+            .send_with_network_fallback("user profile", |client, base| {
+                let url = format!("{base}{path}");
+                self.add_common_headers(client.get(&url))
+                    .header("Authorization", format!("Bearer {}", access_token))
+            })
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = read_auth_error(response).await;
+            error!(
+                "Fetch user profile failed: {} - {}",
+                status,
+                summarize_error_body(&body)
+            );
+            if let Some(error) = update_required_error(status, &body) {
+                return Err(error);
+            }
+            if let Some(error) = user_banned_error_from_body(&body) {
+                return Err(error);
+            }
+            return Err(AuthError::ApiError(format!(
+                "Profile fetch failed: {} - {}",
+                status,
+                summarize_error_body(&body)
+            )));
+        }
+
+        let data: UserProfileResponse = read_auth_json(response, "profile").await?;
+
+        info!("Fetched user profile (is_tester: {})", data.is_tester);
+        Ok(data)
+    }
+
+    /// Verify magic link token with Supabase to get access/refresh tokens
+    pub async fn verify_magic_link(
+        &self,
+        token_hash: &str,
+    ) -> Result<SupabaseAuthResponse, AuthError> {
+        let url = format!("{}/auth/v1/verify", SUPABASE_URL);
+
+        debug!("Verifying magic link (token omitted)");
+
+        let response = self
+            .send_to_fixed_url("magic link verification", |client| {
+                client
+                    .post(&url)
+                    .header("apikey", SUPABASE_ANON_KEY)
+                    .header("Content-Type", "application/json")
+                    .json(&json!({
+                        "type": "magiclink",
+                        "token_hash": token_hash,
+                    }))
+            })
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = read_auth_error(response).await;
+            error!(
+                "Verify magic link failed: {} - {}",
+                status,
+                summarize_error_body(&body)
+            );
+
+            if body.contains("Token has expired")
+                || body.contains("token is expired")
+                || body.contains("expired")
+            {
+                return Err(AuthError::ApiError(
+                    "Login link has expired. Please try signing in again.".to_string(),
+                ));
+            }
+            if body.contains("Invalid token")
+                || body.contains("token is invalid")
+                || body.contains("invalid")
+            {
+                return Err(AuthError::ApiError(
+                    "Invalid login link. Please try signing in again.".to_string(),
+                ));
+            }
+            if body.contains("already been used") || body.contains("used") {
+                return Err(AuthError::ApiError(
+                    "This login link was already used. Please try signing in again.".to_string(),
+                ));
+            }
+
+            return Err(AuthError::ApiError(format!(
+                "Verification failed ({}). Please try signing in again.",
+                status
+            )));
+        }
+
+        let data: SupabaseAuthResponse = read_auth_json(response, "auth response").await?;
+
+        info!("Magic link verification successful");
+        Ok(data)
+    }
+}
+
+const AUTH_JSON_LIMIT: usize = 1024 * 1024;
+const AUTH_ERROR_LIMIT: usize = 64 * 1024;
+
+// An alternate provider is for transport/API availability failures. Explicit
+// account, build, quota and rate-limit decisions must not trigger a second
+// request through a route that does not share those checks.
+fn auth_fallback_allowed(error: &AuthError) -> bool {
+    matches!(error, AuthError::NetworkError(_) | AuthError::ApiError(_))
+}
+
+async fn parse_refresh_response(
+    response: reqwest::Response,
+) -> Result<SupabaseAuthResponse, AuthError> {
+    if !response.status().is_success() {
+        let status = response.status();
+        let retry_after = retry_after_seconds(&response);
+        let body = read_auth_error(response).await;
+        error!(
+            "Token refresh failed: {} - {}",
+            status,
+            summarize_error_body(&body)
+        );
+        if status.as_u16() == 429 {
+            return Err(AuthError::RateLimited(retry_after));
+        }
+        if let Some(error) = update_required_error(status, &body) {
+            return Err(error);
+        }
+        if let Some(error) = user_banned_error_from_body(&body) {
+            return Err(error);
+        }
+        if is_refresh_token_permanently_invalid(&body) {
+            return Err(AuthError::RefreshTokenInvalid);
+        }
+        return Err(AuthError::ApiError(format!(
+            "Refresh failed: {} - {}",
+            status,
+            summarize_error_body(&body)
+        )));
+    }
+    read_auth_json(response, "response").await
+}
+
+async fn read_auth_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<T, AuthError> {
+    let bytes =
+        crate::http_body::read_bounded(response, AUTH_JSON_LIMIT, "authentication response")
+            .await
+            .map_err(AuthError::ApiError)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| AuthError::ApiError(format!("Failed to parse {context}: {error}")))
+}
+
+async fn read_auth_error(response: reqwest::Response) -> String {
+    // Keep status/header classification (429, bans, quota, old builds) in the
+    // caller even if a proxy returns an oversized or incomplete error body.
+    match crate::http_body::read_bounded(response, AUTH_ERROR_LIMIT, "authentication error").await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(error) => error,
+    }
+}
+
+impl Default for AuthClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Classify a Supabase refresh-token error response body.
+///
+/// Returns `true` if the error indicates a permanently invalid refresh token
+/// (revoked, rotated, or not found). These errors should NOT be retried.
+pub(crate) fn is_refresh_token_permanently_invalid(body: &str) -> bool {
+    body.contains("refresh_token_not_found")
+        || body.contains("Invalid Refresh Token")
+        || body.contains("refresh_token_already_used")
+}
+
+/// Condense an HTTP error body into something safe to put in front of a user.
+///
+/// These strings get interpolated into [`AuthError::ApiError`] and rendered
+/// verbatim in the app window, so a body that is not our JSON fills the whole
+/// screen with page source. That is exactly what users hit when
+/// `auth.swifttunnel.net` began answering with a Cloudflare "Error 1000" page:
+/// the entire HTML document was painted into the login error.
+///
+/// An HTML body is reduced to the one detail support can act on, the CDN Ray
+/// ID. Anything else keeps its text, whitespace-collapsed and truncated. Callers
+/// must still run their own `body.contains(...)` checks against the *raw* body
+/// first; this is only for display.
+fn summarize_error_body(body: &str) -> String {
+    const MAX_LEN: usize = 300;
+
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "empty response".to_string();
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.starts_with('<') || lower.contains("<html") || lower.contains("<!doctype html") {
+        return match token_after(trimmed, "Ray ID: ") {
+            Some(ray) => format!(
+                "the server returned an HTML error page instead of JSON \
+                 (blocked or misrouted by a proxy, captive portal, or CDN; Ray ID {ray})"
+            ),
+            None => "the server returned an HTML error page instead of JSON \
+                     (blocked or misrouted by a proxy, captive portal, or CDN)"
+                .to_string(),
+        };
+    }
+
+    let collapsed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > MAX_LEN {
+        let head: String = collapsed.chars().take(MAX_LEN).collect();
+        format!("{head}…")
+    } else {
+        collapsed
+    }
+}
+
+/// First alphanumeric run following `needle`, if present.
+fn token_after(haystack: &str, needle: &str) -> Option<String> {
+    let start = haystack.find(needle)? + needle.len();
+    let token: String = haystack[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .take(64)
+        .collect();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Detect a server "update required" (old-build lockout) response: HTTP 426, or
+/// an explicit `{"code":"update_required"}` body. Returns the user-facing
+/// message so the app can prompt an update instead of a raw API error.
+fn update_required_error(status: reqwest::StatusCode, body: &str) -> Option<AuthError> {
+    let parsed: Option<ApiErrorResponse> = serde_json::from_str(body).ok();
+    let code_matches = parsed.as_ref().and_then(|p| p.code.as_deref()) == Some("update_required");
+    if status.as_u16() != 426 && !code_matches {
+        return None;
+    }
+    let message = parsed.and_then(|p| p.error).unwrap_or_else(|| {
+        "This version of SwiftTunnel is no longer supported. Please update to continue.".to_string()
+    });
+    // Latch it so the app can show a forced-update gate even if this particular
+    // request's error is otherwise swallowed upstream.
+    if let Ok(mut held) = UPDATE_REQUIRED_MESSAGE.write() {
+        *held = Some(message.clone());
+    }
+    Some(AuthError::UpdateRequired(message))
+}
+
+fn user_banned_error_from_body(body: &str) -> Option<AuthError> {
+    let parsed: ApiErrorResponse = serde_json::from_str(body).ok()?;
+    if parsed.code.as_deref() != Some("user_banned") {
+        return None;
+    }
+
+    Some(AuthError::UserBanned(ban_reason_suffix(
+        parsed.banned_reason,
+    )))
+}
+
+/// Default wait when a 429 arrives with no usable `Retry-After`.
+const DEFAULT_RETRY_AFTER_SECONDS: u64 = 60;
+
+/// Longest we will honour from `Retry-After`. A hostile or misconfigured
+/// intermediary must not be able to park the client for hours.
+const MAX_RETRY_AFTER_SECONDS: u64 = 300;
+
+/// Seconds to wait before retrying, from the response's `Retry-After` header.
+///
+/// Only the delta-seconds form is handled , that is what
+/// `rateLimitResponse` in the web app sends. An HTTP-date value, which the spec
+/// also permits, falls back to the default rather than being misparsed as 0 and
+/// causing an immediate retry.
+fn retry_after_seconds(response: &reqwest::Response) -> u64 {
+    parse_retry_after(
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+fn parse_retry_after(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT_RETRY_AFTER_SECONDS)
+        .min(MAX_RETRY_AFTER_SECONDS)
+}
+
+fn retryable_ticket_delay(status: reqwest::StatusCode, retry_after: u64) -> Option<u64> {
+    matches!(status.as_u16(), 429 | 503).then(|| retry_after.clamp(1, MAX_RETRY_AFTER_SECONDS))
+}
+
+/// Detect the free-tier quota rejection. `/api/vpn/relay-ticket` answers 429
+/// with `{"error":"free_tier_limit_reached","message":"..."}` , note the code
+/// lands in `error`, not `code`, unlike the ban and update responses.
+fn free_tier_limit_error(status: reqwest::StatusCode, body: &str) -> Option<AuthError> {
+    if status.as_u16() != 429 {
+        return None;
+    }
+    let parsed: ApiErrorResponse = serde_json::from_str(body).ok()?;
+    if parsed.error.as_deref() != Some("free_tier_limit_reached") {
+        return None;
+    }
+    Some(AuthError::FreeTierLimitReached(
+        parsed.message.unwrap_or_else(|| {
+            "You've used your free SwiftTunnel time for now. This limit is temporary.".to_string()
+        }),
+    ))
+}
+
+fn ban_reason_suffix(reason: Option<String>) -> String {
+    reason
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(": {}", value))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod client_initialization_tests {
+    use super::*;
+
+    fn failed_client() -> Result<Client, String> {
+        // Exercise reqwest's real builder-error path without changing Windows TLS.
+        finish_http_client(Client::builder().user_agent("invalid\nheader"))
+    }
+
+    #[test]
+    fn client_initialization_failure_is_an_error_instead_of_a_panic() {
+        let error = failed_client().unwrap_err();
+        assert!(error.contains("Could not prepare a secure connection"));
+        assert!(error.contains("Restart SwiftTunnel"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_clients_report_failure_without_starting_a_request() {
+        let client = AuthClient {
+            client: OnceLock::from(failed_client()),
+            direct_client: OnceLock::from(failed_client()),
+            device_hwid: OnceLock::from(None),
+        };
+        let result = client
+            .send_to_fixed_url("owned test", |_| panic!("must not build a network request"))
+            .await;
+        let error = result.unwrap_err();
+        assert!(matches!(error, AuthError::NetworkError(_)));
+        assert!(error.to_string().contains("Direct retry also failed"));
+    }
+
+    async fn response_with_primary(primary_failed: bool, status: &str) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let wire = format!("HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        let server = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 2048];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                stream.write_all(wire.as_bytes()).await.unwrap();
+            })
+            .await
+        });
+        let working = || {
+            Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap()
+        };
+        let client = AuthClient {
+            client: OnceLock::from(if primary_failed {
+                failed_client()
+            } else {
+                Ok(working())
+            }),
+            direct_client: if primary_failed {
+                OnceLock::from(Ok(working()))
+            } else {
+                OnceLock::new()
+            },
+            device_hwid: OnceLock::from(None),
+        };
+        let result = client
+            .send_to_fixed_url("owned loopback test", |client| client.get(&url))
+            .await;
+        // Both sides have deadlines, so a regression cannot strand an owned listener.
+        server.await.unwrap().unwrap();
+        if !primary_failed {
+            assert!(
+                client.direct_client.get().is_none(),
+                "a primary response must leave the fallback transport uninitialized"
+            );
+        }
+        result.unwrap()
+    }
+
+    #[tokio::test]
+    async fn direct_path_still_works_if_system_client_initialization_failed() {
+        assert_eq!(response_with_primary(true, "200 OK").await.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn a_real_http_policy_response_does_not_try_an_unavailable_fallback() {
+        assert_eq!(
+            response_with_primary(false, "403 Forbidden").await.status(),
+            403
+        );
+    }
+}
+
+#[cfg(test)]
+mod api_host_tests {
+    use super::{API_HOSTS, order_hosts_from};
+
+    /// Every host gets tried, and the one that worked last goes first.
+    ///
+    /// Both halves matter. Trying them all is what gets a filtered user back;
+    /// starting from the winner is what stops everyone else paying for it, and
+    /// stops the filtered user paying the dead host's failure on every request
+    /// rather than once.
+    #[test]
+    fn the_host_that_worked_last_is_tried_first() {
+        let hosts = [
+            "https://a.example",
+            "https://b.example",
+            "https://c.example",
+        ];
+
+        assert_eq!(
+            order_hosts_from(&hosts, 0),
+            vec![
+                "https://a.example",
+                "https://b.example",
+                "https://c.example"
+            ]
+        );
+        assert_eq!(
+            order_hosts_from(&hosts, 1),
+            vec![
+                "https://b.example",
+                "https://c.example",
+                "https://a.example"
+            ],
+            "the remembered host leads, and the rest still follow"
+        );
+        assert_eq!(
+            order_hosts_from(&hosts, 2),
+            vec![
+                "https://c.example",
+                "https://a.example",
+                "https://b.example"
+            ]
+        );
+    }
+
+    /// A stale index must not drop hosts or panic.
+    ///
+    /// The remembered index outlives the list it points into: shipping a build
+    /// with one fewer host, with the old index still in memory, would otherwise
+    /// index out of bounds.
+    #[test]
+    fn a_stale_index_still_returns_every_host() {
+        let hosts = ["https://a.example", "https://b.example"];
+        assert_eq!(
+            order_hosts_from(&hosts, 7),
+            vec!["https://b.example", "https://a.example"],
+            "an out-of-range index wraps rather than losing a host"
+        );
+        assert!(
+            order_hosts_from(&[], 3).is_empty(),
+            "no hosts is not a panic"
+        );
+    }
+
+    /// A host that carries our own name is caught by the same filter.
+    ///
+    /// The whole point of a second host is to survive a match on the first. One
+    /// containing "swifttunnel" is matched by the substring that caught the
+    /// original, so it would be dead on arrival and nobody would find out until
+    /// the tickets came back.
+    #[test]
+    fn no_fallback_host_repeats_the_blocked_name() {
+        for host in API_HOSTS.iter().skip(1) {
+            assert!(
+                !host.contains("swifttunnel"),
+                "{host} carries the name the filter matches, so it is blocked too"
+            );
+        }
+        assert!(
+            API_HOSTS[0].contains("swifttunnel"),
+            "the primary is still our own domain"
+        );
+        assert!(!API_HOSTS.is_empty(), "there has to be somewhere to go");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Cloudflare Error 1000 page that `auth.swifttunnel.net` served when
+    /// its DNS record was proxied onto a Cloudflare-owned origin. Pasting this
+    /// into `AuthError::ApiError` filled the whole app window with page source.
+    #[test]
+    fn test_summarize_error_body_collapses_cloudflare_error_page() {
+        let body = r#"<!DOCTYPE html><html><head><script>window.foo=1</script></head>
+            <body><div id="cf-wrapper"><h1>Error <span>1000</span></h1>
+            <span>Ray ID: a28c07f94b76fde8 &bull;</span>
+            <h2>DNS points to prohibited IP</h2>
+            <p>You've requested a page on a website (auth.swifttunnel.net) that is on the
+            Cloudflare network.</p></div></body></html>"#;
+
+        let summary = summarize_error_body(body);
+        assert!(
+            summary.contains("HTML error page"),
+            "expected an explanation, got: {summary}"
+        );
+        assert!(
+            summary.contains("a28c07f94b76fde8"),
+            "Ray ID is the one detail support can act on, got: {summary}"
+        );
+        assert!(!summary.contains('<'), "markup leaked: {summary}");
+        assert!(summary.len() < 200, "summary too long: {}", summary.len());
+    }
+
+    #[test]
+    fn test_summarize_error_body_bounds_an_oversized_html_diagnostic_id() {
+        let summary = summarize_error_body(&format!("<html>Ray ID: {} </html>", "a".repeat(8000)));
+        assert!(summary.contains("HTML error page"));
+        assert!(summary.contains("Ray ID"));
+        assert!(
+            summary.len() < 300,
+            "HTML diagnostics bypassed the display budget"
+        );
+    }
+
+    #[test]
+    fn test_summarize_error_body_keeps_json_intact() {
+        let body =
+            r#"{"code":400,"error_code":"invalid_credentials","msg":"Invalid login credentials"}"#;
+        assert_eq!(summarize_error_body(body), body);
+    }
+
+    #[test]
+    fn test_summarize_error_body_truncates_long_text() {
+        let summary = summarize_error_body(&"x".repeat(5000));
+        assert!(summary.chars().count() <= 301, "not truncated: {summary}");
+        assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn test_summarize_error_body_handles_empty() {
+        assert_eq!(summarize_error_body("   "), "empty response");
+    }
+
+    #[test]
+    fn test_detects_refresh_token_not_found() {
+        let body = r#"{"code":400,"error_code":"refresh_token_not_found","msg":"Invalid Refresh Token: Refresh Token Not Found"}"#;
+        assert!(is_refresh_token_permanently_invalid(body));
+    }
+
+    #[test]
+    fn test_detects_refresh_token_already_used() {
+        let body = r#"{"code":400,"error_code":"refresh_token_already_used","msg":"Refresh token already used"}"#;
+        assert!(is_refresh_token_permanently_invalid(body));
+    }
+
+    #[test]
+    fn test_detects_invalid_refresh_token_message() {
+        let body = "Invalid Refresh Token";
+        assert!(is_refresh_token_permanently_invalid(body));
+    }
+
+    #[test]
+    fn test_transient_errors_are_not_permanent() {
+        assert!(!is_refresh_token_permanently_invalid(
+            "Internal Server Error",
+        ));
+        assert!(!is_refresh_token_permanently_invalid("rate_limit_exceeded"));
+        assert!(!is_refresh_token_permanently_invalid(""));
+    }
+
+    #[test]
+    fn test_user_banned_error_uses_structured_code() {
+        let body = r#"{"error":"User banned","code":"user_banned","banned_reason":"chargeback"}"#;
+
+        let error = user_banned_error_from_body(body).unwrap();
+
+        assert_eq!(error.to_string(), "Account banned: chargeback");
+    }
+
+    #[test]
+    fn test_user_banned_error_ignores_incidental_text() {
+        let body = r#"{"error":"user_banned appeared in a log line","code":"internal_error"}"#;
+
+        assert!(user_banned_error_from_body(body).is_none());
+    }
+
+    #[test]
+    fn retry_after_uses_the_servers_delta_seconds() {
+        assert_eq!(parse_retry_after(Some("45")), 45);
+        assert_eq!(parse_retry_after(Some("  120 ")), 120);
+    }
+
+    #[test]
+    fn ticket_cooldown_rounds_up_and_expires_at_the_server_deadline() {
+        let now = Instant::now();
+        let mut window = TicketRetryWindow::default();
+        window.defer(now, 60);
+        assert_eq!(window.remaining(now), Some(60));
+        assert_eq!(
+            window.remaining(now + Duration::from_millis(59_001)),
+            Some(1)
+        );
+        assert_eq!(window.remaining(now + Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn a_shorter_reply_cannot_shorten_an_existing_ticket_cooldown() {
+        let now = Instant::now();
+        let mut window = TicketRetryWindow::default();
+        window.defer(now, u64::MAX);
+        window.defer(now + Duration::from_secs(10), 1);
+        assert_eq!(window.remaining(now), Some(MAX_RETRY_AFTER_SECONDS));
+        assert_eq!(window.remaining(now + Duration::from_secs(300)), None);
+    }
+
+    #[test]
+    fn ticket_backoff_applies_to_throttling_and_service_pressure() {
+        for code in [429, 503] {
+            assert_eq!(
+                retryable_ticket_delay(reqwest::StatusCode::from_u16(code).unwrap(), 120),
+                Some(120)
+            );
+        }
+        for code in [400, 401, 403, 426, 500] {
+            assert_eq!(
+                retryable_ticket_delay(reqwest::StatusCode::from_u16(code).unwrap(), 120),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_falls_back_when_absent_or_unparseable() {
+        // An HTTP-date is legal per the spec but not something the web app
+        // sends. Parsing it as 0 would retry immediately into the throttle,
+        // which is the exact loop this whole change exists to stop.
+        assert_eq!(parse_retry_after(None), DEFAULT_RETRY_AFTER_SECONDS);
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            DEFAULT_RETRY_AFTER_SECONDS
+        );
+        assert_eq!(parse_retry_after(Some("")), DEFAULT_RETRY_AFTER_SECONDS);
+        assert_eq!(parse_retry_after(Some("0")), DEFAULT_RETRY_AFTER_SECONDS);
+    }
+
+    #[test]
+    fn retry_after_is_capped_so_a_bad_value_cannot_park_the_client() {
+        assert_eq!(parse_retry_after(Some("999999")), MAX_RETRY_AFTER_SECONDS);
+    }
+
+    #[test]
+    fn rate_limited_is_distinct_from_a_generic_api_error() {
+        // The retry loop keys off this distinction: RateLimited must not count
+        // toward the consecutive-failure tally that forces a re-login.
+        let limited = AuthError::RateLimited(30);
+        assert!(matches!(limited, AuthError::RateLimited(_)));
+        assert!(!matches!(limited, AuthError::ApiError(_)));
+
+        let generic = AuthError::ApiError("Refresh failed: 500".to_string());
+        assert!(!matches!(generic, AuthError::RateLimited(_)));
+    }
+
+    #[test]
+    fn exchange_oauth_payload_includes_hwid_when_available() {
+        let client = AuthClient::with_device_hwid(Some("hwid:v1:abc".to_string()));
+
+        let payload = client.exchange_oauth_payload("exchange", "state");
+
+        assert_eq!(payload["exchange_token"], "exchange");
+        assert_eq!(payload["state"], "state");
+        assert_eq!(payload["device_hwid"], "hwid:v1:abc");
+    }
+
+    #[test]
+    fn exchange_oauth_payload_omits_missing_hwid() {
+        let client = AuthClient::with_device_hwid(None);
+
+        let payload = client.exchange_oauth_payload("exchange", "state");
+
+        assert!(payload.get("device_hwid").is_none());
+    }
+
+    #[test]
+    fn ticket_401_is_a_dead_session_not_a_generic_api_error() {
+        // The distinction matters: a generic ApiError left the user signed in
+        // and unable to connect, with "not authorized" and no hint that signing
+        // out and back in was the fix. RefreshTokenInvalid ends the session for
+        // them.
+        let body = r#"{"error":"Unauthorized"}"#;
+        assert!(update_required_error(reqwest::StatusCode::UNAUTHORIZED, body).is_none());
+        assert!(user_banned_error_from_body(body).is_none());
+        assert!(free_tier_limit_error(reqwest::StatusCode::UNAUTHORIZED, body).is_none());
+    }
+
+    #[test]
+    fn free_tier_limit_detected_and_message_passed_through() {
+        let err = free_tier_limit_error(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":"free_tier_limit_reached","message":"You've used your 3 hours of free SwiftTunnel time.","limit_seconds":10800,"remaining_seconds":0,"temporary":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(err, AuthError::FreeTierLimitReached(_)));
+        assert_eq!(
+            err.to_string(),
+            "You've used your 3 hours of free SwiftTunnel time."
+        );
+    }
+
+    #[test]
+    fn free_tier_limit_ignores_the_ip_rate_limiter() {
+        // The same route answers 429 for per-IP flooding; that one *is* worth
+        // retrying, so it must not be mistaken for a spent allowance.
+        assert!(
+            free_tier_limit_error(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":"rate_limited"}"#,
+            )
+            .is_none()
+        );
+    }
+
+    /// The lockout has to be liftable.
+    ///
+    /// It was a OnceLock, so one 426 held the client in a forced-update gate
+    /// for the life of the process even after the server started serving it
+    /// again. The floor is an environment variable and can be lowered, or set
+    /// by mistake, so "the server rejected us once" is not a permanent truth.
+    /// In Lite the gate also disables the connect button, which made this a
+    /// dead app rather than a wrong message.
+    #[test]
+    fn the_update_gate_lifts_once_the_server_serves_us_again() {
+        let _guard = gate_lock();
+
+        let _ = update_required_error(
+            reqwest::StatusCode::UPGRADE_REQUIRED,
+            r#"{"code":"update_required","error":"Please update."}"#,
+        );
+        assert_eq!(update_required_message().as_deref(), Some("Please update."));
+
+        note_server_served_us(API_HOSTS[0]);
+        assert_eq!(
+            update_required_message(),
+            None,
+            "a server that answers us has not locked this build out"
+        );
+    }
+
+    /// Clearing when nothing is set must not be a special case.
+    #[test]
+    fn clearing_an_unset_gate_is_harmless() {
+        let _guard = gate_lock();
+        if let Ok(mut held) = UPDATE_REQUIRED_MESSAGE.write() {
+            *held = None;
+        }
+        note_server_served_us(API_HOSTS[0]);
+        assert_eq!(update_required_message(), None);
+    }
+
+    /// Process-wide state, so every test that touches the gate has to hold
+    /// this, not just the two that read it back.
+    ///
+    /// `update_required_error` latches the message into UPDATE_REQUIRED_MESSAGE
+    /// whenever it detects one, so the detection tests below are writers too.
+    /// They did not take the lock, and one of them landing between the "set it"
+    /// and "clear it" halves of `the_update_gate_lifts_once_the_server_serves_us_again`
+    /// left the gate set and failed it. It only failed under parallelism, which
+    /// is why it read as flaky rather than as a missing lock.
+    static UPDATE_GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the gate lock, ignoring poisoning.
+    ///
+    /// A failing test panics while holding it, and a poisoned mutex would then
+    /// turn one real failure into a cascade of unrelated ones.
+    fn gate_lock() -> std::sync::MutexGuard<'static, ()> {
+        UPDATE_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn another_provider_cannot_clear_our_minimum_version_gate() {
+        let _guard = gate_lock();
+        let _ = update_required_error(
+            reqwest::StatusCode::UPGRADE_REQUIRED,
+            r#"{"code":"update_required","error":"Please update."}"#,
+        );
+        // Fixed-provider requests pass an empty base rather than an API host.
+        note_server_served_us("");
+        note_server_served_us(SUPABASE_URL);
+        assert_eq!(update_required_message().as_deref(), Some("Please update."));
+        note_server_served_us(API_HOSTS[0]);
+        assert!(update_required_message().is_none());
+    }
+
+    /// This one had lost its `#[test]` to a stray duplicate attribute on the
+    /// test above, so it had not run at all: 426 is the status the server
+    /// actually sends for a version lockout, and nothing was checking it.
+    #[test]
+    fn update_required_detected_by_status_426() {
+        let _guard = gate_lock();
+
+        let err = update_required_error(
+            reqwest::StatusCode::from_u16(426).unwrap(),
+            r#"{"error":"Please update.","code":"update_required","min_version":"2.6.0"}"#,
+        )
+        .unwrap();
+        assert!(matches!(err, AuthError::UpdateRequired(_)));
+        assert_eq!(err.to_string(), "Please update.");
+    }
+
+    #[test]
+    fn update_required_detected_by_code_without_426() {
+        let _guard = gate_lock();
+
+        let err = update_required_error(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"error":"Old build.","code":"update_required"}"#,
+        )
+        .unwrap();
+        assert_eq!(err.to_string(), "Old build.");
+    }
+
+    #[test]
+    fn update_required_falls_back_to_default_message_on_bare_426() {
+        let _guard = gate_lock();
+
+        let err = update_required_error(
+            reqwest::StatusCode::from_u16(426).unwrap(),
+            "upgrade required",
+        )
+        .unwrap();
+        assert!(err.to_string().contains("no longer supported"));
+    }
+
+    #[test]
+    fn non_update_errors_are_not_update_required() {
+        assert!(
+            update_required_error(
+                reqwest::StatusCode::FORBIDDEN,
+                r#"{"error":"User banned","code":"user_banned"}"#,
+            )
+            .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod bounded_response_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    async fn loopback_response(wire: Vec<u8>) -> reqwest::Response {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request);
+            socket.write_all(&wire).unwrap();
+        });
+        let response = Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        server.join().unwrap();
+        response
+    }
+
+    #[test]
+    fn explicit_auth_policy_decisions_cannot_select_an_alternate_provider() {
+        for error in [
+            AuthError::InvalidCredentials,
+            AuthError::RateLimited(67),
+            AuthError::UserBanned(": test policy".into()),
+            AuthError::UpdateRequired("Update first".into()),
+            AuthError::RefreshTokenInvalid,
+            AuthError::FreeTierLimitReached("Allowance exhausted".into()),
+        ] {
+            assert!(!auth_fallback_allowed(&error));
+        }
+        assert!(auth_fallback_allowed(&AuthError::NetworkError(
+            "offline".into()
+        )));
+        assert!(auth_fallback_allowed(&AuthError::ApiError(
+            "upstream unavailable".into()
+        )));
+    }
+
+    #[tokio::test]
+    async fn sign_in_and_refresh_keep_retry_after_even_with_an_unreadable_error_body() {
+        let client = AuthClient::with_device_hwid(None);
+        for length in [0, AUTH_ERROR_LIMIT + 1] {
+            let wire = format!("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 67\r\nContent-Length: {length}\r\n\r\n").into_bytes();
+            let error = client
+                .parse_password_sign_in_response(loopback_response(wire.clone()).await)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, AuthError::RateLimited(67)));
+            assert!(!auth_fallback_allowed(&error));
+            let error = parse_refresh_response(loopback_response(wire).await)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, AuthError::RateLimited(67)));
+            assert!(!auth_fallback_allowed(&error));
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_password_is_not_retried_through_the_second_provider() {
+        let body = r#"{"error":"Invalid login credentials"}"#;
+        let wire = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let client = AuthClient::with_device_hwid(None);
+        let error = client
+            .parse_password_sign_in_response(loopback_response(wire).await)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuthError::InvalidCredentials));
+        assert!(!auth_fallback_allowed(&error));
+        assert_eq!(error.to_string(), "Invalid email or password");
+    }
+
+    #[tokio::test]
+    async fn refresh_parser_preserves_bans_revocation_and_successful_sessions() {
+        for (status, body, expected) in [
+            (
+                "403 Forbidden",
+                r#"{"code":"user_banned","banned_reason":"test policy"}"#,
+                "banned",
+            ),
+            (
+                "400 Bad Request",
+                r#"{"error":"refresh_token_already_used"}"#,
+                "revoked",
+            ),
+            (
+                "200 OK",
+                r#"{"access_token":"test-access","refresh_token":"test-refresh","expires_in":3600,"token_type":"bearer","user":{"id":"owned-test","email":"owned@example.invalid"}}"#,
+                "session",
+            ),
+        ] {
+            let wire = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes();
+            let result = parse_refresh_response(loopback_response(wire).await).await;
+            match expected {
+                "banned" => assert!(matches!(result, Err(AuthError::UserBanned(_)))),
+                "revoked" => assert!(matches!(result, Err(AuthError::RefreshTokenInvalid))),
+                _ => assert_eq!(result.unwrap().user.id, "owned-test"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_json_is_preserved_and_oversized_json_is_rejected() {
+        let body = br#"{"user_id":"test-player","remaining_seconds":123}"#;
+        let mut wire =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        wire.extend_from_slice(body);
+        let parsed: serde_json::Value =
+            read_auth_json(loopback_response(wire).await, "test response")
+                .await
+                .unwrap();
+        assert_eq!(parsed["remaining_seconds"], 123);
+        let wire = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            AUTH_JSON_LIMIT + 1
+        )
+        .into_bytes();
+        let error =
+            read_auth_json::<serde_json::Value>(loopback_response(wire).await, "test response")
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("download limit"));
+    }
+
+    #[tokio::test]
+    async fn bounded_errors_preserve_ban_details_and_reject_large_proxy_pages() {
+        let body =
+            br#"{"error":"User banned","code":"user_banned","banned_reason":"test restriction"}"#;
+        let mut wire = format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        wire.extend_from_slice(body);
+        let text = read_auth_error(loopback_response(wire).await).await;
+        assert!(user_banned_error_from_body(&text).is_some());
+        let wire = format!(
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: {}\r\n\r\n",
+            AUTH_ERROR_LIMIT + 1
+        )
+        .into_bytes();
+        assert!(
+            read_auth_error(loopback_response(wire).await)
+                .await
+                .contains("download limit")
+        );
+    }
+}

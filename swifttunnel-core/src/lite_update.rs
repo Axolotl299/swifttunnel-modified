@@ -1,0 +1,605 @@
+//! Keeping SwiftTunnel Lite up to date.
+//!
+//! Lite had no updater at all. That is tolerable for an app nobody can be
+//! forced off, and it stops being tolerable the moment a version floor exists:
+//! a client that cannot update and is refused by the server is simply dead, and
+//! its owner has no way to know that downloading it again is the fix.
+//!
+//! # What is trusted
+//!
+//! Nothing that is not signed. The release publishes a small manifest signed
+//! with our Ed25519 key, and that manifest carries each Lite installer's URL
+//! and SHA-256. So:
+//!
+//! 1. Fetch the manifest and its detached signature.
+//! 2. Verify the signature against the key compiled into this build.
+//! 3. Read the installer entry for this architecture out of the *verified*
+//!    manifest.
+//! 4. Download it and check its SHA-256 against the one the manifest gave.
+//! 5. Only then hand the file to `msiexec`.
+//!
+//! Anything that fails leaves the installed version alone. An update that
+//! cannot be verified is not an update, and refusing it is always safer than
+//! running it: the cost of skipping one is an out of date client, and the cost
+//! of running the wrong one is arbitrary code as administrator.
+//!
+//! Unlike the desktop updater this does not go through the GitHub releases API
+//! at all. `releases/latest/download/...` redirects to whatever the newest
+//! release is, which needs no token, no rate limit budget, and no release
+//! listing to parse.
+
+use semver::Version;
+use serde::Deserialize;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::update_verify::{
+    stable_manifest_signature_url, verify_bytes_sha256, verify_manifest_signature_with_public_key,
+};
+
+const MANIFEST_URL: &str = "https://github.com/Swift-tunnel/swifttunnel-app/releases/latest/download/swifttunnel-update-manifest.json";
+
+/// Replaced at build time. A build that still carries this cannot verify
+/// anything and refuses to update rather than trusting a download.
+const PUBLIC_KEY_PLACEHOLDER: &str = "REPLACE_WITH_UPDATE_MANIFEST_PUBLIC_KEY_B64";
+
+/// Nothing we publish is anywhere near this. It exists so a redirect to
+/// something enormous cannot be streamed into memory.
+const MAX_INSTALLER_BYTES: u64 = 128 * 1024 * 1024;
+
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const INSTALLER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+static DOWNLOAD_SLOT: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
+
+#[derive(Debug, Deserialize)]
+struct SignedManifest {
+    version: String,
+    tag: String,
+    #[serde(default)]
+    lite: Option<LiteAssets>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LiteAssets {
+    #[serde(default)]
+    x64: Option<LiteAsset>,
+    #[serde(default)]
+    arm64: Option<LiteAsset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LiteAsset {
+    file: String,
+    url: String,
+    sha256: String,
+    #[serde(default)]
+    size: u64,
+}
+
+/// A newer Lite that the signed manifest vouches for.
+#[derive(Debug, Clone)]
+pub struct AvailableUpdate {
+    pub version: Version,
+    pub tag: String,
+    pub file: String,
+    url: String,
+    sha256: String,
+    size: u64,
+}
+
+impl AvailableUpdate {
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+/// The key this build verifies manifests with.
+///
+/// Release builds trust only the build-time key. Runtime overrides are for
+/// debug builds only. A missing build-time key refuses verification.
+fn manifest_public_key_b64() -> Result<String, String> {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = std::env::var("SWIFTTUNNEL_UPDATE_MANIFEST_PUBLIC_KEY_B64") {
+        let value = value.trim();
+        if !value.is_empty() && value != PUBLIC_KEY_PLACEHOLDER {
+            return Ok(value.to_string());
+        }
+    }
+    let key = option_env!("SWIFTTUNNEL_UPDATE_MANIFEST_PUBLIC_KEY_B64")
+        .unwrap_or(PUBLIC_KEY_PLACEHOLDER)
+        .trim()
+        .to_string();
+
+    if key.is_empty() || key == PUBLIC_KEY_PLACEHOLDER {
+        return Err("this build has no update manifest key, so updates cannot be verified".into());
+    }
+    Ok(key)
+}
+
+/// Which installer this build should replace itself with.
+///
+/// Its own architecture, deliberately, not the machine's. An x64 build running
+/// under emulation on an ARM64 machine is still an x64 product, and swapping it
+/// for the ARM64 one mid-update changes which product is installed.
+fn asset_for_this_build(assets: &LiteAssets) -> Option<&LiteAsset> {
+    if cfg!(target_arch = "aarch64") {
+        assets.arm64.as_ref()
+    } else {
+        assets.x64.as_ref()
+    }
+}
+
+fn http_client(timeout: std::time::Duration) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(30))
+        .timeout(timeout)
+        .user_agent(concat!("SwiftTunnel-Lite/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| format!("could not build an HTTP client: {e}"))
+}
+
+/// Is there a newer Lite than `current_version`?
+///
+/// `Ok(None)` means up to date. An error means we could not find out, which is
+/// not the same thing and must not be reported as being current.
+pub async fn check_for_update(current_version: &str) -> Result<Option<AvailableUpdate>, String> {
+    let current = Version::parse(current_version.trim_start_matches('v'))
+        .map_err(|e| format!("this build has an unreadable version '{current_version}': {e}"))?;
+
+    let public_key = base64_decode(&manifest_public_key_b64()?)?;
+    let client = http_client(REQUEST_TIMEOUT)?;
+
+    let manifest_bytes = fetch(&client, MANIFEST_URL, "update manifest", 1024 * 1024).await?;
+    let signature_url = stable_manifest_signature_url(&manifest_bytes)?;
+    let signature =
+        String::from_utf8(fetch(&client, &signature_url, "manifest signature", 4096).await?)
+            .map_err(|_| "the manifest signature was not text".to_string())?;
+
+    // Against the bytes as fetched. Parsing and re-encoding would change the
+    // whitespace the signature was made over.
+    verify_manifest_signature_with_public_key(&manifest_bytes, &signature, &public_key)?;
+
+    let manifest: SignedManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| format!("the update manifest could not be read: {e}"))?;
+
+    let latest = Version::parse(manifest.version.trim_start_matches('v')).map_err(|e| {
+        format!(
+            "the manifest version '{}' is unreadable: {e}",
+            manifest.version
+        )
+    })?;
+
+    if latest <= current {
+        return Ok(None);
+    }
+
+    let assets = manifest
+        .lite
+        .as_ref()
+        .ok_or("the latest release publishes no Lite installer")?;
+    let asset = asset_for_this_build(assets)
+        .ok_or("the latest release has no Lite installer for this architecture")?;
+
+    Ok(Some(AvailableUpdate {
+        version: latest,
+        tag: manifest.tag,
+        file: asset.file.clone(),
+        url: asset.url.clone(),
+        sha256: asset.sha256.clone(),
+        size: asset.size,
+    }))
+}
+
+/// Download the installer, check it against the manifest, and save it.
+///
+/// Returns the path it was written to. Saved under `%ProgramData%` rather than
+/// a temporary directory: Windows records the folder an install ran from as the
+/// product's source and needs it again to remove that version later, and a
+/// temporary one is gone by then.
+pub async fn download_verified(
+    update: &AvailableUpdate,
+) -> Result<swifttunnel_installer_cache::ProtectedInstaller, String> {
+    let permit = reserve_download(DOWNLOAD_SLOT.clone())?;
+    let client = http_client(INSTALLER_TIMEOUT)?;
+    let limit = if update.size == 0 {
+        MAX_INSTALLER_BYTES
+    } else {
+        update.size.min(MAX_INSTALLER_BYTES)
+    };
+    let bytes = fetch(&client, &update.url, &update.file, limit as usize).await?;
+
+    let update = update.clone();
+    stage_on_blocking_pool(permit, move || verify_and_stage(&update, bytes)).await
+}
+
+fn reserve_download(slots: Arc<Semaphore>) -> Result<OwnedSemaphorePermit, String> {
+    slots.try_acquire_owned().map_err(|_| {
+        "A Lite installer is still being prepared. Wait for it to finish, then retry.".into()
+    })
+}
+
+async fn stage_on_blocking_pool<T: Send + 'static>(
+    permit: OwnedSemaphorePermit,
+    stage: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    // A cancelled future aborts queued jobs. A running filesystem operation
+    // retains its permit and bytes until it returns, without blocking the
+    // runtime or admitting more abandoned staging jobs.
+    let mut worker = tokio::task::JoinSet::new();
+    worker.spawn_blocking(move || {
+        let _permit = permit;
+        stage()
+    });
+    let failure = || "Could not finish preparing the Lite installer. Please retry.".to_string();
+    worker
+        .join_next()
+        .await
+        .ok_or_else(failure)?
+        .map_err(|error| {
+            log::warn!("Lite installer staging worker failed: {error}");
+            failure()
+        })?
+}
+
+fn verify_and_stage(
+    update: &AvailableUpdate,
+    bytes: Vec<u8>,
+) -> Result<swifttunnel_installer_cache::ProtectedInstaller, String> {
+    // The manifest is signed, so its size is trustworthy and a mismatch means
+    // this is not the file it described.
+    if update.size > 0 && bytes.len() as u64 != update.size {
+        return Err(format!(
+            "{} is {} bytes, the signed manifest says {}",
+            update.file,
+            bytes.len(),
+            update.size
+        ));
+    }
+
+    verify_bytes_sha256(&bytes, &update.sha256, &update.file)?;
+
+    let installer = swifttunnel_installer_cache::InstallerCache::open()
+        .and_then(|cache| cache.stage(&update.file, &bytes))
+        .map_err(|e| format!("Could not prepare the protected installer cache: {e}. If Retry fails, use the signed MSI from the official release or contact support@swifttunnel.net."))?;
+
+    log::info!(
+        "verified {} ({} bytes) and staged it at {}",
+        update.file,
+        bytes.len(),
+        installer.path().display()
+    );
+    Ok(installer)
+}
+
+/// Hand a verified installer to msiexec.
+///
+/// Only ever called with a path returned by [`download_verified`], which is
+/// what makes this safe: by here the bytes have been checked against a signed
+/// manifest.
+pub fn launch_installer(
+    installer: &swifttunnel_installer_cache::ProtectedInstaller,
+) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    // Lite exits after handover. Its read guard lasts until then; the protected
+    // owner/DACL keeps the immutable source safe for later installer reads.
+    let msiexec =
+        swifttunnel_installer_cache::windows_installer_path().map_err(|e| e.to_string())?;
+    launch_after_repair(
+        || swifttunnel_msi_repair::repair().map(|cleared| cleared.len()),
+        || {
+            std::process::Command::new(msiexec)
+                .arg("/i")
+                .arg(installer.path())
+                .creation_flags(0x0800_0000)
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| format!("could not start the installer: {e}"))
+        },
+    )
+}
+
+fn launch_after_repair(
+    repair: impl FnOnce() -> Result<usize, String>,
+    launch: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    // Startup is not a lasting guarantee: cleanup can remove the old package
+    // while Lite is open. Both manual and automatic updates come through here.
+    // Match Desktop's best-effort policy, since Windows may still find another
+    // valid source when inspection or repair is unavailable.
+    match repair() {
+        Ok(count) if count > 0 => {
+            log::warn!("cleared {count} orphaned SwiftTunnel registration(s) before Lite update");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            log::warn!("could not check installer registration before Lite update: {error}")
+        }
+    }
+    launch()
+}
+
+/// Remember that an installer was launched for this version.
+///
+/// Written immediately before handing over to msiexec, because the process
+/// exits straight afterwards and gets no chance to write anything later.
+pub fn record_install_attempt(version: &Version) {
+    if let Ok(cache) = swifttunnel_installer_cache::InstallerCache::open() {
+        let _ = cache.write_note(
+            swifttunnel_installer_cache::CacheNote::LiteAttempt,
+            version.to_string().as_bytes(),
+        );
+    }
+}
+
+/// Did we already run an installer for this version and end up still on the
+/// old one?
+///
+/// The guard against an update that cannot succeed. The manifest's version
+/// comes from the release, and the installer's from Lite's own crate version;
+/// they are kept equal by a check at build time, but if they ever drifted the
+/// client would install a build that is not the version it was promised,
+/// restart still out of date, see the same update again, and reinstall every
+/// forty-five seconds forever. A CI check is too thin a thing to stand between
+/// a user and that.
+///
+/// Only consulted by the automatic path. Someone who presses the button on the
+/// update screen has asked for it explicitly and is told plainly if it fails,
+/// so refusing them would only leave them stuck.
+pub fn already_attempted(version: &Version) -> bool {
+    let Ok(cache) = swifttunnel_installer_cache::InstallerCache::open() else {
+        return false;
+    };
+    let Ok(recorded) = cache.read_note(swifttunnel_installer_cache::CacheNote::LiteAttempt) else {
+        return false;
+    };
+    attempt_matches_version(&recorded, version)
+}
+
+fn attempt_matches_version(recorded: &str, version: &Version) -> bool {
+    Version::parse(recorded.trim()).is_ok_and(|tried| &tried == version)
+}
+
+/// Forget the last attempt, once this build is the version that was wanted.
+pub fn clear_install_attempt() {
+    if let Ok(cache) = swifttunnel_installer_cache::InstallerCache::open() {
+        let _ = cache.write_note(swifttunnel_installer_cache::CacheNote::LiteAttempt, b"");
+    }
+}
+
+fn base64_decode(value: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(value.trim())
+        .map_err(|e| format!("the update manifest key is not valid base64: {e}"))
+}
+
+async fn fetch(
+    client: &reqwest::Client,
+    url: &str,
+    what: &str,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("could not fetch the {what}: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "could not fetch the {what}: server said {}",
+            response.status()
+        ));
+    }
+
+    crate::http_body::read_bounded(response, limit, what).await
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn cancelled_staging_keeps_its_permit_without_blocking_the_runtime() {
+        use std::time::Duration;
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = super::reserve_download(slots.clone()).unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let task = tokio::spawn(super::stage_on_blocking_pool(permit, move || {
+            let _ = started.send(());
+            let _ = resume.recv_timeout(Duration::from_secs(3));
+            Ok(7)
+        }));
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        // This current-thread runtime is still able to cancel the owner while
+        // the injected filesystem operation is deliberately waiting.
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let duplicate = super::reserve_download(slots.clone());
+        let _ = release.send(());
+        assert!(
+            duplicate.is_err(),
+            "a cancelled owner must not admit another staging job"
+        );
+        let permit = tokio::time::timeout(Duration::from_secs(2), slots.acquire_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(super::stage_on_blocking_pool(permit, || Ok(9)).await, Ok(9));
+    }
+
+    #[test]
+    fn bad_download_size_or_hash_is_rejected_before_opening_the_installer_cache() {
+        let mut update = super::AvailableUpdate {
+            version: semver::Version::parse("3.9.5").unwrap(),
+            tag: "v3.9.5".into(),
+            file: "owned-fixture.msi".into(),
+            url: "https://example.invalid/fixture.msi".into(),
+            sha256: "00".repeat(32),
+            size: 3,
+        };
+        assert!(
+            super::verify_and_stage(&update, vec![1, 2])
+                .err()
+                .expect("size mismatch must precede cache access")
+                .contains("signed manifest")
+        );
+        update.size = 2;
+        assert!(super::verify_and_stage(&update, vec![1, 2]).is_err());
+    }
+
+    use super::*;
+
+    #[test]
+    fn update_rechecks_an_orphan_created_after_lite_started() {
+        use std::cell::Cell;
+        // Model a healthy startup followed by a cleanup tool removing the MSI.
+        // The launch double refuses the upgrade while that orphan survives.
+        let orphan = Cell::new(false);
+        assert!(!orphan.get());
+        orphan.set(true);
+        let result = launch_after_repair(
+            || {
+                orphan.set(false);
+                Ok(1)
+            },
+            || {
+                if orphan.get() {
+                    Err("old package unavailable".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn repair_failure_still_allows_windows_to_resolve_another_source() {
+        let result = launch_after_repair(|| Err("registry unavailable".into()), || Ok(()));
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn repaired_registration_does_not_hide_installer_launch_failure() {
+        assert_eq!(
+            launch_after_repair(|| Ok(1), || Err("launch denied".into())),
+            Err("launch denied".into()),
+        );
+    }
+
+    fn assets(x64: Option<&str>, arm64: Option<&str>) -> LiteAssets {
+        let make = |file: &str| LiteAsset {
+            file: file.to_string(),
+            url: format!("https://example.invalid/{file}"),
+            sha256: "00".repeat(32),
+            size: 10,
+        };
+        LiteAssets {
+            x64: x64.map(make),
+            arm64: arm64.map(make),
+        }
+    }
+
+    /// A version installed once that did not take is not tried again on its
+    /// own.
+    ///
+    /// Without this an update that can never succeed reinstalls itself every
+    /// forty-five seconds forever. The manifest's version comes from the
+    /// release and the installer's from Lite's crate version; a build-time
+    /// check keeps them equal, and this is what stands there if it ever fails.
+    #[test]
+    fn a_version_already_attempted_is_not_retried() {
+        // Persistence is tested by the cache library. Never clear a real
+        // machine's auto-update marker or silently pass without write access.
+        let wanted = Version::parse("9.9.9").unwrap();
+        assert!(attempt_matches_version("9.9.9\n", &wanted));
+        for recorded in ["", "invalid", "9.9.10", "3.1.6"] {
+            assert!(!attempt_matches_version(recorded, &wanted));
+        }
+    }
+
+    /// A build must replace itself with its own architecture.
+    ///
+    /// An x64 build running under emulation on an ARM64 machine is still the
+    /// x64 product. Handing it the ARM64 installer would change which product
+    /// is installed partway through an update.
+    #[test]
+    fn a_build_updates_to_its_own_architecture() {
+        let both = assets(Some("lite_x64.msi"), Some("lite_arm64.msi"));
+        let chosen = asset_for_this_build(&both).expect("an entry for this build");
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(chosen.file, "lite_arm64.msi");
+        } else {
+            assert_eq!(chosen.file, "lite_x64.msi");
+        }
+    }
+
+    /// Missing our architecture is refused, not silently swapped for the other.
+    #[test]
+    fn a_missing_architecture_is_not_substituted() {
+        let only_other = if cfg!(target_arch = "aarch64") {
+            assets(Some("lite_x64.msi"), None)
+        } else {
+            assets(None, Some("lite_arm64.msi"))
+        };
+        assert!(asset_for_this_build(&only_other).is_none());
+    }
+
+    /// A build with no key compiled in must refuse to update rather than
+    /// install something it cannot check.
+    #[test]
+    fn a_build_without_a_key_refuses_to_verify() {
+        // Only meaningful when the environment is not supplying one.
+        if std::env::var("SWIFTTUNNEL_UPDATE_MANIFEST_PUBLIC_KEY_B64").is_ok() {
+            return;
+        }
+        if option_env!("SWIFTTUNNEL_UPDATE_MANIFEST_PUBLIC_KEY_B64").is_some() {
+            return;
+        }
+        let error = manifest_public_key_b64().expect_err("a keyless build cannot verify");
+        assert!(
+            error.contains("cannot be verified"),
+            "the error should say verification is impossible, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_without_lite_is_reported_not_ignored() {
+        let manifest: SignedManifest =
+            serde_json::from_str(r#"{"version":"9.9.9","tag":"v9.9.9"}"#).unwrap();
+        assert!(manifest.lite.is_none());
+    }
+
+    /// The fields the updater depends on must survive a real manifest shape,
+    /// including keys it does not know about.
+    #[test]
+    fn a_manifest_with_lite_parses() {
+        let manifest: SignedManifest = serde_json::from_str(
+            r#"{
+                "version":"3.1.3","tag":"v3.1.3","channel_class":"stable",
+                "latest_json_url":"https://example.invalid/latest.json",
+                "latest_json_sha256":"abc",
+                "lite":{
+                  "x64":{"file":"SwiftTunnelLite_3.1.3_x64_en-US.msi",
+                         "url":"https://example.invalid/x64.msi",
+                         "sha256":"aa","size":123},
+                  "arm64":{"file":"SwiftTunnelLite_3.1.3_arm64_en-US.msi",
+                           "url":"https://example.invalid/arm64.msi",
+                           "sha256":"bb","size":456}
+                }
+            }"#,
+        )
+        .expect("a real manifest shape must parse");
+
+        assert_eq!(manifest.version, "3.1.3");
+        let lite = manifest.lite.expect("lite entries");
+        assert_eq!(lite.x64.unwrap().size, 123);
+        assert_eq!(lite.arm64.unwrap().sha256, "bb");
+    }
+}

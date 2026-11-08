@@ -1,0 +1,314 @@
+pub const ROBLOX_PROCESS_NAMES: &[&str] = &[
+    "robloxplayerbeta.exe",
+    "robloxplayer.exe",
+    "robloxapp.exe",
+    "robloxplayerlauncher.exe",
+    "robloxstudiobeta.exe",
+    "robloxstudio.exe",
+    "robloxstudiolauncherbeta.exe",
+    "robloxstudiolauncher.exe",
+    // First-party installers. These run BEFORE the player/studio binaries exist
+    // and fetch clientsettings/version from clientsettingscdn.roblox.com; in a
+    // blocked country an un-tunnelled installer fails with SslConnectFail
+    // ("Continue installation without flag settings ..."). Tunnel-eligible like
+    // the other Roblox processes - their TCP is direct anyway unless the user
+    // enables Route Assist/Bypass, so non-blocked users are unaffected.
+    "robloxstudioinstaller.exe",
+    "robloxplayerinstaller.exe",
+];
+
+/// The in-game player clients — present only while the user is actually inside a
+/// Roblox experience (RobloxPlayerBeta launches on join and exits on leave).
+/// Deliberately excludes the launcher/bootstrapper (which lingers while the app
+/// idles on the website), Studio, and installers, so the UI can tell "in a game"
+/// apart from "the Roblox app is merely open in the background".
+pub const ROBLOX_PLAYER_PROCESS_NAMES: &[&str] = &["robloxplayerbeta.exe", "robloxplayer.exe"];
+
+/// Third-party Roblox bootstrappers ("strappers").
+///
+/// These are tunnelled ONLY while "Bypass Country Bans" is enabled (the
+/// injection happens in `VpnConnection::connect`). Their launch-time
+/// `clientsettings`/update fetches otherwise hit a country block directly and
+/// time out (`clientsettings.roblox.com:443`). They are deliberately kept OUT
+/// of `ROBLOX_PROCESS_NAMES`: routing a non-blocked user's strapper traffic
+/// through the relay would add latency for no reason. Entries must be
+/// lowercase to match the tunnel-app set convention.
+pub const STRAPPER_PROCESS_NAMES: &[&str] = &[
+    "bloxstrap.exe",
+    "fishstrap.exe",
+    "froststrap.exe",
+    "bubblestrap.exe",
+    "voidstrap.exe",
+    "voidstrap.desktop.windows.exe",
+];
+
+fn basename(name: &str) -> &str {
+    name.rsplit(['\\', '/']).next().unwrap_or(name)
+}
+
+fn process_stem(name: &str) -> &str {
+    basename(name).trim_end_matches(".exe")
+}
+
+fn is_roblox_process_name_lowercase(process_name_lower: &str) -> bool {
+    let stem = process_stem(process_name_lower);
+    ROBLOX_PROCESS_NAMES
+        .iter()
+        .map(|candidate| process_stem(candidate))
+        .any(|candidate_stem| candidate_stem == stem)
+}
+
+fn is_roblox_tunnel_alias_lowercase(alias_lower: &str) -> bool {
+    process_stem(alias_lower) == "roblox" || is_roblox_process_name_lowercase(alias_lower)
+}
+
+fn is_generic_store_host_lowercase(name_lower: &str) -> bool {
+    process_stem(name_lower) == "windows10universal"
+}
+
+pub fn process_name_matches_alias(process_name: &str, alias: &str) -> bool {
+    let process_name = basename(process_name).to_ascii_lowercase();
+    let alias = basename(alias).to_ascii_lowercase();
+    process_stem(&process_name) == process_stem(&alias)
+}
+
+pub fn process_name_matches_tunnel_app(process_name_lower: &str, tunnel_app_lower: &str) -> bool {
+    if is_generic_store_host_lowercase(process_name_lower)
+        || is_generic_store_host_lowercase(tunnel_app_lower)
+    {
+        return false;
+    }
+
+    let name_stem = process_stem(process_name_lower);
+    let app_stem = process_stem(tunnel_app_lower);
+    name_stem == app_stem
+        || (is_roblox_process_name_lowercase(process_name_lower)
+            && is_roblox_tunnel_alias_lowercase(tunnel_app_lower))
+}
+
+pub fn process_name_matches_any_tunnel_app<'a>(
+    process_name_lower: &str,
+    tunnel_apps_lower: impl IntoIterator<Item = &'a String>,
+) -> bool {
+    tunnel_apps_lower
+        .into_iter()
+        .any(|app| process_name_matches_tunnel_app(process_name_lower, app))
+}
+
+#[cfg(any(not(windows), test))]
+pub fn is_roblox_process_name(process_name: &str) -> bool {
+    // Process scans call this for every PID. Normalize once, rather than
+    // allocating both names again for every candidate in the known list.
+    let name = basename(process_name).to_ascii_lowercase();
+    is_roblox_process_name_lowercase(&name)
+}
+
+/// True only for the in-game Roblox player (see `ROBLOX_PLAYER_PROCESS_NAMES`).
+/// Use this for "is the user actually in a game" — not `is_roblox_process_name`,
+/// which also matches the launcher, Studio and installers.
+pub fn is_roblox_player_process_name(process_name: &str) -> bool {
+    let name = basename(process_name).to_ascii_lowercase();
+    let stem = process_stem(&name);
+    ROBLOX_PLAYER_PROCESS_NAMES
+        .iter()
+        .any(|candidate| process_stem(candidate) == stem)
+}
+
+/// True for Roblox Studio and its launcher/installer (everything whose name
+/// stems from `robloxstudio`).
+///
+/// Studio is a developer tool, not a game client — it never joins the game
+/// servers Route Assist optimizes for. Relaying it adds nothing and breaks
+/// Team Create, whose place-sync TCP exceeds the relay's forward buffer
+/// ("connectToTeamCreateSession: no response"). So it is dropped from the relay
+/// set outside country-ban bypass (where Studio still needs the relay just to
+/// reach a blocked Roblox). It stays in `ROBLOX_PROCESS_NAMES` for detection.
+pub fn is_roblox_studio_process_name(process_name: &str) -> bool {
+    process_stem(process_name)
+        .to_ascii_lowercase()
+        .starts_with("robloxstudio")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_roblox_process_name_matches_known_variants() {
+        for name in [
+            "RobloxPlayerBeta.exe",
+            "robloxplayer.exe",
+            "C:\\Program Files\\Roblox\\RobloxApp.exe",
+            "robloxstudiolauncherbeta.exe",
+            "RobloxStudioInstaller.exe",
+            r"C:\Users\me\AppData\Local\Roblox\RobloxStudioInstaller\RobloxStudioInstaller.exe",
+        ] {
+            assert!(is_roblox_process_name(name), "expected {name} to match");
+        }
+
+        // Windows10Universal.exe is the generic UWP app host: Photos, Calculator, every
+        // Microsoft Store app runs under that name. It is not tunnel-eligible.
+        assert!(!is_roblox_process_name("Windows10Universal.exe"));
+        assert!(!is_roblox_process_name("chrome.exe"));
+        assert!(!is_roblox_process_name("robloxhelper.exe"));
+    }
+
+    #[test]
+    fn test_is_roblox_process_name_rejects_store_package_path() {
+        assert!(!is_roblox_process_name(
+            r"C:\Program Files\WindowsApps\ROBLOXCORPORATION.ROBLOX_2.617.655.0_x64__55nm5eh3cm0pr\Windows10Universal.exe"
+        ));
+        assert!(!is_roblox_process_name(
+            r"\Device\HarddiskVolume3\Program Files\WindowsApps\ROBLOXCORPORATION.ROBLOX_2.617.655.0_x64__55nm5eh3cm0pr\Windows10Universal.exe"
+        ));
+        assert!(!is_roblox_process_name(
+            r"C:\Program Files\WindowsApps\Microsoft.MicrosoftSolitaireCollection_4.20.0.0_x64__8wekyb3d8bbwe\Windows10Universal.exe"
+        ));
+        assert!(!process_name_matches_tunnel_app(
+            r"c:\program files\windowsapps\microsoft.mahjong_1.0.0.0_x64__8wekyb3d8bbwe\windows10universal.exe",
+            "robloxplayerbeta.exe"
+        ));
+    }
+
+    #[test]
+    fn test_process_name_matches_tunnel_app_supports_generic_aliases() {
+        assert!(process_name_matches_tunnel_app(
+            "robloxapp.exe",
+            "robloxplayerbeta.exe"
+        ));
+        assert!(process_name_matches_tunnel_app(
+            "robloxplayerbeta.exe",
+            "roblox"
+        ));
+        assert!(!process_name_matches_tunnel_app("chrome.exe", "roblox"));
+        assert!(!process_name_matches_tunnel_app(
+            "robloxhelper.exe",
+            "roblox"
+        ));
+    }
+
+    #[test]
+    fn test_process_name_matches_tunnel_app_rejects_substring_lookalikes() {
+        assert!(!process_name_matches_tunnel_app(
+            "player.exe",
+            "robloxplayerbeta.exe"
+        ));
+        assert!(!process_name_matches_tunnel_app(
+            "window.exe",
+            "windows10universal.exe"
+        ));
+        assert!(!process_name_matches_tunnel_app(
+            "robloxstudiohelper.exe",
+            "robloxstudio.exe"
+        ));
+    }
+
+    #[test]
+    fn test_process_name_matches_tunnel_app_rejects_store_package_identity() {
+        assert!(!process_name_matches_tunnel_app(
+            r"c:\program files\windowsapps\robloxcorporation.roblox_2.617.655.0_x64__55nm5eh3cm0pr\windows10universal.exe",
+            "robloxplayerbeta.exe"
+        ));
+        assert!(!process_name_matches_tunnel_app(
+            "windows10universal.exe",
+            "robloxplayerbeta.exe"
+        ));
+        assert!(!process_name_matches_tunnel_app(
+            "windows10universal.exe",
+            "windows10universal.exe"
+        ));
+    }
+
+    #[test]
+    fn player_detection_means_in_game_only() {
+        for in_game in [
+            "RobloxPlayerBeta.exe",
+            "robloxplayer.exe",
+            r"C:\Users\me\AppData\Local\Roblox\Versions\v1\RobloxPlayerBeta.exe",
+        ] {
+            assert!(
+                is_roblox_player_process_name(in_game),
+                "expected {in_game} to count as in-game"
+            );
+        }
+        // The launcher/app host, Studio and installers all run while NOT in a
+        // game — they must not read as "in a game".
+        for idle in [
+            "RobloxPlayerLauncher.exe",
+            "robloxplayerlauncher.exe",
+            "RobloxStudioBeta.exe",
+            "RobloxPlayerInstaller.exe",
+            "Windows10Universal.exe",
+            "chrome.exe",
+        ] {
+            assert!(
+                !is_roblox_player_process_name(idle),
+                "expected {idle} NOT to count as in-game"
+            );
+        }
+    }
+
+    #[test]
+    fn strappers_are_lowercase_and_separate_from_core_roblox_processes() {
+        for process in [
+            "Voidstrap.exe",
+            r"C:\Launchers\Voidstrap.Desktop.Windows.exe",
+        ] {
+            let lower = process.to_ascii_lowercase();
+            let bypass_apps: Vec<_> = STRAPPER_PROCESS_NAMES
+                .iter()
+                .map(|name| name.to_string())
+                .collect();
+            assert!(process_name_matches_any_tunnel_app(&lower, &bypass_apps));
+            assert!(!is_roblox_player_process_name(process));
+            let normal_apps: Vec<_> = ROBLOX_PROCESS_NAMES
+                .iter()
+                .map(|name| name.to_string())
+                .collect();
+            assert!(!process_name_matches_any_tunnel_app(&lower, &normal_apps));
+        }
+        for strapper in STRAPPER_PROCESS_NAMES {
+            assert_eq!(
+                *strapper,
+                strapper.to_ascii_lowercase(),
+                "{strapper} must be lowercase to match the tunnel-app set"
+            );
+            // Strappers are tunnelled only under Bypass; they must NOT be treated
+            // as core Roblox processes (which are always tunnel-eligible and used
+            // for detection/perf monitoring).
+            assert!(
+                !is_roblox_process_name(strapper),
+                "{strapper} must not be a core Roblox process name"
+            );
+        }
+    }
+
+    #[test]
+    fn studio_processes_are_recognized_and_players_are_not() {
+        for studio in [
+            "RobloxStudioBeta.exe",
+            "robloxstudio.exe",
+            "RobloxStudioLauncherBeta.exe",
+            "RobloxStudioInstaller.exe",
+            r"C:\Users\me\AppData\Local\Roblox\Versions\v1\RobloxStudioBeta.exe",
+        ] {
+            assert!(
+                is_roblox_studio_process_name(studio),
+                "expected {studio} to be recognized as Studio"
+            );
+        }
+        // Players, launchers, and unrelated processes must NOT be treated as
+        // Studio (they keep their normal tunnel routing).
+        for not_studio in [
+            "RobloxPlayerBeta.exe",
+            "robloxplayer.exe",
+            "robloxplayerlauncher.exe",
+            "chrome.exe",
+        ] {
+            assert!(
+                !is_roblox_studio_process_name(not_studio),
+                "expected {not_studio} NOT to be Studio"
+            );
+        }
+    }
+}

@@ -1,0 +1,82 @@
+param(
+    [Parameter(Mandatory = $true)][string]$WorkDir,
+    [ValidateSet('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')]
+    [string]$Target = 'x86_64-pc-windows-msvc'
+)
+$ErrorActionPreference = 'Stop'
+$repo = Split-Path $PSScriptRoot -Parent
+$WorkDir = [IO.Path]::GetFullPath($WorkDir)
+if ($WorkDir.StartsWith($repo.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Fixture output must be outside the repository'
+}
+New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
+$archive = Join-Path $WorkDir 'wix314-binaries.zip'
+$wix = Join-Path $WorkDir 'wix'
+# Same official portable toolset and digest pinned by Tauri CLI v2.10.0.
+$digest = '6ac824e1642d6f7277d0ed7ea09411a508f6116ba6fae0aa5f2c7daa2ff43d31'
+if (-not (Test-Path -LiteralPath $archive)) {
+    Invoke-WebRequest 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip' -OutFile $archive
+}
+if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $digest) { throw 'WiX archive digest mismatch' }
+Expand-Archive -LiteralPath $archive -DestinationPath $wix -Force
+Push-Location $repo
+try {
+    $output = cargo build -p swifttunnel-msi-actions --release --target $Target --message-format=json-render-diagnostics
+    if ($LASTEXITCODE -ne 0) { throw 'MSI action DLL build failed' }
+    $dlls = @($output | ForEach-Object {
+        $message = $_ | ConvertFrom-Json
+        if ($message.reason -eq 'compiler-artifact' -and $message.target.name -eq 'swifttunnel_msi_actions') {
+            $message.filenames | Where-Object { $_.EndsWith('.dll') }
+        }
+    })
+    if ($dlls.Count -ne 1) { throw 'Expected exactly one freshly built action DLL' }
+    $dll = $dlls[0]
+    & "$PSScriptRoot/check-vc-runtime.ps1" -Binary $dll
+    $pe = [IO.File]::ReadAllBytes($dll)
+    $offset = [BitConverter]::ToInt32($pe, 0x3c)
+    $machine = [BitConverter]::ToUInt16($pe, $offset + 4)
+    $expected = if ($Target.StartsWith('aarch64')) { 0xaa64 } else { 0x8664 }
+    if ($machine -ne $expected) { throw 'Action DLL architecture does not match the MSI target' }
+    cargo run -p swifttunnel-msi-actions --example render_sequence_fixture -- $WorkDir
+    if ($LASTEXITCODE -ne 0) { throw 'Desktop template render failed' }
+} finally { Pop-Location }
+$previousDll = $env:TAURI_SWIFTTUNNEL_MSI_ACTIONS_DLL
+$env:TAURI_SWIFTTUNNEL_MSI_ACTIONS_DLL = $dll
+$arch = if ($Target.StartsWith('aarch64')) { 'arm64' } else { 'x64' }
+Push-Location $WorkDir
+try {
+    & "$wix/candle.exe" -nologo -arch $arch -ext WixUtilExtension main.wxs `
+        "$repo/swifttunnel-desktop/src-tauri/wix/nsis-migration.wxs" "$repo/swifttunnel-desktop/src-tauri/wix/lite.wxs" "$repo/installer/SwiftSetupUI.wxs"
+    if ($LASTEXITCODE -ne 0) { throw 'WiX fixture compile failed' }
+    & "$wix/light.exe" -nologo -wx -ice:ICE20 -ice:ICE31 -ice:ICE44 -ice:ICE63 -ext WixUIExtension -ext WixUtilExtension `
+        -cultures:en-us -loc fixture.wxl -out desktop-sequence-fixture.msi main.wixobj nsis-migration.wixobj lite.wixobj SwiftSetupUI.wixobj
+    if ($LASTEXITCODE -ne 0) { throw 'WiX upgrade sequencing validation failed' }
+    & "$PSScriptRoot/check-desktop-msi-sequence.ps1" -Msi desktop-sequence-fixture.msi
+    & "$PSScriptRoot/check-installer-ui.ps1" -Msi desktop-sequence-fixture.msi
+    $fixtureInstaller = New-Object -ComObject WindowsInstaller.Installer
+    $fixtureDb = $fixtureInstaller.OpenDatabase((Join-Path $WorkDir 'desktop-sequence-fixture.msi'), 0)
+    $prerequisite = $fixtureDb.OpenView('SELECT `Action`, `Source`, `Target` FROM `CustomAction`')
+    $prerequisite.Execute()
+    $offlineFound = $false
+    while ($row = $prerequisite.Fetch()) {
+        if ($row.StringData(1) -eq 'DownloadAndInvokeBootstrapper') { throw 'Offline MSI must not download WebView' }
+        if ($row.StringData(1) -eq 'InvokeStandalone') {
+            if ($row.StringData(2) -ne 'MicrosoftEdgeWebView2RuntimeInstaller.exe' -or $row.StringData(3) -ne '/silent /install') { throw 'Offline runtime action is not correctly bound' }
+            $offlineFound = $true
+        }
+    }
+    if (-not $offlineFound) { throw 'Missing embedded WebView installation action' }
+    $runtimeSequence = $fixtureDb.OpenView("SELECT ``Condition`` FROM ``InstallExecuteSequence`` WHERE ``Action``='InvokeStandalone'")
+    $runtimeSequence.Execute()
+    $runtimeRow = $runtimeSequence.Fetch()
+    if (-not $runtimeRow -or $runtimeRow.StringData(1).Trim() -ne 'NOT(REMOVE OR WVRTINSTALLED)') { throw 'Runtime must only install when missing and never during uninstall' }
+    $guard = $fixtureDb.OpenView('SELECT `Condition` FROM `LaunchCondition`')
+    $guard.Execute()
+    $guardFound = $false
+    while ($row = $guard.Fetch()) { if ($row.StringData(1) -eq '0') { $guardFound = $true } }
+    if (-not $guardFound) { throw 'Fixture must refuse actual installation' }
+    & "$PSScriptRoot/test-lite-msi-package.ps1" -WorkDir (Join-Path $WorkDir 'lite') -WixDir $wix -Architecture $arch -MsiActionsPath $dll
+} finally {
+    Pop-Location
+    $env:TAURI_SWIFTTUNNEL_MSI_ACTIONS_DLL = $previousDll
+}

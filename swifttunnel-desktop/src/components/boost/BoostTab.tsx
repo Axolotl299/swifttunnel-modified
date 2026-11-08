@@ -1,0 +1,1030 @@
+import { useEffect, useState, useCallback, useRef, type ReactNode } from "react";
+import { useShallow } from "zustand/react/shallow";
+import * as motion from "framer-motion/m";
+import { AnimatePresence } from "framer-motion";
+import { useSettingsStore } from "../../stores/settingsStore";
+import { useBoostStore } from "../../stores/boostStore";
+import { useToastStore } from "../../stores/toastStore";
+import { formatErrorMessage } from "../../lib/errors";
+import { SettingsSaveNotice } from "../ui/SettingsSaveNotice";
+import {
+  boostCloseRoblox,
+  boostGetMetrics,
+} from "../../lib/commands";
+import { normalizeNetworkBoostConfig } from "../../lib/settings";
+import {
+  Toggle,
+  SectionHeader,
+  Panel,
+  Tooltip,
+  InfoIcon,
+  Button,
+  Row,
+  ErrorBanner,
+  Dialog,
+  type WatermarkProps,
+} from "../ui";
+import { validateCustomFflags } from "../../lib/fastFlags";
+import { FpsSlider } from "./FpsSlider";
+import {
+  PROFILES,
+  configsEqual,
+  mergeConfigChanges,
+  getPresetConfig,
+  parseWindowDimensionInput,
+  robloxSettingsChanged,
+  validateWindowDimension,
+} from "./boostConfig";
+import type {
+  Config,
+  GameProcessPerformanceSettings,
+  NetworkConfig,
+  OptimizationProfile,
+  RobloxSettingsConfig,
+  SystemOptimizationConfig,
+} from "../../lib/types";
+
+const MIN_WINDOW_WIDTH = 800;
+const MAX_WINDOW_WIDTH = 3840;
+const MIN_WINDOW_HEIGHT = 600;
+const MAX_WINDOW_HEIGHT = 2160;
+/**
+ * Everything that stops a config being written, for any config.
+ *
+ * Takes the config rather than reading the draft out of the component, because
+ * selecting a profile has to check the config it is about to apply and the
+ * draft state does not exist yet at that point.
+ */
+function configValidationError(config: Config): string | null {
+  const windowError =
+    validateWindowDimension(
+      "Width",
+      config.roblox_settings.window_width,
+      MIN_WINDOW_WIDTH,
+      MAX_WINDOW_WIDTH,
+    ) ??
+    validateWindowDimension(
+      "Height",
+      config.roblox_settings.window_height,
+      MIN_WINDOW_HEIGHT,
+      MAX_WINDOW_HEIGHT,
+    );
+  if (windowError) return windowError;
+
+  if (
+    config.roblox_settings.ultraboost &&
+    config.roblox_settings.custom_fflags_enabled
+  ) {
+    return "Turn off Ultraboost before managing overrides in the FastFlags editor.";
+  }
+
+  return validateCustomFflags(
+    config.roblox_settings.custom_fflags_enabled,
+    config.roblox_settings.custom_fflags_json,
+  );
+}
+
+export function BoostTab() {
+  const settings = useSettingsStore((s) => s.settings);
+  const updateSettings = useSettingsStore((s) => s.update);
+  const saveSettings = useSettingsStore((s) => s.save);
+
+  // This is a settings form. Live FPS/CPU/RAM samples belong to their own
+  // readouts, not a subscription that rebuilds every control on every sample.
+  const boost = useBoostStore(useShallow((s) => ({
+    fetchMetrics: s.fetchMetrics,
+    syncEffectiveConfig: s.syncEffectiveConfig,
+    updateConfig: s.updateConfig,
+    restartRoblox: s.restartRoblox,
+    error: s.error,
+    warning: s.warning,
+    robloxRunning: s.robloxRunning,
+  })));
+  const addToast = useToastStore((s) => s.addToast);
+
+  const [networkApplying, setNetworkApplying] = useState(false);
+
+  const savedConfig = settings.config;
+  const [draft, setDraft] = useState<Config>(savedConfig);
+  const previousSavedConfig = useRef(savedConfig);
+
+  useEffect(() => {
+    const previous = previousSavedConfig.current;
+    previousSavedConfig.current = savedConfig;
+    setDraft(current => mergeConfigChanges(current, previous, savedConfig));
+  }, [savedConfig]);
+
+  const savedGPP = settings.game_process_performance;
+  const [draftGPP, setDraftGPP] =
+    useState<GameProcessPerformanceSettings>(savedGPP);
+  const savedCountryBan = settings.enable_country_ban;
+  const [draftCountryBan, setDraftCountryBan] = useState(savedCountryBan);
+  const [fullBanDialogOpen, setFullBanDialogOpen] = useState(false);
+  const [fullBanChecking, setFullBanChecking] = useState(false);
+  const [fullBanClosing, setFullBanClosing] = useState(false);
+  const [resetDialogOpen, setResetDialogOpen] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
+
+  useEffect(() => {
+    setDraftGPP(savedGPP);
+  }, [savedGPP]);
+
+  useEffect(() => {
+    setDraftCountryBan(savedCountryBan);
+  }, [savedCountryBan]);
+
+  const chooseFullBan = (v: boolean) => {
+    if (robloxControlsLocked) return;
+    setDraftCountryBan(v);
+  };
+  const enableFullBanDraft = useCallback(() => {
+    setDraftCountryBan(true);
+  }, []);
+  const requestFullBan = useCallback(
+    async (v: boolean) => {
+      if (!v) {
+        chooseFullBan(false);
+        return;
+      }
+
+      setFullBanChecking(true);
+      try {
+        const metrics = await boostGetMetrics();
+        if (metrics.roblox_running) {
+          setFullBanDialogOpen(true);
+          return;
+        }
+        enableFullBanDraft();
+      } catch {
+        addToast({
+          type: "warning",
+          message: "Close Roblox before enabling Full Country Ban",
+        });
+        setFullBanDialogOpen(true);
+      } finally {
+        setFullBanChecking(false);
+      }
+    },
+    [addToast, enableFullBanDraft],
+  );
+  const confirmRobloxClosedForFullBan = useCallback(async () => {
+    setFullBanChecking(true);
+    try {
+      const metrics = await boostGetMetrics();
+      if (metrics.roblox_running) {
+        addToast({ type: "warning", message: "Roblox is still running" });
+        return;
+      }
+      enableFullBanDraft();
+      setFullBanDialogOpen(false);
+    } catch {
+      addToast({
+        type: "warning",
+        message: "Could not verify Roblox is closed",
+      });
+    } finally {
+      setFullBanChecking(false);
+    }
+  }, [addToast, enableFullBanDraft]);
+  const closeRobloxAndEnableFullBan = useCallback(async () => {
+    setFullBanClosing(true);
+    try {
+      await boostCloseRoblox();
+      await boost.fetchMetrics();
+      enableFullBanDraft();
+      setFullBanDialogOpen(false);
+      addToast({
+        type: "success",
+        message: "Roblox closed. Apply Full Country Ban to save it.",
+      });
+    } catch {
+      addToast({ type: "error", message: "Could not close Roblox" });
+    } finally {
+      setFullBanClosing(false);
+    }
+  }, [addToast, boost, enableFullBanDraft]);
+  useEffect(() => {
+    void boost.syncEffectiveConfig();
+  }, [boost.syncEffectiveConfig]);
+
+  const hasConfigChanges = !configsEqual(draft, savedConfig);
+  const hasGPPChanges = JSON.stringify(draftGPP) !== JSON.stringify(savedGPP);
+  const hasCountryBanChange = draftCountryBan !== savedCountryBan;
+  const hasChanges = hasConfigChanges || hasGPPChanges || hasCountryBanChange;
+  const hasRobloxChanges = robloxSettingsChanged(draft, savedConfig);
+  const [isRestarting, setIsRestarting] = useState(false);
+  const [isApplying, setIsApplying] = useState(false);
+  const robloxControlsLocked =
+    isRestarting || isApplying || fullBanChecking || fullBanClosing;
+  const windowWidthError = validateWindowDimension(
+    "Width",
+    draft.roblox_settings.window_width,
+    MIN_WINDOW_WIDTH,
+    MAX_WINDOW_WIDTH,
+  );
+  const windowHeightError = validateWindowDimension(
+    "Height",
+    draft.roblox_settings.window_height,
+    MIN_WINDOW_HEIGHT,
+    MAX_WINDOW_HEIGHT,
+  );
+  const windowValidationError = windowWidthError ?? windowHeightError;
+  const validationError = configValidationError(draft);
+
+  // The shell keeps player presence current. No RAM or FPS readout lives
+  // here, so this form must not start another performance polling loop.
+
+  const applyChanges = useCallback(async () => {
+    if (validationError || isApplying || isRestarting) return;
+    setIsApplying(true);
+    try {
+      if (hasConfigChanges) {
+        await boost.updateConfig(JSON.stringify(draft));
+      }
+      updateSettings({
+        game_process_performance: draftGPP,
+        enable_country_ban: draftCountryBan,
+      });
+      setDraft(useSettingsStore.getState().settings.config);
+      await saveSettings(true);
+      const currentWarning = useBoostStore.getState().warning;
+      if (currentWarning) {
+        addToast({ type: "warning", message: "Boost applied with warnings" });
+      } else {
+        addToast({ type: "success", message: "Boost settings applied" });
+      }
+    } catch (error) {
+      addToast({ type: "error", message: `Could not finish applying Boost settings: ${formatErrorMessage(error)}. Some changes may already be applied. Review your settings and retry.` });
+    } finally {
+      setIsApplying(false);
+    }
+  }, [
+    draft,
+    draftGPP,
+    draftCountryBan,
+    hasConfigChanges,
+    saveSettings,
+    updateSettings,
+    boost,
+    validationError,
+    isApplying,
+    isRestarting,
+    addToast,
+  ]);
+
+  const restartAndApply = useCallback(async () => {
+    if (validationError || isRestarting || isApplying) return;
+    setIsRestarting(true);
+    try {
+      if (hasConfigChanges) {
+        await boost.updateConfig(JSON.stringify(draft));
+      }
+      updateSettings({
+        game_process_performance: draftGPP,
+        enable_country_ban: draftCountryBan,
+      });
+      setDraft(useSettingsStore.getState().settings.config);
+      await saveSettings(true);
+      await boost.restartRoblox();
+    } catch (error) {
+      addToast({ type: "error", message: `Could not finish applying and restarting Roblox: ${formatErrorMessage(error)}. Review your settings before retrying.` });
+    } finally {
+      setIsRestarting(false);
+    }
+  }, [
+    draft,
+    draftGPP,
+    draftCountryBan,
+    hasConfigChanges,
+    saveSettings,
+    updateSettings,
+    boost,
+    addToast,
+    validationError,
+    isRestarting,
+    isApplying,
+  ]);
+
+  /**
+   * Put Roblox back to stock, whoever changed it.
+   *
+   * Deliberately not the same thing as turning our settings off. A player
+   * asking for this has a Roblox that renders wrong and no idea which of
+   * SwiftTunnel, a bootstrapper or a flag list they were handed is responsible,
+   * and the flag that ruins render distance is indistinguishable from the one
+   * that unlocks frames. So it clears all of them and says how many it found.
+   */
+  const resetRobloxClient = useCallback(async () => {
+    setIsResetting(true);
+    try {
+      const report = await useSettingsStore.getState().resetRobloxClient();
+      setResetDialogOpen(false);
+
+      if (report.failures.length > 0) {
+        addToast({
+          type: "warning",
+          message: "Some files could not be cleared. Close Roblox and retry.",
+        });
+      } else {
+        // Say that Roblox was ended. On Windows it commonly outlives its own
+        // window, so someone who believes they closed it half an hour ago still
+        // had it running, and a silent kill would read as a crash.
+        const closed = report.roblox_was_running ? "Roblox closed. " : "";
+        if (report.flag_files_removed === 0) {
+          addToast({
+            type: "success",
+            message: report.settings_restored
+              ? `${closed}Roblox's FPS and graphics settings were reset.`
+              : `${closed}Roblox was already clean, nothing to remove.`,
+          });
+        } else {
+          const where =
+            report.sources.length > 0
+              ? ` from ${report.sources.join(", ")}`
+              : "";
+          addToast({
+            type: "success",
+            message: `${closed}Removed ${report.flag_files_removed} flag file${
+              report.flag_files_removed === 1 ? "" : "s"
+            }${where}.`,
+          });
+        }
+      }
+    } catch {
+      addToast({ type: "warning", message: "Could not reset Roblox" });
+    } finally {
+      setIsResetting(false);
+    }
+  }, [addToast]);
+
+  const discardChanges = useCallback(() => {
+    setDraft(savedConfig);
+    setDraftGPP(savedGPP);
+    setDraftCountryBan(savedCountryBan);
+  }, [savedConfig, savedGPP, savedCountryBan]);
+
+  // Profiles stage a draft, like the other controls, until Apply is pressed.
+  function selectProfile(id: OptimizationProfile) {
+    if (isApplying || isRestarting) return;
+    setDraft(getPresetConfig(id, draft));
+  }
+
+  function updateSysOpt(p: Partial<SystemOptimizationConfig>) {
+    setDraft((prev) => ({
+      ...prev,
+      profile: "Custom",
+      system_optimization: { ...prev.system_optimization, ...p },
+    }));
+  }
+
+  const applyNetworkOpt = useCallback(
+    async (p: Partial<NetworkConfig>) => {
+      const nextDraft = {
+        ...draft,
+        profile: "Custom" as const,
+        network_settings: normalizeNetworkBoostConfig({
+          ...draft.network_settings,
+          ...p,
+        }),
+      };
+      setNetworkApplying(true);
+      try {
+        await boost.updateConfig(JSON.stringify(nextDraft));
+        updateSettings({
+          game_process_performance: draftGPP,
+        });
+        setDraft(useSettingsStore.getState().settings.config);
+        await saveSettings(true);
+
+        const currentWarning = useBoostStore.getState().warning;
+        if (currentWarning) {
+          addToast({
+            type: "warning",
+            message: "Network boost could not fully apply",
+          });
+        } else {
+          addToast({ type: "success", message: "Network boost updated" });
+        }
+      } catch (error) {
+        addToast({ type: "error", message: `Could not finish updating Network Boost: ${formatErrorMessage(error)}. Review your settings and retry.` });
+      } finally {
+        setNetworkApplying(false);
+      }
+    },
+    [addToast, boost, draft, draftGPP, saveSettings, updateSettings],
+  );
+
+  function updateRblxOpt(p: Partial<RobloxSettingsConfig>) {
+    if (robloxControlsLocked) return;
+    setDraft((prev) => ({
+      ...prev,
+      profile: "Custom",
+      roblox_settings: { ...prev.roblox_settings, ...p },
+    }));
+  }
+
+  function updateGPP(p: Partial<GameProcessPerformanceSettings>) {
+    setDraftGPP((prev) => ({ ...prev, ...p }));
+  }
+
+  const systemBoostFlags = [
+    draft.system_optimization.set_high_priority,
+    draft.system_optimization.timer_resolution_1ms,
+    draft.system_optimization.mmcss_gaming_profile,
+    draft.system_optimization.game_mode_enabled,
+  ];
+  const sysCount = systemBoostFlags.filter(Boolean).length;
+  const netCount = [
+    draft.network_settings.disable_nagle,
+    draft.network_settings.disable_network_throttling,
+  ].filter(Boolean).length;
+  const rblxCount = [
+    draft.roblox_settings.unlock_fps,
+    draft.roblox_settings.ultraboost,
+    draft.roblox_settings.custom_fflags_enabled,
+    draft.roblox_settings.window_fullscreen,
+  ].filter(Boolean).length;
+  const countryBanCount = draftCountryBan ? 1 : 0;
+  const schedCount = [
+    draftGPP.high_performance_gpu_binding,
+    draftGPP.prefer_performance_cores,
+    draftGPP.unbind_cpu0,
+  ].filter(Boolean).length;
+
+  return (
+    <div className="flex w-full flex-col gap-4">
+      <SettingsSaveNotice />
+      {boost.error && <ErrorBanner tone="error">{boost.error}</ErrorBanner>}
+
+      {boost.warning && (
+        <ErrorBanner tone="warning">{boost.warning}</ErrorBanner>
+      )}
+
+      {/* ── Profile Selector ── */}
+      <section>
+        <SectionHeader
+          label="Profile"
+          description="Choose a preset or customize individual settings below"
+          tag={draft.profile === "Custom" ? "Custom" : undefined}
+        />
+        <div
+          className="instrument grid gap-1 p-1"
+          style={{
+            gridTemplateColumns: `repeat(${PROFILES.length}, minmax(0, 1fr))`,
+          }}
+        >
+          {PROFILES.map((p) => {
+            const sel = draft.profile === p.id;
+            return (
+              <button
+                key={p.id}
+                onClick={() => selectProfile(p.id)}
+                disabled={robloxControlsLocked}
+                className="rounded-[7px] px-3 py-2 text-left transition-all duration-100"
+                style={{
+                  background: sel ? "#fafafa" : "transparent",
+                  color: sel ? "#0a0a0a" : "var(--color-text-secondary)",
+                }}
+                onMouseEnter={(e) => {
+                  if (!sel)
+                    e.currentTarget.style.backgroundColor =
+                      "var(--color-bg-hover)";
+                }}
+                onMouseLeave={(e) => {
+                  if (!sel)
+                    e.currentTarget.style.backgroundColor = "transparent";
+                }}
+              >
+                <div
+                  className="text-[12.5px] font-semibold"
+                  style={{ letterSpacing: "-0.005em" }}
+                >
+                  {p.name}
+                </div>
+                <div
+                  className="mt-0.5 text-[10.5px] leading-tight"
+                  style={{
+                    color: sel ? "rgba(0,0,0,0.65)" : "var(--color-text-muted)",
+                  }}
+                >
+                  {p.desc}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+
+      {/* ── Roblox ── */}
+      <Section
+        title="Roblox"
+        tag={`${rblxCount} / 4 on`}
+        watermark={{ icon: "roblox", at: "top-right", size: 150, rotate: -14, opacity: 0.055 }}
+      >
+        <SettingRow
+          title="Unlock FPS"
+          anchorId="unlock_fps"
+          desc="Remove 60 FPS cap"
+          enabled={draft.roblox_settings.unlock_fps}
+          onChange={(v) => updateRblxOpt({ unlock_fps: v })}
+          disabled={robloxControlsLocked}
+        />
+        {draft.roblox_settings.unlock_fps && (
+          <FpsSlider
+            value={draft.roblox_settings.target_fps}
+            onChange={(v) => updateRblxOpt({ target_fps: v })}
+            disabled={robloxControlsLocked}
+          />
+        )}
+        <SettingRow
+          title="Ultraboost"
+          anchorId="ultraboost"
+          desc="Max FPS, lowest detail. Lowers your Roblox graphics quality"
+          enabled={draft.roblox_settings.ultraboost}
+          onChange={(v) =>
+            updateRblxOpt(
+              v
+                ? { ultraboost: true, custom_fflags_enabled: false }
+                : { ultraboost: false },
+            )
+          }
+          disabled={robloxControlsLocked}
+        />
+        <ResolutionRow
+          width={draft.roblox_settings.window_width}
+          height={draft.roblox_settings.window_height}
+          onWidthChange={(w) =>
+            updateRblxOpt({
+              window_width: parseWindowDimensionInput(
+                String(w),
+                MIN_WINDOW_WIDTH,
+              ),
+            })
+          }
+          onHeightChange={(h) =>
+            updateRblxOpt({
+              window_height: parseWindowDimensionInput(
+                String(h),
+                MIN_WINDOW_HEIGHT,
+              ),
+            })
+          }
+          error={windowValidationError}
+          disabled={robloxControlsLocked}
+        />
+        <SettingRow
+          title="Launch Fullscreen"
+          anchorId="launch_fullscreen"
+          desc="Set Roblox fullscreen default"
+          enabled={draft.roblox_settings.window_fullscreen}
+          onChange={(v) => updateRblxOpt({ window_fullscreen: v })}
+          disabled={robloxControlsLocked}
+        />
+        <Row
+          label="Reset Roblox to default"
+          desc="Close Roblox, remove every FFlag on this PC including a bootstrapper's, and put graphics back"
+          anchorId="reset_roblox"
+        >
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => setResetDialogOpen(true)}
+            disabled={robloxControlsLocked || isResetting}
+            loading={isResetting}
+          >
+            Reset
+          </Button>
+        </Row>
+      </Section>
+
+      {/* ── System + Network side-by-side ── */}
+      <Section
+        title="Country Ban"
+        tag={`${countryBanCount} / 1 on`}
+        watermark={{ icon: "globe", at: "right", size: 140, fade: true }}
+      >
+        <SettingRow
+          title="Bypass Country Ban"
+          anchorId="country_ban"
+          desc="Use when the whole Roblox platform is blocked"
+          tooltip="Full bypass: DPI evasion plus relaying all Roblox traffic through the selected SwiftTunnel relay."
+          enabled={draftCountryBan}
+          onChange={(v) => void requestFullBan(v)}
+          disabled={robloxControlsLocked}
+        />
+      </Section>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Section
+          title="System"
+          tag={`${sysCount} / ${systemBoostFlags.length} on`}
+        >
+          <SettingRow
+            title="High Priority Mode"
+            anchorId="high_priority"
+            desc="Boost game process priority (+5-15 FPS)"
+            enabled={draft.system_optimization.set_high_priority}
+            onChange={(v) => updateSysOpt({ set_high_priority: v })}
+          />
+          <SettingRow
+            title="0.5ms Timer Resolution"
+            anchorId="timer_resolution"
+            desc="Max precision frame pacing"
+            tooltip="Reduces the Windows timer interrupt interval to 0.5ms for more precise frame pacing. Slightly increases CPU usage."
+            enabled={draft.system_optimization.timer_resolution_1ms}
+            onChange={(v) => updateSysOpt({ timer_resolution_1ms: v })}
+          />
+          <SettingRow
+            title="MMCSS Gaming Profile"
+            anchorId="mmcss"
+            desc="Better thread scheduling, stable frame times"
+            tooltip="Multimedia Class Scheduler Service, prioritizes game threads for CPU time."
+            enabled={draft.system_optimization.mmcss_gaming_profile}
+            onChange={(v) => updateSysOpt({ mmcss_gaming_profile: v })}
+          />
+          <SettingRow
+            title="Windows Game Mode"
+            anchorId="game_mode"
+            desc="System resource prioritization"
+            enabled={draft.system_optimization.game_mode_enabled}
+            onChange={(v) => updateSysOpt({ game_mode_enabled: v })}
+          />
+        </Section>
+
+        <Section title="Network" tag={`${netCount} / 2 on`}>
+          <SettingRow
+            title="Disable Nagle's Algorithm"
+            anchorId="disable_nagle"
+            desc="Faster packet delivery (-5-15ms)"
+            tooltip="Nagle batches small packets to reduce overhead. Disabling sends immediately, better for real-time games."
+            enabled={draft.network_settings.disable_nagle}
+            onChange={(v) => void applyNetworkOpt({ disable_nagle: v })}
+            disabled={networkApplying}
+          />
+          <SettingRow
+            title="Disable Network Throttling"
+            anchorId="network_throttling"
+            desc="Full bandwidth while gaming"
+            tooltip="Windows throttles network I/O when multimedia is playing. Disabling prevents sudden bandwidth drops."
+            enabled={draft.network_settings.disable_network_throttling}
+            onChange={(v) =>
+              void applyNetworkOpt({ disable_network_throttling: v })
+            }
+            disabled={networkApplying}
+          />
+        </Section>
+      </div>
+
+      {/* ── Process Scheduling ── */}
+      <Section title="Process Scheduling" tag={`${schedCount} / 3 on`}>
+        <SettingRow
+          title="High-Performance GPU Binding"
+          anchorId="gpu_binding"
+          desc="Bind target games to the high-performance GPU while connected"
+          enabled={draftGPP.high_performance_gpu_binding}
+          onChange={(v) => updateGPP({ high_performance_gpu_binding: v })}
+        />
+        <SettingRow
+          title="Prefer Performance Cores"
+          anchorId="performance_cores"
+          desc="Steer target games to P-cores on hybrid CPUs"
+          enabled={draftGPP.prefer_performance_cores}
+          onChange={(v) => updateGPP({ prefer_performance_cores: v })}
+        />
+        <SettingRow
+          title="Unbind CPU0"
+          anchorId="unbind_cpu0"
+          desc="Exclude logical CPU 0 when enough cores are available"
+          enabled={draftGPP.unbind_cpu0}
+          onChange={(v) => updateGPP({ unbind_cpu0: v })}
+        />
+      </Section>
+
+      {/* ── Sticky Apply Bar ── */}
+      <AnimatePresence>
+        {hasChanges && (
+          <motion.div
+            initial={{ opacity: 0, y: 28 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 28 }}
+            transition={{ type: "spring", damping: 24, stiffness: 280 }}
+            className="sticky z-40"
+            style={{ bottom: "12px" }}
+          >
+            <div className="flex w-full items-center justify-between rounded-[var(--radius-card)] surface-elevated px-4 py-2.5">
+              <span className="text-[12px] font-medium text-text-secondary">
+                {validationError
+                  ? validationError
+                  : hasRobloxChanges && boost.robloxRunning
+                    ? "Roblox must restart for changes to apply"
+                    : "Unsaved changes"}
+              </span>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={discardChanges}
+                  disabled={isRestarting || isApplying}
+                >
+                  Discard
+                </Button>
+                {hasRobloxChanges && boost.robloxRunning ? (
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={() => {
+                      void restartAndApply().catch(() => {});
+                    }}
+                    disabled={isRestarting || Boolean(validationError)}
+                    loading={isRestarting}
+                  >
+                    Restart & Apply
+                  </Button>
+                ) : (
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={applyChanges}
+                    disabled={
+                      isRestarting || isApplying || Boolean(validationError)
+                    }
+                    loading={isApplying}
+                  >
+                    Apply
+                  </Button>
+                )}
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+      <Dialog
+        open={fullBanDialogOpen}
+        onClose={() => {
+          if (!fullBanChecking && !fullBanClosing) setFullBanDialogOpen(false);
+        }}
+        title="Close Roblox first"
+        description="Full Country Ban must start before Roblox opens."
+      >
+        <div className="flex flex-col gap-4">
+          <p className="text-[12px] leading-relaxed text-text-secondary">
+            Close Roblox completely, then enable Full Country Ban and click
+            Apply. This keeps login, verification, and game traffic on the
+            selected SwiftTunnel relay from the first connection.
+          </p>
+          <p className="text-[11px] leading-relaxed text-text-muted">
+            If Roblox is stuck in the background, SwiftTunnel can close it for
+            you.
+          </p>
+          <div className="flex flex-wrap justify-end gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => setFullBanDialogOpen(false)}
+              disabled={fullBanChecking || fullBanClosing}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => void confirmRobloxClosedForFullBan()}
+              disabled={fullBanChecking || fullBanClosing}
+              loading={fullBanChecking}
+            >
+              I closed Roblox
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => void closeRobloxAndEnableFullBan()}
+              disabled={fullBanChecking || fullBanClosing}
+              loading={fullBanClosing}
+            >
+              Close Roblox & Enable
+            </Button>
+          </div>
+        </div>
+      </Dialog>
+      <Dialog
+        open={resetDialogOpen}
+        onClose={() => {
+          if (!isResetting) setResetDialogOpen(false);
+        }}
+        title="Reset Roblox to default"
+        description="Closes Roblox and clears every FFlag on this PC, not only SwiftTunnel's."
+      >
+        <div className="flex flex-col gap-4">
+          <p className="text-[12px] leading-relaxed text-text-secondary">
+            <span className="text-foreground">Roblox will be closed</span>, and
+            any game you are in ends immediately. It has to be: Roblox rewrites
+            its settings when it exits, so a reset done underneath a running
+            client is undone the moment that client closes.
+          </p>
+          <p className="text-[12px] leading-relaxed text-text-secondary">
+            This deletes every ClientAppSettings.json on this machine, including
+            the one Bloxstrap, Fishstrap or any other launcher keeps in its
+            modifications folder. That copy is the one that matters: a launcher
+            writes it back into Roblox at every launch, which is why resetting
+            Roblox's own files never clears a stuck flag.
+          </p>
+          <p className="text-[12px] leading-relaxed text-text-secondary">
+            Graphics quality goes back to automatic and the frame cap back to
+            Roblox's own 60, unless SwiftTunnel has a backup of your original
+            settings, in which case that goes back instead. Your account, saved
+            games and keybinds are untouched.
+          </p>
+          <p className="text-[11px] leading-relaxed text-text-muted">
+            If you set up your own flags in a launcher, you will lose them and
+            will need to add them again.
+          </p>
+          <div className="flex flex-wrap justify-end gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => setResetDialogOpen(false)}
+              disabled={isResetting}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => {
+                void resetRobloxClient();
+              }}
+              disabled={isResetting}
+              loading={isResetting}
+            >
+              Reset Roblox
+            </Button>
+          </div>
+        </div>
+      </Dialog>
+    </div>
+  );
+}
+
+// ── Sub-components ──
+
+function Section({
+  title,
+  tag,
+  watermark,
+  children,
+}: {
+  title: string;
+  tag?: string;
+  watermark?: WatermarkProps;
+  children: ReactNode;
+}) {
+  // Group title now titles the panel it belongs to, rather than floating above
+  // it as a caption over a separate slab.
+  return (
+    <Panel
+      flush
+      eyebrow={title}
+      watermark={watermark}
+      className="overflow-hidden"
+      actions={
+        tag ? (
+          <span
+            className="pill-base"
+            style={{
+              backgroundColor: "var(--color-accent-primary-soft-10)",
+              color: "var(--color-text-secondary)",
+              border: "1px solid var(--color-border-subtle)",
+            }}
+          >
+            {tag}
+          </span>
+        ) : undefined
+      }
+    >
+      <div className="divide-y divide-[color:var(--color-border-subtle)] border-t border-[color:var(--color-border-subtle)]">
+        {children}
+      </div>
+    </Panel>
+  );
+}
+
+function SettingRow({
+  title,
+  desc,
+  tooltip,
+  enabled,
+  onChange,
+  disabled,
+  anchorId,
+}: {
+  title: string;
+  desc: string;
+  tooltip?: string;
+  enabled: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+  anchorId?: string;
+}) {
+  return (
+    <Row
+      label={title}
+      desc={desc}
+      anchorId={anchorId}
+      tooltip={
+        tooltip && (
+          <Tooltip content={tooltip}>
+            <span className="inline-flex">
+              <InfoIcon />
+            </span>
+          </Tooltip>
+        )
+      }
+    >
+      <Toggle
+        enabled={enabled}
+        onChange={onChange}
+        disabled={disabled}
+        ariaLabel={title}
+      />
+    </Row>
+  );
+}
+
+function ResolutionRow({
+  width,
+  height,
+  onWidthChange,
+  onHeightChange,
+  error,
+  disabled,
+}: {
+  width: number;
+  height: number;
+  onWidthChange: (v: number) => void;
+  onHeightChange: (v: number) => void;
+  error: string | null;
+  disabled?: boolean;
+}) {
+  return (
+    <div className="px-4 py-3" data-search-anchor="window_resolution">
+      <div className="mb-0.5 text-[13px] font-medium text-text-primary">
+        Window resolution
+      </div>
+      <div className="mb-2.5 text-[11px] text-text-muted">
+        Sets Roblox launch window size in pixels.
+      </div>
+      <div className="flex items-center gap-2">
+        <label className="flex flex-1 flex-col gap-1">
+          <span className="text-[9.5px] font-semibold uppercase tracking-[0.1em] text-text-dimmed">
+            Width
+          </span>
+          <input
+            type="number"
+            min={MIN_WINDOW_WIDTH}
+            max={MAX_WINDOW_WIDTH}
+            step={2}
+            value={width}
+            disabled={disabled}
+            onChange={(e) =>
+              onWidthChange(
+                parseWindowDimensionInput(e.target.value, MIN_WINDOW_WIDTH),
+              )
+            }
+            className="boost-input rounded-[4px] px-3 py-1.5 font-mono text-[13px] outline-none transition-colors"
+            style={{
+              backgroundColor: "var(--color-bg-elevated)",
+              border: "1px solid var(--color-border-default)",
+              color: "var(--color-text-primary)",
+            }}
+          />
+        </label>
+        <span className="mt-4 text-[11px] text-text-dimmed">×</span>
+        <label className="flex flex-1 flex-col gap-1">
+          <span className="text-[9.5px] font-semibold uppercase tracking-[0.1em] text-text-dimmed">
+            Height
+          </span>
+          <input
+            type="number"
+            min={MIN_WINDOW_HEIGHT}
+            max={MAX_WINDOW_HEIGHT}
+            step={2}
+            value={height}
+            disabled={disabled}
+            onChange={(e) =>
+              onHeightChange(
+                parseWindowDimensionInput(e.target.value, MIN_WINDOW_HEIGHT),
+              )
+            }
+            className="boost-input rounded-[4px] px-3 py-1.5 font-mono text-[13px] outline-none transition-colors"
+            style={{
+              backgroundColor: "var(--color-bg-elevated)",
+              border: "1px solid var(--color-border-default)",
+              color: "var(--color-text-primary)",
+            }}
+          />
+        </label>
+      </div>
+      {error && <p className="mt-2 text-[11px] text-status-error">{error}</p>}
+    </div>
+  );
+}

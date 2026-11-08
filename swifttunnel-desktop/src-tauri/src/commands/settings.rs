@@ -1,0 +1,1010 @@
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Manager, State};
+
+use crate::state::AppState;
+use swifttunnel_core::settings::AppSettings;
+
+use serde::Serialize;
+
+#[derive(Serialize)]
+pub struct NetworkDiagnosticsBundleResponse {
+    pub file_path: String,
+    pub folder_path: String,
+}
+
+#[derive(Serialize)]
+pub struct SettingsSaveResult {
+    warning: Option<String>,
+}
+
+static PREFERENCE_EFFECTS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+fn publish_current_preferences<T>(
+    gate: &parking_lot::Mutex<()>,
+    current: impl FnOnce() -> T,
+    publish: impl FnOnce(T),
+) {
+    let _publication = gate.lock();
+    // A prior effect can outlive the save that requested it. Read only after
+    // admission, so late work cannot re-enable an older tracing/RPC preference.
+    publish(current());
+}
+
+#[derive(Debug, Clone)]
+struct DiagnosticsCommand {
+    title: &'static str,
+    program: &'static str,
+    args: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CommandCapture {
+    stdout: String,
+    stderr: String,
+    status_code: Option<i32>,
+    success: bool,
+    execution_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BundleContext {
+    generated_at: String,
+    app_version: String,
+    platform: String,
+    settings: swifttunnel_core::settings::AppSettings,
+    vpn_state: swifttunnel_core::vpn::ConnectionState,
+    split_tunnel_diag: Option<swifttunnel_core::vpn::SplitTunnelDiagnostics>,
+}
+
+#[tauri::command]
+pub async fn settings_load(state: State<'_, AppState>) -> Result<AppSettings, String> {
+    if let Some(error) = swifttunnel_core::settings::settings_load_error() {
+        return Err(error.into());
+    }
+    let settings = state.settings.clone();
+    tauri::async_runtime::spawn_blocking(move || Ok(settings.lock().clone()))
+        .await
+        .map_err(|e| format!("Settings load task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn settings_save(
+    state: State<'_, AppState>,
+    settings: AppSettings,
+) -> Result<SettingsSaveResult, String> {
+    let settings_arc = state.settings.clone();
+    let discord_manager = state.discord_manager.clone();
+    let fps_monitor = state.fps_monitor.clone();
+
+    let result: Result<(bool, Option<String>), String> = tauri::async_runtime::spawn_blocking(move || {
+        let mut new_settings = settings;
+        new_settings.sanitize_in_place();
+        let run_on_startup = new_settings.run_on_startup;
+        // Repair must compare its requested preference against the same save
+        // ordering that publishes the Windows registration.
+        let publication = crate::autostart::begin_startup_publication();
+        let routing_changed = persist_preferences(
+            &settings_arc,
+            new_settings,
+            swifttunnel_core::settings::save_settings,
+        )?;
+
+        let warning = if let Err(e) = publication.sync(run_on_startup) {
+            log::warn!("Failed to sync startup registration after settings save: {}", e);
+            Some("Your settings were saved, but Windows startup could not be updated. Retry startup setup or use Startup login in Repair.".to_string())
+        } else {
+            None
+        };
+        drop(publication);
+
+        publish_current_preferences(
+            &PREFERENCE_EFFECTS,
+            || {
+                let current = settings_arc.lock();
+                (current.enable_discord_rpc, overlay_wants_fps(&current))
+            },
+            |(discord_enabled, wants_fps)| {
+                discord_manager.lock().set_enabled(discord_enabled);
+                // Never hold the settings lock through native trace shutdown.
+                fps_monitor.set_enabled(wants_fps);
+            },
+        );
+
+        Ok((routing_changed, warning))
+    })
+    .await
+    .map_err(|e| format!("Settings save task failed: {}", e))?;
+    let (routing_changed, warning) = result?;
+    if !routing_changed {
+        // Display, overlay and other preferences must not wait behind a
+        // connection attempt just to republish unchanged routing settings.
+        return Ok(SettingsSaveResult { warning });
+    }
+
+    // Push auto-routing settings to the live router so changes apply
+    // mid-session instead of waiting for the next connect. Inert when
+    // disconnected (no router) or for custom-relay sessions (no lookup task).
+    let auto_router = {
+        let vpn = state.vpn_connection.lock().await;
+        vpn.auto_router().cloned()
+    };
+    if let Some(router) = auto_router {
+        // A connection may have held the lock while a later save completed.
+        // Publish current preferences, never the snapshot from before that wait.
+        let settings = state.settings.lock();
+        router.set_enabled(settings.auto_routing_enabled);
+        router.set_whitelisted_regions(settings.whitelisted_regions.clone());
+    }
+
+    Ok(SettingsSaveResult { warning })
+}
+
+fn persist_preferences(
+    settings: &parking_lot::Mutex<AppSettings>,
+    next: AppSettings,
+    persist: impl FnOnce(&AppSettings) -> Result<(), String>,
+) -> Result<bool, String> {
+    // Native background writers use this lock through their saves too. Keep
+    // disk publication and its matching in-memory state in the same ordering.
+    let mut current = settings.lock();
+    let routing_changed = current.auto_routing_enabled != next.auto_routing_enabled
+        || current.whitelisted_regions != next.whitelisted_regions;
+    persist(&next)?;
+    *current = next;
+    Ok(routing_changed)
+}
+
+fn overlay_wants_fps(settings: &AppSettings) -> bool {
+    settings.config.overlay.enabled
+        && settings
+            .config
+            .overlay
+            .metrics
+            .iter()
+            .any(|metric| metric == "fps")
+}
+
+fn current_timestamp_utc() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+fn current_filename_timestamp() -> String {
+    chrono::Local::now().format("%Y%m%d_%H%M%S").to_string()
+}
+
+fn build_diagnostics_filename_from_timestamp(timestamp: &str) -> String {
+    format!("SwiftTunnel_NetworkDiagnostics_{timestamp}.txt")
+}
+
+fn build_diagnostics_filename() -> String {
+    build_diagnostics_filename_from_timestamp(&current_filename_timestamp())
+}
+
+fn resolve_output_dir(app: &AppHandle) -> PathBuf {
+    app.path()
+        .desktop_dir()
+        .or_else(|_| app.path().download_dir())
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
+
+fn format_section(title: &str, body: &str) -> String {
+    let mut section = String::new();
+    section.push_str("## ");
+    section.push_str(title);
+    section.push('\n');
+    section.push_str(body.trim_end());
+    section.push('\n');
+    section
+}
+
+fn format_command_section(title: &str, capture: &CommandCapture) -> String {
+    let mut body = String::new();
+
+    if let Some(error) = &capture.execution_error {
+        body.push_str(&format!("Execution error: {error}\n"));
+        return format_section(title, &body);
+    }
+
+    if !capture.success {
+        match capture.status_code {
+            Some(code) => body.push_str(&format!("Command failed (exit code: {code})\n")),
+            None => body.push_str("Command failed (unknown exit code)\n"),
+        }
+    }
+
+    if !capture.stdout.trim().is_empty() {
+        body.push_str(&capture.stdout);
+        if !capture.stdout.ends_with('\n') {
+            body.push('\n');
+        }
+    }
+
+    if !capture.stderr.trim().is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("[stderr]\n");
+        body.push_str(&capture.stderr);
+        if !capture.stderr.ends_with('\n') {
+            body.push('\n');
+        }
+    }
+
+    if body.trim().is_empty() {
+        body.push_str("(no output)\n");
+    }
+
+    format_section(title, &body)
+}
+
+fn run_diagnostics_command(command: &DiagnosticsCommand, timeout: Duration) -> CommandCapture {
+    let output =
+        swifttunnel_core::run_hidden_command_with_timeout(command.program, &command.args, timeout);
+    CommandCapture {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        status_code: output.exit_code,
+        success: output.success,
+        execution_error: None,
+    }
+}
+
+fn collect_diagnostics_sections(commands: &[DiagnosticsCommand], budget: Duration) -> Vec<String> {
+    let started = Instant::now();
+    commands
+        .iter()
+        .map(|command| {
+            let remaining = budget.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return format_section(
+                    command.title,
+                    "Skipped: diagnostics reached its time limit.",
+                );
+            }
+            let capture = run_diagnostics_command(command, remaining.min(Duration::from_secs(15)));
+            format_command_section(command.title, &capture)
+        })
+        .collect()
+}
+
+fn run_windows_diagnostics_sections() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        collect_diagnostics_sections(&windows_diagnostics_commands(), Duration::from_secs(60))
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![format_section(
+            "Windows Diagnostics",
+            "Windows-specific diagnostics are unavailable on this platform.",
+        )]
+    }
+}
+
+fn isp_lookup_script() -> &'static str {
+    "$ErrorActionPreference='Stop'; \
+     $ProgressPreference='SilentlyContinue'; \
+     Invoke-RestMethod -Uri 'https://ipinfo.io/json' -TimeoutSec 6 | ConvertTo-Json -Depth 8"
+}
+
+#[cfg(windows)]
+fn windows_diagnostics_commands() -> Vec<DiagnosticsCommand> {
+    vec![
+        DiagnosticsCommand {
+            title: "Get-NetAdapter",
+            program: "powershell",
+            args: vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "Get-NetAdapter | Format-Table Name,InterfaceDescription,ifIndex,Status,MacAddress,LinkSpeed -AutoSize | Out-String -Width 220".to_string(),
+            ],
+        },
+        DiagnosticsCommand {
+            title: "Get-NetIPInterface",
+            program: "powershell",
+            args: vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "Get-NetIPInterface | Sort-Object InterfaceMetric | Format-Table InterfaceAlias,InterfaceIndex,AddressFamily,NlMtu,InterfaceMetric,ConnectionState -AutoSize | Out-String -Width 220".to_string(),
+            ],
+        },
+        DiagnosticsCommand {
+            title: "Get-NetRoute Default Routes",
+            program: "powershell",
+            args: vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "Get-NetRoute -DestinationPrefix '0.0.0.0/0','::/0' | Sort-Object RouteMetric,InterfaceMetric | Format-Table DestinationPrefix,NextHop,InterfaceIndex,RouteMetric,InterfaceMetric -AutoSize | Out-String -Width 220".to_string(),
+            ],
+        },
+        DiagnosticsCommand {
+            title: "Get-DnsClientServerAddress",
+            program: "powershell",
+            args: vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "Get-DnsClientServerAddress | Format-Table InterfaceAlias,AddressFamily,ServerAddresses -AutoSize | Out-String -Width 220".to_string(),
+            ],
+        },
+        DiagnosticsCommand {
+            title: "Get-NetOffloadGlobalSetting",
+            program: "powershell",
+            args: vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "Get-NetOffloadGlobalSetting | Out-String -Width 220".to_string(),
+            ],
+        },
+        DiagnosticsCommand {
+            title: "Get-NetAdapterAdvancedProperty (offload/checksum)",
+            program: "powershell",
+            args: vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "Get-NetAdapterAdvancedProperty | Where-Object { $_.DisplayName -match 'offload|checksum|large send|udp|tcp' } | Format-Table Name,DisplayName,DisplayValue -AutoSize | Out-String -Width 260".to_string(),
+            ],
+        },
+        DiagnosticsCommand {
+            title: "ipconfig /all",
+            program: "ipconfig",
+            args: vec!["/all".to_string()],
+        },
+        DiagnosticsCommand {
+            title: "route print -4",
+            program: "route",
+            args: vec!["print".to_string(), "-4".to_string()],
+        },
+        DiagnosticsCommand {
+            title: "route print -6",
+            program: "route",
+            args: vec!["print".to_string(), "-6".to_string()],
+        },
+        DiagnosticsCommand {
+            title: "External ISP Lookup (ipinfo.io)",
+            program: "powershell",
+            args: vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                isp_lookup_script().to_string(),
+            ],
+        },
+    ]
+}
+
+#[cfg(not(windows))]
+fn windows_diagnostics_commands() -> Vec<DiagnosticsCommand> {
+    Vec::new()
+}
+
+fn format_settings_snapshot(settings: &swifttunnel_core::settings::AppSettings) -> String {
+    let selected_games = if settings.selected_game_presets.is_empty() {
+        "none".to_string()
+    } else {
+        settings.selected_game_presets.join(", ")
+    };
+    let whitelisted_regions = if settings.whitelisted_regions.is_empty() {
+        "none".to_string()
+    } else {
+        settings.whitelisted_regions.join(", ")
+    };
+    let custom_relay = if settings.custom_relay_server.trim().is_empty() {
+        "auto".to_string()
+    } else {
+        settings.custom_relay_server.trim().to_string()
+    };
+    let adapter_binding_mode = match settings.adapter_binding_mode {
+        swifttunnel_core::settings::AdapterBindingMode::SmartAuto => "smart_auto",
+        swifttunnel_core::settings::AdapterBindingMode::Manual => "manual",
+    };
+    let preferred_adapter = settings
+        .preferred_physical_adapter_guid
+        .as_deref()
+        .unwrap_or("none");
+    let remembered_overrides = settings.network_binding_overrides.len();
+
+    format!(
+        "selected_region: {}\nselected_game_presets: {}\nauto_routing_enabled: {}\nwhitelisted_regions: {}\nupdate_channel: {:?}\ncustom_relay_server: {}\nadapter_binding_mode: {}\npreferred_physical_adapter_guid: {}\nnetwork_binding_override_count: {}",
+        settings.selected_region,
+        selected_games,
+        settings.auto_routing_enabled,
+        whitelisted_regions,
+        settings.update_channel,
+        custom_relay,
+        adapter_binding_mode,
+        preferred_adapter,
+        remembered_overrides
+    )
+}
+
+fn format_vpn_snapshot(vpn_state: &swifttunnel_core::vpn::ConnectionState) -> String {
+    match vpn_state {
+        swifttunnel_core::vpn::ConnectionState::Disconnected => "state: disconnected".to_string(),
+        swifttunnel_core::vpn::ConnectionState::FetchingConfig => {
+            "state: fetching_config".to_string()
+        }
+        swifttunnel_core::vpn::ConnectionState::ConfiguringSplitTunnel => {
+            "state: configuring_split_tunnel".to_string()
+        }
+        swifttunnel_core::vpn::ConnectionState::Connected {
+            server_region,
+            server_endpoint,
+            assigned_ip,
+            relay_auth_mode,
+            split_tunnel_active,
+            tunneled_processes,
+            ..
+        } => {
+            let tunneled = if tunneled_processes.is_empty() {
+                "none".to_string()
+            } else {
+                tunneled_processes.join(", ")
+            };
+            format!(
+                "state: connected\nserver_region: {server_region}\nserver_endpoint: {server_endpoint}\nassigned_ip: {assigned_ip}\nrelay_auth_mode: {relay_auth_mode}\nsplit_tunnel_active: {split_tunnel_active}\ntunneled_processes: {tunneled}"
+            )
+        }
+        swifttunnel_core::vpn::ConnectionState::Disconnecting => "state: disconnecting".to_string(),
+        swifttunnel_core::vpn::ConnectionState::Error(message) => {
+            format!("state: error\nerror: {message}")
+        }
+    }
+}
+
+fn format_split_tunnel_snapshot(
+    diag: Option<swifttunnel_core::vpn::SplitTunnelDiagnostics>,
+) -> String {
+    match diag {
+        Some(diag) => format!(
+            "adapter_name: {}\nadapter_guid: {}\nselected_if_index: {}\nresolved_if_index: {}\nhas_default_route: {}\nroute_resolution_source: {}\nroute_resolution_target_ip: {}\nmanual_binding_active: {}\nbinding_reason: {}\nbinding_stage: {}\ncached_override_used: {}\nnetwork_signature: {}\nlast_validation_result: {}\npackets_tunneled: {}\npackets_bypassed: {}",
+            diag.adapter_name.unwrap_or_else(|| "unknown".to_string()),
+            diag.adapter_guid.unwrap_or_else(|| "unknown".to_string()),
+            diag.selected_if_index
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "n/a".to_string()),
+            diag.resolved_if_index
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "n/a".to_string()),
+            diag.has_default_route,
+            diag.route_resolution_source,
+            diag.route_resolution_target_ip
+                .unwrap_or_else(|| "n/a".to_string()),
+            diag.manual_binding_active,
+            diag.binding_reason,
+            diag.binding_stage,
+            diag.cached_override_used,
+            diag.network_signature.unwrap_or_else(|| "n/a".to_string()),
+            diag.last_validation_result,
+            diag.packets_tunneled,
+            diag.packets_bypassed
+        ),
+        None => "split tunnel diagnostics unavailable".to_string(),
+    }
+}
+
+fn compose_bundle_text(context: &BundleContext, command_sections: &[String]) -> String {
+    let mut content = String::new();
+    content.push_str("SwiftTunnel Network Diagnostics Bundle\n");
+    content.push_str("====================================\n\n");
+
+    content.push_str(&format_section(
+        "App Metadata",
+        &format!(
+            "generated_at: {}\napp_version: {}\nplatform: {}",
+            context.generated_at, context.app_version, context.platform
+        ),
+    ));
+    content.push('\n');
+    content.push_str(&format_section(
+        "Settings Snapshot",
+        &format_settings_snapshot(&context.settings),
+    ));
+    content.push('\n');
+    content.push_str(&format_section(
+        "VPN Snapshot",
+        &format_vpn_snapshot(&context.vpn_state),
+    ));
+    content.push('\n');
+    content.push_str(&format_section(
+        "Split Tunnel Diagnostics",
+        &format_split_tunnel_snapshot(context.split_tunnel_diag.clone()),
+    ));
+    content.push('\n');
+
+    for (idx, section) in command_sections.iter().enumerate() {
+        content.push_str(section);
+        if idx + 1 != command_sections.len() {
+            content.push('\n');
+        }
+    }
+
+    content
+}
+
+/// Exports belong to the user. Never truncate an existing file, including a
+/// pre-existing link. Create a separate file if the suggested name is taken.
+fn write_export(output_dir: &Path, file_name: &str, contents: &[u8]) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let suggested = output_dir.join(file_name);
+    let stem = suggested
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("SwiftTunnel");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for attempt in 0..8 {
+        let path = if attempt == 0 {
+            suggested.clone()
+        } else {
+            output_dir.join(format!("{stem}-{nonce:x}-{attempt}.txt"))
+        };
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Could not create export file: {error}")),
+        };
+        file.write_all(contents)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("Could not finish writing {}: {error}", path.display()))?;
+        return Ok(path);
+    }
+    Err("Could not create a separate export file. Try again.".into())
+}
+
+#[tauri::command]
+pub async fn settings_generate_network_diagnostics_bundle(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<NetworkDiagnosticsBundleResponse, String> {
+    // Keep the permit inside the blocking worker, so cancelling the request
+    // cannot start another set of checks while the previous commands run.
+    static EXPORT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let permit = EXPORT.try_acquire().map_err(|_| {
+        "A diagnostics report is already being created. Wait for it to finish.".to_string()
+    })?;
+    let settings = state.settings.clone();
+    // Reports are most useful while Connect is stuck. Read the published
+    // state without queuing behind that operation; a busy driver is optional.
+    let vpn_state = state.vpn_state_handle.borrow().clone();
+    let driver = state.split_tunnel_handle.read().clone();
+    let split_tunnel_diag = driver.and_then(|handle| {
+        handle
+            .try_lock()
+            .ok()
+            .and_then(|driver| driver.get_diagnostics())
+    });
+
+    let output_dir = resolve_output_dir(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        let bundle_context = BundleContext {
+            generated_at: current_timestamp_utc(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            settings: settings.lock().clone(),
+            vpn_state,
+            split_tunnel_diag,
+        };
+        let command_sections = run_windows_diagnostics_sections();
+        let bundle_text = compose_bundle_text(&bundle_context, &command_sections);
+        std::fs::create_dir_all(&output_dir)
+            .map_err(|e| format!("Failed to create diagnostics output directory: {e}"))?;
+        let file_path = write_export(
+            &output_dir,
+            &build_diagnostics_filename(),
+            bundle_text.as_bytes(),
+        )?;
+        Ok(NetworkDiagnosticsBundleResponse {
+            file_path: file_path.to_string_lossy().to_string(),
+            folder_path: output_dir.to_string_lossy().to_string(),
+        })
+    })
+    .await
+    .map_err(|e| format!("Diagnostics task failed: {e}"))?
+}
+
+/// Sanitize a caller-supplied preset filename so it can never escape the output
+/// directory (no path separators, traversal or exotic characters).
+fn sanitize_preset_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .take(128)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches(['-', '.']);
+    let base = if trimmed.is_empty() {
+        "SwiftTunnel-Preset"
+    } else {
+        trimmed
+    };
+    if base.to_ascii_lowercase().ends_with(".txt") {
+        base.to_string()
+    } else {
+        format!("{base}.txt")
+    }
+}
+
+/// Write a shareable preset as a `.txt` next to where diagnostics land (Desktop,
+/// falling back to Downloads), and return the path so the UI can reveal it.
+#[tauri::command]
+pub async fn preset_save_to_downloads(
+    app: AppHandle,
+    file_name: String,
+    contents: String,
+) -> Result<NetworkDiagnosticsBundleResponse, String> {
+    if contents.len() > 256 * 1024 {
+        return Err("This config is too large to export. Use a config under 256 KB.".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let output_dir = resolve_output_dir(&app);
+        std::fs::create_dir_all(&output_dir)
+            .map_err(|e| format!("Failed to create output directory: {e}"))?;
+
+        let file_path = write_export(
+            &output_dir,
+            &sanitize_preset_filename(&file_name),
+            contents.as_bytes(),
+        )?;
+
+        Ok(NetworkDiagnosticsBundleResponse {
+            file_path: file_path.to_string_lossy().to_string(),
+            folder_path: output_dir.to_string_lossy().to_string(),
+        })
+    })
+    .await
+    .map_err(|e| format!("Preset export task failed: {e}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preference_effects_read_the_latest_save_after_waiting_for_publication() {
+        let gate = std::sync::Arc::new(parking_lot::Mutex::new(()));
+        let latest = std::sync::Arc::new(parking_lot::Mutex::new(true));
+        let active_effect = gate.lock();
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (applied_tx, applied_rx) = std::sync::mpsc::channel();
+        let worker_gate = gate.clone();
+        let worker_latest = latest.clone();
+        let worker = std::thread::spawn(move || {
+            waiting_tx.send(()).unwrap();
+            publish_current_preferences(
+                &worker_gate,
+                || {
+                    assert!(worker_gate.try_lock().is_none());
+                    *worker_latest.lock()
+                },
+                |enabled| {
+                    // The native effect must not run with settings held.
+                    assert!(worker_latest.try_lock().is_some());
+                    applied_tx.send(enabled).unwrap();
+                },
+            );
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // A newer save disables tracing while an older request is queued.
+        *latest.lock() = false;
+        assert!(applied_rx.try_recv().is_err());
+        drop(active_effect);
+        assert!(!applied_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn preference_effects_keep_a_newer_save_after_an_in_flight_effect() {
+        let gate = std::sync::Arc::new(parking_lot::Mutex::new(()));
+        let latest = std::sync::Arc::new(parking_lot::Mutex::new(true));
+        let applied = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker_gate = gate.clone();
+        let worker_latest = latest.clone();
+        let worker_applied = applied.clone();
+        let worker = std::thread::spawn(move || {
+            publish_current_preferences(
+                &worker_gate,
+                || *worker_latest.lock(),
+                |enabled| {
+                    entered_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    worker_applied.lock().push(enabled);
+                },
+            );
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        *latest.lock() = false;
+        resume_tx.send(()).unwrap();
+        publish_current_preferences(
+            &gate,
+            || *latest.lock(),
+            |enabled| applied.lock().push(enabled),
+        );
+        worker.join().unwrap();
+        assert_eq!(*applied.lock(), vec![true, false]);
+    }
+
+    #[test]
+    fn only_routing_preference_changes_need_the_connection_lock_after_saving() {
+        let settings = parking_lot::Mutex::new(AppSettings::default());
+        let mut next = settings.lock().clone();
+        next.minimize_to_tray = !next.minimize_to_tray;
+        assert!(!persist_preferences(&settings, next, |_| Ok(())).unwrap());
+
+        let mut next = settings.lock().clone();
+        next.auto_routing_enabled = !next.auto_routing_enabled;
+        assert!(persist_preferences(&settings, next, |_| Ok(())).unwrap());
+
+        let mut next = settings.lock().clone();
+        next.whitelisted_regions.push("mumbai".into());
+        assert!(persist_preferences(&settings, next.clone(), |_| Ok(())).unwrap());
+        assert!(!persist_preferences(&settings, next, |_| Ok(())).unwrap());
+    }
+
+    #[test]
+    fn a_background_writer_cannot_split_preference_persistence_from_publication() {
+        let settings = parking_lot::Mutex::new(AppSettings::default());
+        let mut next = settings.lock().clone();
+        next.enable_discord_rpc = !next.enable_discord_rpc;
+        let disk = std::cell::RefCell::new(serde_json::Value::Null);
+        persist_preferences(&settings, next, |snapshot| {
+            *disk.borrow_mut() = serde_json::to_value(snapshot).unwrap();
+            // A background native writer uses the same state lock. Inject it
+            // at the old gap between writing disk and publishing memory.
+            if let Some(mut competing) = settings.try_lock() {
+                competing.selected_region = "tokyo".into();
+                *disk.borrow_mut() = serde_json::to_value(&*competing).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&*settings.lock()).unwrap(),
+            disk.into_inner()
+        );
+    }
+
+    #[test]
+    fn failed_preference_persistence_preserves_the_confirmed_state() {
+        let settings = parking_lot::Mutex::new(AppSettings::default());
+        let original = serde_json::to_value(&*settings.lock()).unwrap();
+        let mut next = settings.lock().clone();
+        next.selected_region = "tokyo".into();
+        let result = persist_preferences(&settings, next, |_| Err("disk unavailable".into()));
+        assert_eq!(result.unwrap_err(), "disk unavailable");
+        assert_eq!(serde_json::to_value(&*settings.lock()).unwrap(), original);
+    }
+
+    struct ExportDirectory(PathBuf);
+    impl ExportDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "swift-export-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for ExportDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn exports_preserve_existing_files_and_return_the_actual_new_path() {
+        let dir = ExportDirectory::new();
+        let previous = dir.0.join("preset.txt");
+        std::fs::write(&previous, b"previous export").unwrap();
+        let first = write_export(&dir.0, "preset.txt", b"new export").unwrap();
+        let second = write_export(&dir.0, "preset.txt", b"another export").unwrap();
+        assert_ne!(first, previous);
+        assert_ne!(second, first);
+        assert_eq!(std::fs::read(previous).unwrap(), b"previous export");
+        assert_eq!(std::fs::read(first).unwrap(), b"new export");
+        assert_eq!(std::fs::read(second).unwrap(), b"another export");
+    }
+
+    #[test]
+    fn exporting_does_not_overwrite_the_target_of_an_existing_hard_link() {
+        let dir = ExportDirectory::new();
+        let original = dir.0.join("keep.txt");
+        std::fs::write(&original, b"keep this").unwrap();
+        std::fs::hard_link(&original, dir.0.join("preset.txt")).unwrap();
+        let path = write_export(&dir.0, "preset.txt", b"export").unwrap();
+        assert_eq!(std::fs::read(original).unwrap(), b"keep this");
+        assert_eq!(std::fs::read(path).unwrap(), b"export");
+    }
+
+    #[test]
+    fn preset_export_filenames_remain_bounded_and_cannot_escape_the_folder() {
+        let name = sanitize_preset_filename(&"x".repeat(100_000));
+        assert!(name.len() <= 132);
+        assert!(name.ends_with(".txt"));
+        let name = sanitize_preset_filename("../../outside.txt");
+        assert!(!name.contains(['/', '\\']));
+        assert_eq!(Path::new(&name).components().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn diagnostics_keep_partial_output_and_skip_later_checks_after_the_budget() {
+        let commands = [
+            DiagnosticsCommand {
+                title: "Stuck owned check",
+                program: "powershell",
+                args: [
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "[Console]::Out.WriteLine('captured before timeout'); Start-Sleep -Seconds 8",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            },
+            DiagnosticsCommand {
+                title: "Later check",
+                program: "must-not-be-executed",
+                args: vec![],
+            },
+        ];
+        let started = Instant::now();
+        let sections = collect_diagnostics_sections(&commands, Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(sections[0].contains("captured before timeout"));
+        assert!(sections[0].contains("did not finish within"));
+        assert!(sections[1].contains("Skipped: diagnostics reached its time limit."));
+        assert!(!sections[1].contains("Failed to start"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn diagnostics_report_nonzero_exit_and_continue_with_the_next_check() {
+        let commands = [
+            DiagnosticsCommand {
+                title: "Failed owned check",
+                program: "cmd",
+                args: vec!["/C".into(), "exit 42".into()],
+            },
+            DiagnosticsCommand {
+                title: "Successful owned check",
+                program: "cmd",
+                args: vec!["/C".into(), "echo next check completed".into()],
+            },
+        ];
+        let sections = collect_diagnostics_sections(&commands, Duration::from_secs(5));
+        assert!(sections[0].contains("Command failed (exit code: 42)"));
+        assert!(sections[1].contains("next check completed"));
+        assert!(!sections[1].contains("Command failed"));
+    }
+
+    #[test]
+    fn build_diagnostics_filename_has_expected_format() {
+        let fixed = build_diagnostics_filename_from_timestamp("20260219_154500");
+        assert_eq!(fixed, "SwiftTunnel_NetworkDiagnostics_20260219_154500.txt");
+
+        let generated = build_diagnostics_filename();
+        assert!(generated.starts_with("SwiftTunnel_NetworkDiagnostics_"));
+        assert!(generated.ends_with(".txt"));
+
+        let stamp = generated
+            .trim_start_matches("SwiftTunnel_NetworkDiagnostics_")
+            .trim_end_matches(".txt");
+        assert_eq!(stamp.len(), 15);
+        assert_eq!(&stamp[8..9], "_");
+        assert!(stamp.chars().enumerate().all(|(idx, ch)| {
+            if idx == 8 {
+                ch == '_'
+            } else {
+                ch.is_ascii_digit()
+            }
+        }));
+    }
+
+    #[test]
+    fn compose_bundle_text_contains_required_sections() {
+        let settings = swifttunnel_core::settings::AppSettings {
+            selected_region: "mumbai".to_string(),
+            selected_game_presets: vec!["roblox".to_string()],
+            auto_routing_enabled: true,
+            custom_relay_server: "relay.example.com:51821".to_string(),
+            ..Default::default()
+        };
+
+        let context = BundleContext {
+            generated_at: "2026-02-19T15:45:00Z".to_string(),
+            app_version: "1.21.0".to_string(),
+            platform: "windows-x86_64".to_string(),
+            settings,
+            vpn_state: swifttunnel_core::vpn::ConnectionState::Connected {
+                since: Instant::now(),
+                server_region: "mumbai".to_string(),
+                server_endpoint: "1.2.3.4:51821".to_string(),
+                assigned_ip: "100.64.0.12".to_string(),
+                relay_auth_mode: "preflight-ok".to_string(),
+                split_tunnel_active: true,
+                tunneled_processes: vec!["robloxplayerbeta.exe".to_string()],
+                relay_status: None,
+            },
+            split_tunnel_diag: Some(swifttunnel_core::vpn::SplitTunnelDiagnostics {
+                adapter_name: Some("Ethernet".to_string()),
+                adapter_guid: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string()),
+                selected_if_index: Some(7),
+                resolved_if_index: Some(7),
+                has_default_route: true,
+                packets_tunneled: 77,
+                packets_bypassed: 12,
+                route_resolution_source: "game_route".to_string(),
+                route_resolution_target_ip: Some("128.116.1.1".to_string()),
+                manual_binding_active: false,
+                binding_reason: "Connected using the active default-route adapter.".to_string(),
+                binding_stage: "exact_route_match".to_string(),
+                cached_override_used: false,
+                network_signature: Some("sig".to_string()),
+                last_validation_result: "selected_exact_route_match".to_string(),
+                leaked_worker_threads: 0,
+            }),
+        };
+
+        let bundle = compose_bundle_text(
+            &context,
+            &[format_section("Get-NetAdapter", "sample adapter output")],
+        );
+
+        assert!(bundle.contains("## App Metadata"));
+        assert!(bundle.contains("## Settings Snapshot"));
+        assert!(bundle.contains("## VPN Snapshot"));
+        assert!(bundle.contains("## Split Tunnel Diagnostics"));
+        assert!(bundle.contains("selected_region: mumbai"));
+        assert!(bundle.contains("state: connected"));
+        assert!(bundle.contains("packets_tunneled: 77"));
+        assert!(bundle.contains("## Get-NetAdapter"));
+    }
+
+    #[test]
+    fn command_section_includes_errors_without_panicking() {
+        let capture = CommandCapture {
+            stdout: String::new(),
+            stderr: "Access is denied".to_string(),
+            status_code: Some(1),
+            success: false,
+            execution_error: None,
+        };
+
+        let section = format_command_section("Get-NetAdapter", &capture);
+        assert!(section.contains("Command failed (exit code: 1)"));
+        assert!(section.contains("[stderr]"));
+        assert!(section.contains("Access is denied"));
+    }
+
+    #[test]
+    fn isp_lookup_script_targets_ipinfo() {
+        let script = isp_lookup_script();
+        assert!(script.contains("ipinfo.io/json"));
+        assert!(script.contains("Invoke-RestMethod"));
+    }
+}
