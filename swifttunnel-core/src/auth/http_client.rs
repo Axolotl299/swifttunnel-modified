@@ -763,6 +763,14 @@ impl AuthClient {
             data.preflight_mode(),
             data.queue_full_mode()
         );
+        // Safe diagnostics: log only quota metadata, never the signed ticket or auth tokens.
+        info!(
+            "SERVER QUOTA: limit={:?}, remaining={:?}, resets_at={:?}, grace={:?}",
+            data.limit_seconds,
+            data.remaining_seconds,
+            data.resets_at,
+            data.grace_seconds
+        );
         Ok(data)
     }
 
